@@ -1,0 +1,47 @@
+# ===== 构建产物 =====
+/build/
+*.spec
+__pycache__/
+*.pyc
+
+# ===== 调试截图 =====
+screenshot*.png
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# ===== 一次性修复/分析脚本 =====
+fix_*.py
+analyze_*.py
+check_*.py
+test_*.py
+debug_*.py
+verify_*.py
+extract_*.py
+find_*.py
+gen_*.py
+regen_*.py
+disasm_*.py
+decrypt_*.py
+search_*.py
+get_*.py
+set_ver_*.py
+add_*.py
+optimize_*.py
+relax_*.py
+replace_*.py
+grep_*.ps1
+tuiimg_*.html
+
+# ===== 其他项目目录 =====
+/Chnchts/
+/Emus/
+/Language/
+/Snap/
+/Text/
+/web-grabber/
+
+# ===== 运行时文件 =====
+*.log
+*.txt
