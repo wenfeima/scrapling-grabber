@@ -1,4 +1,10 @@
-# Scrapling 图片爬虫 - 开发交接笔记（v2.12.1）
+# Scrapling 图片爬虫 - 开发交接笔记（v2.12.2）
+
+## v2.12.2 新增（AI 助手更智能）
+1. **新增 get_browser_info 工具**：模型现在能看到浏览器！CDP 直查 9222——标签页列表（标题+URL）+ 当前页图片数（Runtime.evaluate 统计 img 标签）。用户问"浏览器上有几张图""现在看的是什么页"可直接回答（实测 xchina 页准确返回 22 张图）
+2. **set_filter 兜底收紧**：用户没明确说开/关智能过滤、没给 KB 值时，不再假装"已更新"（原来会拿当前值报成功，误导用户），改为返回"请明确过滤设置"并给示例
+3. **start_crawl 智能补位**：用户说"这个页面/这个站/当前页"时，模型直接调 start_crawl（url 可空），执行器自动用当前网址（对话里提取 → url_var 兜底两级）；工具描述加了场景引导（抓取→start_crawl、查浏览器→get_browser_info、设过滤→set_filter）
+4. 实测两个场景修复：问"浏览器上有几张图"→ 模型答"22 张"；说"这个页面图片抓取"→ 自动抓当前页
 
 ## v2.12.1 修复（内置浏览器）
 1. **"Chrome 未正确关闭/要恢复页面吗？"**：启动调试浏览器前自动清理 debug_profile 会话残留（Last Session/Last Tabs/Current Session/Current Tabs + Default/Session + Default/Snapshots），启动参数加 `--disable-session-crashed-bubble`，不再弹恢复条、不再恢复一堆旧标签（内嵌和独立窗口两处启动都改了）
