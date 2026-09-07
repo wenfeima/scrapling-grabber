@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.12'
+APP_VERSION = 'v2.12.13'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -873,16 +873,99 @@ class ScraplingGrabberGUI:
             self._ai_log_chat('resp', final or '(空回复)')
             self._ai_chat_history.append({'role': 'assistant', 'content': final})
 
+    def _ai_capture_shot(self):
+        """CDP截取调试浏览器当前页 → JPEG压缩 → 返回 (base64, 保存路径)；失败返回 None"""
+        import urllib.request as _ur
+        import json as _json
+        import base64 as _b64
+        import io as _io
+        import time as _time
+        try:
+            with _ur.urlopen('http://127.0.0.1:9222/json/list', timeout=3) as r:
+                tabs = _json.loads(r.read())
+            pages = [t for t in tabs if t.get('type') == 'page']
+            if not pages:
+                return None
+            active = next((t for t in pages if t.get('active')), pages[0])
+            import websocket as _ws
+            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=15)
+            ws.send(_json.dumps({'id': 1, 'method': 'Page.captureScreenshot', 'params': {'format': 'png'}}))
+            resp = _json.loads(ws.recv())
+            ws.close()
+            png_b64 = resp.get('result', {}).get('data')
+            if not png_b64:
+                return None
+            from PIL import Image
+            img = Image.open(_io.BytesIO(_b64.b64decode(png_b64))).convert('RGB')
+            img.thumbnail((1024, 1024))
+            buf = _io.BytesIO()
+            img.save(buf, 'JPEG', quality=85)
+            b64 = _b64.b64encode(buf.getvalue()).decode()
+            shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
+            os.makedirs(shot_dir, exist_ok=True)
+            shot_path = os.path.join(shot_dir, 'chat_%s.jpg' % _time.strftime('%Y%m%d_%H%M%S'))
+            with open(shot_path, 'wb') as f:
+                f.write(buf.getvalue())
+            return b64, shot_path
+        except Exception:
+            return None
+
+    def _ai_add_shot(self):
+        """「截图给AI」：截取当前浏览器页面加入对话，发送时随问题一起让AI看图"""
+        if not (self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)):
+            self._log('AI对话: AI服务未运行，请先点击「启动AI服务」')
+            return
+        shot = self._ai_capture_shot()
+        if not shot:
+            self._log('截图给AI失败：调试浏览器未运行或截图出错')
+            return
+        b64, path = shot
+        self._ai_pending_image = {'b64': b64, 'path': path}
+        self._ai_log_chat('req', '[已添加截图] 浏览器截图已就绪，输入问题后点「发送」即可让AI看图回答\n（截图已保存: %s）' % path)
+
+    def _ai_vision_chat(self, user_text, jpg_b64, shot_path):
+        """带截图的一次性视觉对话：截图+问题 → 模型看图回答（不进工具模式，识别结果进历史便于追问）"""
+        import requests
+        self._ai_log_chat('req', '[截图识别] %s\n（截图: %s）' % (user_text, shot_path))
+        try:
+            port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
+            model = requests.get('http://127.0.0.1:%d/v1/models' % port, timeout=5).json()['data'][0]['id']
+            r = requests.post(
+                'http://127.0.0.1:%d/v1/chat/completions' % port,
+                json={'model': model,
+                      'messages': [{'role': 'user', 'content': [
+                          {'type': 'text', 'text': user_text},
+                          {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + jpg_b64}},
+                      ]}],
+                      'max_tokens': 1024, 'temperature': 0.3},
+                timeout=300)
+            if r.status_code == 200:
+                content = (r.json()['choices'][0]['message'].get('content') or '').strip()
+                self._ai_log_chat('resp', content or '(空回复)')
+                # 识别结果进历史，便于后续文本追问
+                self._ai_chat_history.append({'role': 'user',
+                                              'content': user_text + '（基于浏览器截图，截图已保存: %s）' % shot_path})
+                self._ai_chat_history.append({'role': 'assistant', 'content': content})
+            else:
+                self._ai_log_chat('resp', '(HTTP %d)' % r.status_code)
+        except Exception as e:
+            self._ai_log_chat('resp', '(调用失败: %s)' % e)
+
     def _ai_chat_send(self):
-        """AI 对话（助手模式）：发送用户消息，模型可调用工具操作软件"""
+        """AI 对话（助手模式）：发送用户消息，模型可调用工具操作软件；若已添加截图则走看图识别"""
         text = self.ai_chat_input.get().strip()
-        if not text:
+        if not text and not getattr(self, '_ai_pending_image', None):
             return
         if not (self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)):
             self._log('AI对话: AI服务未运行，请先点击「启动AI服务」')
             return
         self.ai_chat_input.delete(0, 'end')
-        self._ai_assistant_chat(text)
+        if getattr(self, '_ai_pending_image', None):
+            pending = self._ai_pending_image
+            self._ai_pending_image = None
+            self._ai_vision_chat(text or '请识别这张截图并描述页面内容', pending['b64'], pending['path'])
+        else:
+            self._ai_assistant_chat(text)
 
     def _ai_call_text(self, prompt_text, max_tokens=300, timeout=120):
         """通用文本调用本地模型，返回模型输出字符串（失败返回空串）"""
@@ -1137,8 +1220,10 @@ class ScraplingGrabberGUI:
         self.ai_chat_input = ttk.Entry(ai_input_frame)
         self.ai_chat_input.pack(side='left', fill='x', expand=True, padx=(0, 4))
         self.ai_chat_input.bind('<Return>', lambda e: self._ai_chat_send())
+        ttk.Button(ai_input_frame, text='截图给AI', width=8, command=self._ai_add_shot).pack(side='left', padx=(0, 4))
         ttk.Button(ai_input_frame, text='发送', width=6, command=self._ai_chat_send).pack(side='left')
         self._ai_chat_history = []
+        self._ai_pending_image = None
 
         # ===== 顶部设置区域 =====
         # top_frame已经在上面定义了
@@ -3583,6 +3668,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
