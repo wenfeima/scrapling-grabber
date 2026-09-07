@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.21'
+APP_VERSION = 'v2.12.22'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -1222,8 +1222,18 @@ class ScraplingGrabberGUI:
             return False
 
     def _on_closing(self):
-        """窗口关闭时保存设置"""
+        """窗口关闭时保存设置、优雅关闭调试浏览器和AI服务"""
         self._save_settings()
+        # 优雅关闭调试浏览器（WM_CLOSE），避免下次启动 Chrome 弹"要恢复页面吗"
+        try:
+            subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' or Name='msedge.exe'\" | "
+                 "Where-Object { $_.CommandLine -like '*9222*' -and $_.CommandLine -like '*WebGrabber*debug_profile*' } | "
+                 "ForEach-Object { $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; if ($p) { $p.CloseMainWindow() } }"],
+                timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception:
+            pass
         if self.ai_proc:
             try:
                 self.ai_proc.terminate()
@@ -1734,6 +1744,7 @@ class ScraplingGrabberGUI:
                     '--no-first-run',
                     '--no-default-browser-check',
                     '--disable-session-crashed-bubble',
+                    '--disable-features=InfiniteSessionRestore',
                     '--disable-gpu',
                     '--disable-gpu-compositing',
                     '--disable-backgrounding-occluded-windows',
@@ -1758,6 +1769,7 @@ class ScraplingGrabberGUI:
                     '--no-first-run',
                     '--no-default-browser-check',
                     '--disable-session-crashed-bubble',
+                    '--disable-features=InfiniteSessionRestore',
                     '--disable-gpu',
                     '--disable-gpu-compositing',
                     '--disable-backgrounding-occluded-windows',
@@ -2569,6 +2581,7 @@ class ScraplingGrabberGUI:
             '--no-first-run',
             '--no-default-browser-check',
             '--disable-session-crashed-bubble',
+            '--disable-features=InfiniteSessionRestore',
             '--disable-gpu',
                     '--disable-gpu-compositing',
                     '--disable-backgrounding-occluded-windows',
@@ -3854,6 +3867,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
