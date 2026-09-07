@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.22'
+APP_VERSION = 'v2.12.23'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -506,6 +506,7 @@ class ScraplingGrabberGUI:
         '  [工具:get_browser_info {}]\n'
         '  [工具:get_browser_view {"prompt":"关于页面你想问什么，可选"}]\n'
         '  [工具:ai_adjust_crawl {"url":"目标页面网址，可选，默认浏览器当前页"}]\n'
+        '  [工具:run_js {"code":"要执行的JavaScript代码"}]\n'
         '工具使用场景：\n'
         '- 用户想抓取/下载某个页面或网站的图片（如"抓取这个页面""这个站""这个页面图片抓取""下载图片"）→ 用 start_crawl；用户消息里可能只有网址没有"抓取"两个字，那也是在请求抓取\n'
         '- 用户问抓取进度/状态/剩多少 → 用 get_status\n'
@@ -513,6 +514,7 @@ class ScraplingGrabberGUI:
         '- 用户问浏览器当前打开了什么页面/几张图/页面状态（如"浏览器上有几张图""现在看的是什么页"）→ 用 get_browser_info\n'
         '- 用户想让你看页面内容/画面（如"看看这个页面""这个站怎么样""页面上有什么""帮我看看现在这页"）→ 用 get_browser_view，会截屏并用视觉模型理解页面\n'
         '- 用户说页面明明有图但抓取不到/抓不到图片/提取太少/帮我调整抓取策略/怎么才能抓到（如"这个页面有图抓不到""帮我调整抓取策略""图片怎么抓不下来"）→ 用 ai_adjust_crawl，会自动截图分析页面图片加载方式（懒加载/属性/点击），滚动触发并重新提取，返回图片数量变化\n'
+        '- 用户想在当前网页执行JS/修改网页游戏数值/调用页面函数（如"把金币改成999999""修改血量""把得分改成100000""执行这段代码"）→ 用 run_js，先 get_browser_info 或 get_browser_view 了解页面，再注入JS修改\n'
         '- 用户明确要求设置过滤（开启/关闭智能过滤、最小图片大小KB）→ 才用 set_filter，否则不要调用它\n'
         '规则：\n'
         '1. start_crawl 的 url 可以省略：用户说"这个页面/这个站/当前页"或之前已经给过网址时，直接调用 start_crawl（url 可传空 {}），执行器会自动用当前网址；只有完全不知道网址时才先问用户；\n'
@@ -694,6 +696,11 @@ class ScraplingGrabberGUI:
                 return self._ai_browser_view(str(args.get('prompt') or '').strip())
             if name == 'ai_adjust_crawl':
                 return True, self._ai_adjust_crawl_tool(str(args.get('url') or '').strip())
+            if name == 'run_js':
+                code = str(args.get('code') or '').strip()
+                if not code:
+                    return False, '缺少 code 参数，请重新调用 [工具:run_js {"code":"document.title"}]'
+                return self._ai_execute_js(code)
             return False, '未知工具: %s' % name
         except Exception as e:
             return False, '工具执行出错: %s' % e
@@ -946,6 +953,131 @@ class ScraplingGrabberGUI:
             return b64, shot_path
         except Exception:
             return None
+
+    def _ai_execute_js(self, code, timeout=8):
+        """CDP 在活跃标签页执行 JS，返回 (ok, 结果)。网页游戏修改/页面调试工具"""
+        import json as _json
+        import urllib.request as _ur
+        import websocket as _ws
+        try:
+            pages = _json.loads(_ur.urlopen('http://127.0.0.1:9222/json/list', timeout=5).read())
+            pages = [t for t in pages if t.get('type') == 'page']
+            if not pages:
+                return False, '调试浏览器没有打开的网页'
+            active = next((t for t in pages if t.get('active')), pages[0])
+            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=timeout)
+            ws.send(_json.dumps({'id': 1, 'method': 'Runtime.evaluate', 'params': {
+                'expression': code, 'returnByValue': True, 'awaitPromise': False}}))
+            resp = _json.loads(ws.recv())
+            ws.close()
+            if 'error' in resp:
+                return False, '执行失败: %s' % resp['error'].get('message', '?')
+            r = resp.get('result', {})
+            if 'exceptionDetails' in r:
+                return False, 'JS异常: %s' % r['exceptionDetails'].get('exception', {}).get('description',
+                                    r['exceptionDetails'].get('text', '?'))[:300]
+            val = r.get('result', {})
+            if 'value' in val:
+                return True, '执行成功: %s' % _json.dumps(val['value'], ensure_ascii=False)[:500]
+            if 'description' in val:
+                return True, '执行成功: %s' % val['description'][:500]
+            return True, '执行成功（无返回值）'
+        except Exception as e:
+            return False, '执行JS失败: %s' % e
+
+    def _ai_execute_js(self, code, timeout=8):
+        """CDP 在活跃标签页执行 JS，返回 (ok, 结果文本)。网页游戏修改工具"""
+        import json as _json
+        import websocket as _ws
+        try:
+            pages = _json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json/list', timeout=5).read())
+            pages = [t for t in pages if t.get('type') == 'page']
+            if not pages:
+                return False, '调试浏览器没有打开的网页'
+            active = next((t for t in pages if t.get('active')), pages[0])
+            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=timeout)
+            ws.send(_json.dumps({'id': 1, 'method': 'Runtime.evaluate', 'params': {
+                'expression': code, 'returnByValue': True, 'awaitPromise': False}}))
+            resp = _json.loads(ws.recv())
+            ws.close()
+            if 'error' in resp:
+                return False, '执行失败: %s' % resp['error'].get('message', '?')
+            r = resp.get('result', {})
+            if 'exceptionDetails' in r:
+                return False, 'JS异常: %s' % r['exceptionDetails'].get('exception', {}).get('description',
+                    r['exceptionDetails'].get('text', '?'))[:300]
+            val = r.get('result', {})
+            if 'value' in val:
+                return True, '执行成功: %s' % _json.dumps(val['value'], ensure_ascii=False)[:500]
+            if 'description' in val:
+                return True, '执行成功: %s' % val['description'][:500]
+            return True, '执行成功（无返回值）'
+        except Exception as e:
+            return False, '执行JS失败: %s' % e
+
+    # ===== EC 模式：网页游戏数值搜索/过滤/修改/锁定 =====
+    def _ai_ec_scan(self, value, prev_segs=None):
+        """EC模式扫描：首次全量搜索 window 变量，或按上次路径过滤。返回 [(segs列表, 当前值)]"""
+        import json as _json
+        import websocket as _ws
+        prev = _json.dumps(prev_segs or [])
+        if prev_segs:
+            # 过滤模式：只对上次命中的路径重新取值判断
+            js = ('(function(){var target=%(v)s;var prev=%(p)s;var out=[];'
+                  'for(var i=0;i<prev.length;i++){try{'
+                  'var seg=prev[i];var cur=window;'
+                  'for(var j=1;j<seg.length;j++){cur=cur[seg[j]];}'
+                  'if(typeof cur==="number"&&cur===target){out.push({s:seg,v:cur});}'
+                  '}catch(e){}}return out.slice(0,500);})()'
+                  % {'v': repr(value), 'p': prev})
+        else:
+            # 首次全量扫描：递归遍历 window，深度≤6，最多1000命中
+            js = ('(function(){var target=%(v)s;var hits=[];var seen=[];'
+                  'function walk(o,p,d){if(d>6||o===null||typeof o!=="object"||hits.length>=1000)return;'
+                  'if(seen.indexOf(o)>=0)return;seen.push(o);'
+                  'try{Object.keys(o).forEach(function(k){var v=o[k];var seg=p.concat([k]);'
+                  'if(typeof v==="number"&&v===target){hits.push({s:seg,v:v});}'
+                  'if(typeof v==="object"&&v!==null){walk(v,seg,d+1);}});}catch(e){}}'
+                  'walk(window,["window"],0);return hits.slice(0,500);})()'
+                  % {'v': repr(value)})
+        try:
+            pages = _json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json/list', timeout=5).read())
+            pages = [t for t in pages if t.get('type') == 'page']
+            if not pages:
+                return None
+            active = next((t for t in pages if t.get('active')), pages[0])
+            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=15)
+            ws.send(_json.dumps({'id': 1, 'method': 'Runtime.evaluate', 'params': {
+                'expression': js, 'returnByValue': True}}))
+            resp = _json.loads(ws.recv())
+            ws.close()
+            val = resp.get('result', {}).get('result', {}).get('value')
+            if not isinstance(val, list):
+                return []
+            return [(h.get('s', []), h.get('v')) for h in val]
+        except Exception:
+            return None
+
+    def _ai_ec_edit(self, segs, value):
+        """EC模式修改：把变量路径赋新值"""
+        expr = 'window'
+        for s in segs[1:]:
+            expr += '[%s]' % _json.dumps(str(s))
+        expr += ' = %r' % value
+        return self._ai_execute_js(expr, timeout=8)
+
+    def _ai_ec_lock(self, segs, value, enable):
+        """EC模式锁定：定时把变量重写为目标值（enable=False 取消）"""
+        expr = 'window'
+        for s in segs[1:]:
+            expr += '[%s]' % _json.dumps(str(s))
+        if enable:
+            js = ('window.__ecLock&&clearInterval(window.__ecLock);'
+                  'window.__ecLock=setInterval(function(){try{%(e)s=%(v)r;}catch(e1){}},200);'
+                  'window.__ecLock;' % {'e': expr, 'v': value})
+        else:
+            js = 'window.__ecLock&&(clearInterval(window.__ecLock),window.__ecLock=null);true;'
+        return self._ai_execute_js(js, timeout=8)
 
     def _ai_add_shot(self):
         """「截图给AI」：截取当前浏览器页面加入对话，发送时随问题一起让AI看图"""
@@ -1395,6 +1527,7 @@ class ScraplingGrabberGUI:
         self.ai_toggle_btn.pack(side='left', padx=6)
         self.ai_status_var = tk.StringVar(value=self._ai_state)
         ttk.Label(ai_opt, textvariable=self.ai_status_var, foreground='#888').pack(side='left')
+        ttk.Button(ai_opt, text='游戏修改(EC)', width=12, command=self._open_game_mod_window).pack(side='left', padx=(10, 0))
 
         # AI 模型/服务路径变量（控件在设置窗口）
         self.ai_model_var = tk.StringVar()
@@ -1913,6 +2046,156 @@ class ScraplingGrabberGUI:
         ttk.Spinbox(r6b, from_=1024, to=65535, textvariable=self.ai_port_var, width=7).pack(side='left', padx=2)
         ttk.Label(r6b, text='对话上下文(条):').pack(side='left', padx=(16, 2))
         ttk.Spinbox(r6b, from_=1, to=100, textvariable=self.ai_chat_ctx_var, width=6).pack(side='left')
+
+    def _open_game_mod_window(self):
+        """EC 模式窗口：网页游戏数值 搜索→过滤→修改/锁定（Cheat Engine 风格）"""
+        if getattr(self, 'game_win', None) is not None and self.game_win.winfo_exists():
+            self.game_win.lift()
+            self.game_win.focus_set()
+            return
+        win = tk.Toplevel(self.root)
+        self.game_win = win
+        win.title('游戏数值修改（EC模式）')
+        win.geometry('720x480')
+        win.transient(self.root)
+
+        self.ec_scan_state = None   # 上次命中路径列表 [(segs,...)]
+        self.ec_lock_info = None    # (segs, value) 当前锁定项
+        import tkinter.ttk as _ttk
+        import tkinter.messagebox as _mb
+
+        top = ttk.Frame(win)
+        top.pack(fill='x', padx=8, pady=6)
+        ttk.Label(top, text='数值:').pack(side='left')
+        self.ec_value_var = tk.StringVar(value='100')
+        ttk.Entry(top, textvariable=self.ec_value_var, width=14).pack(side='left', padx=4)
+        ttk.Button(top, text='首次扫描', width=10, command=self._ec_first_scan).pack(side='left', padx=2)
+        ttk.Button(top, text='再次扫描', width=10, command=self._ec_next_scan).pack(side='left', padx=2)
+        ttk.Button(top, text='清除', width=8, command=self._ec_clear).pack(side='left', padx=2)
+        self.ec_count_var = tk.StringVar(value='尚未扫描')
+        ttk.Label(top, textvariable=self.ec_count_var, foreground='#888').pack(side='left', padx=8)
+
+        mid = ttk.Frame(win)
+        mid.pack(fill='both', expand=True, padx=8)
+        cols = ('path', 'value')
+        self.ec_tree = ttk.Treeview(mid, columns=cols, show='headings', height=14)
+        self.ec_tree.heading('path', text='变量路径')
+        self.ec_tree.heading('value', text='当前值')
+        self.ec_tree.column('path', width=480)
+        self.ec_tree.column('value', width=100, anchor='center')
+        self.ec_tree.pack(fill='both', expand=True)
+        self.ec_tree.bind('<Double-1>', lambda e: self._ec_edit_selected())
+
+        bot = ttk.Frame(win)
+        bot.pack(fill='x', padx=8, pady=6)
+        ttk.Label(bot, text='新值:').pack(side='left')
+        self.ec_newval_var = tk.StringVar(value='999999')
+        ttk.Entry(bot, textvariable=self.ec_newval_var, width=14).pack(side='left', padx=4)
+        ttk.Button(bot, text='修改选中', width=10, command=self._ec_edit_selected).pack(side='left', padx=2)
+        ttk.Button(bot, text='锁定', width=8, command=lambda: self._ec_lock(True)).pack(side='left', padx=2)
+        ttk.Button(bot, text='解锁', width=8, command=lambda: self._ec_lock(False)).pack(side='left', padx=2)
+        self.ec_lock_var = tk.StringVar(value='未锁定')
+        ttk.Label(bot, textvariable=self.ec_lock_var, foreground='#c0392b').pack(side='left', padx=10)
+        win.protocol('WM_DELETE_WINDOW', self._ec_close)
+
+    def _ec_close(self):
+        try:
+            if self.ec_lock_info:
+                self._ai_ec_lock(self.ec_lock_info[0], self.ec_lock_info[1], False)
+        except Exception:
+            pass
+        self.game_win.destroy()
+
+    def _ec_clear(self):
+        self.ec_scan_state = None
+        self.ec_lock_info = None
+        for i in self.ec_tree.get_children():
+            self.ec_tree.delete(i)
+        self.ec_count_var.set('已清除')
+
+    def _ec_fill(self, hits):
+        for i in self.ec_tree.get_children():
+            self.ec_tree.delete(i)
+        if not hits:
+            self.ec_count_var.set('无匹配')
+            return
+        for segs, v in hits[:300]:
+            self.ec_tree.insert('', 'end', values=('.'.join(segs), v))
+        self.ec_count_var.set('命中 %d 个' % len(hits))
+
+    def _ec_do_scan(self, first):
+        try:
+            value = float(self.ec_value_var.get().strip())
+        except Exception:
+            import tkinter.messagebox as _mb
+            _mb.showwarning('提示', '请输入有效数值', parent=self.game_win)
+            return
+        if first:
+            hits = self._ai_ec_scan(value)
+            if hits is None:
+                import tkinter.messagebox as _mb
+                _mb.showwarning('提示', '调试浏览器未运行，请先启动浏览器模式', parent=self.game_win)
+                return
+            self.ec_scan_state = [s for s, v in hits]
+            self._ec_fill(hits)
+        else:
+            if not self.ec_scan_state:
+                import tkinter.messagebox as _mb
+                _mb.showwarning('提示', '请先「首次扫描」', parent=self.game_win)
+                return
+            hits = self._ai_ec_scan(value, self.ec_scan_state)
+            if hits is None:
+                return
+            self.ec_scan_state = [s for s, v in hits]
+            self._ec_fill(hits)
+
+    def _ec_first_scan(self):
+        self._ec_do_scan(True)
+
+    def _ec_next_scan(self):
+        self._ec_do_scan(False)
+
+    def _ec_selected_segs(self):
+        sel = self.ec_tree.selection()
+        if not sel:
+            import tkinter.messagebox as _mb
+            _mb.showwarning('提示', '请先在列表中选中一个变量', parent=self.game_win)
+            return None
+        path = self.ec_tree.item(sel[0], 'values')[0]
+        return ['window'] + path.split('.')[1:]
+
+    def _ec_edit_selected(self):
+        segs = self._ec_selected_segs()
+        if not segs:
+            return
+        try:
+            value = float(self.ec_newval_var.get().strip())
+        except Exception:
+            import tkinter.messagebox as _mb
+            _mb.showwarning('提示', '请输入有效数值', parent=self.game_win)
+            return
+        ok, msg = self._ai_ec_edit(segs, value)
+        import tkinter.messagebox as _mb
+        _mb.showinfo('结果', msg, parent=self.game_win)
+
+    def _ec_lock(self, enable):
+        segs = self._ec_selected_segs() if enable else None
+        if enable and not segs:
+            return
+        try:
+            value = float(self.ec_newval_var.get().strip())
+        except Exception:
+            import tkinter.messagebox as _mb
+            _mb.showwarning('提示', '请输入有效数值', parent=self.game_win)
+            return
+        if enable:
+            self._ai_ec_lock(segs, value, True)
+            self.ec_lock_info = (segs, value)
+            self.ec_lock_var.set('已锁定 %s = %s' % ('.'.join(segs), value))
+        else:
+            self._ai_ec_lock([], 0, False)
+            self.ec_lock_info = None
+            self.ec_lock_var.set('未锁定')
 
     def _close_settings(self):
         """关闭设置窗口并保存设置"""
@@ -3867,6 +4150,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
