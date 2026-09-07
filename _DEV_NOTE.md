@@ -1,4 +1,12 @@
-# Scrapling 图片爬虫 - 开发交接笔记（v2.12.26）
+# Scrapling 图片爬虫 - 开发交接笔记（v2.12.27）
+
+## v2.12.27 新增（AI对话磁吸窗 + Cocos引擎扫描）
+- **AI对话磁吸窗**：AI 行新增「AI对话」按钮，点一下贴合主窗口右侧（360px 宽、高度跟主窗），再点隐藏；与游戏修改窗口同款机制（拖动100px内吸回、拖远自由、主窗移动实时跟随/轮询兜底）
+- 对话逻辑完全复用：发送走 `_ai_chat_send_from`（页签+磁吸窗共用），截图走 `_ai_add_shot`，清空双窗口同步
+- **Cocos 引擎专项扫描**：首次扫描检测 `window.cc` → 遍历 `cc.director.getScene()` 场景树（深15）→ cc 对象树（深12）→ window（深6）兜底；路径支持调用段 `getScene()`（`__r` resolve 统一用于过滤/回读，`_ec_assign_expr` 用于修改/锁定）
+- 实测：命运挑战游戏（Cocos）搜20命中5处、搜0命中20+处，路径求值正确
+- 按钮顺序：AI对话 在 游戏修改 左边
+- v2.12.26 修复回顾：Windows拖动窗口时 Configure 的 e.x_root 为0 → 用 winfo 查询+150ms轮询兜底；进度文件挪到 %LOCALAPPDATA%\WebGrabber\progress
 
 ## v2.12.26 完善（游戏修改窗口：磁吸跟随修复 + 进度文件挪位）
 - **磁吸跟随修复**：Windows 拖动窗口时 Tk `<Configure>` 的 e.x_root 为 0/无效 → 改用 `winfo_x()/winfo_y()` 实时查询坐标（Configure 事件触发时跟随）+ 150ms 轮询兜底（`_on_root_configure` + `_poll_game_snap`）
