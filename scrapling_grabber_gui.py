@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.26'
+APP_VERSION = 'v2.12.27'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -467,23 +467,34 @@ class ScraplingGrabberGUI:
         return {'cat': cat, 'cn': cn, 'en': en}
 
     def _ai_log_chat(self, role, content):
-        """记录一次 AI 对话到「AI对话」页签：req=发给模型的请求，resp=模型回复"""
+        """记录一次 AI 对话到「AI对话」页签和磁吸窗：req=发给模型的请求，resp=模型回复"""
         try:
             ts = time.strftime('%H:%M:%S')
-            if role == 'req':
-                self.ai_chat_text.insert('end', '[%s] → 模型:\n' % ts, 'req')
-            else:
-                self.ai_chat_text.insert('end', '[%s] ← 模型:\n' % ts, 'resp')
-            self.ai_chat_text.insert('end', (content or '') + '\n', role)
-            self.ai_chat_text.insert('end', '-' * 70 + '\n', 'sep')
-            self.ai_chat_text.see('end')
+            for txt in (self.ai_chat_text, getattr(self, 'ai_float_text', None)):
+                if not txt:
+                    continue
+                try:
+                    if role == 'req':
+                        txt.insert('end', '[%s] → 模型:\n' % ts, 'req')
+                    else:
+                        txt.insert('end', '[%s] ← 模型:\n' % ts, 'resp')
+                    txt.insert('end', (content or '') + '\n', role)
+                    txt.insert('end', '-' * 70 + '\n', 'sep')
+                    txt.see('end')
+                except Exception:
+                    pass
         except Exception:
             pass
 
     def _ai_clear_chat(self):
-        """清空 AI 对话记录"""
+        """清空 AI 对话记录（页签+磁吸窗）"""
         try:
             self.ai_chat_text.delete('1.0', 'end')
+        except Exception:
+            pass
+        try:
+            if getattr(self, 'ai_float_text', None):
+                self.ai_float_text.delete('1.0', 'end')
         except Exception:
             pass
         self._ai_chat_history = []
@@ -1017,29 +1028,43 @@ class ScraplingGrabberGUI:
 
     # ===== EC 模式：网页游戏数值搜索/过滤/修改/锁定 =====
     def _ai_ec_scan(self, value, prev_segs=None):
-        """EC模式扫描：首次全量搜索 window 变量，或按上次路径过滤。返回 [(segs列表, 当前值)]"""
+        """EC模式扫描：首次=引擎专项(Cocos场景树)→window变量；再次=按上次路径过滤。
+        返回 [(segs列表, 当前值)]；segs 段为字符串键，特殊段 'name()' 表示调用方法"""
         import json as _json
         import websocket as _ws
         prev = _json.dumps(prev_segs or [])
+        resolve = ('function __r(seg){var cur=window;'
+                   'for(var j=1;j<seg.length;j++){var k=seg[j];'
+                   'if(typeof k==="string"&&k.slice(-2)==="()"){cur=cur[k.slice(0,-2)]();}'
+                   'else{cur=cur[k];}}return cur;}')
         if prev_segs:
             # 过滤模式：只对上次命中的路径重新取值判断
             js = ('(function(){var target=%(v)s;var prev=%(p)s;var out=[];'
                   'for(var i=0;i<prev.length;i++){try{'
-                  'var seg=prev[i];var cur=window;'
-                  'for(var j=1;j<seg.length;j++){cur=cur[seg[j]];}'
+                  'var seg=prev[i];var cur=__r(seg);'
                   'if(typeof cur==="number"&&cur===target){out.push({s:seg,v:cur});}'
                   '}catch(e){}}return out.slice(0,500);})()'
                   % {'v': repr(value), 'p': prev})
         else:
-            # 首次全量扫描：递归遍历 window，深度≤6，最多1000命中
+            # 首次扫描：Cocos引擎场景树(深15)→cc对象树(深12)→window(深6)
             js = ('(function(){var target=%(v)s;var hits=[];var seen=[];'
-                  'function walk(o,p,d){if(d>6||o===null||typeof o!=="object"||hits.length>=1000)return;'
-                  'if(seen.indexOf(o)>=0)return;seen.push(o);'
-                  'try{Object.keys(o).forEach(function(k){var v=o[k];var seg=p.concat([k]);'
-                  'if(typeof v==="number"&&v===target){hits.push({s:seg,v:v});}'
-                  'if(typeof v==="object"&&v!==null){walk(v,seg,d+1);}});}catch(e){}}'
-                  'walk(window,["window"],0);return hits.slice(0,500);})()'
-                  % {'v': repr(value)})
+                  'function __push(seg,v){if(hits.length<500)hits.push({s:seg,v:v});}'
+                  'function __walk(o,p,d,lim){'
+                  'if(d>lim||o===null||hits.length>=500)return;var t=typeof o;'
+                  'if(t==="number"){if(o===target)__push(p,o);return;}'
+                  'if(t!=="object")return;if(seen.indexOf(o)>=0)return;seen.push(o);'
+                  'var ks=[];try{ks=Object.keys(o);}catch(e){return;}'
+                  'for(var i=0;i<ks.length;i++){try{var k=ks[i];var v=o[k];'
+                  'if(typeof v==="number"&&v===target){__push(p.concat([k]),v);}'
+                  'else if(typeof v==="object"&&v!==null){__walk(v,p.concat([k]),d+1,lim);}'
+                  '}catch(e){}}}'
+                  'try{var CC=window.cc||window.CocosEngine;'
+                  'if(CC&&CC.director){var sc=CC.director.getScene();'
+                  'if(sc){__walk(sc,["cc","director","getScene()"],0,15);}'
+                  'if(hits.length===0){__walk(CC,["cc"],0,12);}'
+                  '}}catch(e){}'
+                  'if(hits.length===0){__walk(window,["window"],0,6);}'
+                  'return hits.slice(0,500);})()' % {'v': repr(value)})
         try:
             pages = _json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json/list', timeout=5).read())
             pages = [t for t in pages if t.get('type') == 'page']
@@ -1048,7 +1073,7 @@ class ScraplingGrabberGUI:
             active = next((t for t in pages if t.get('active')), pages[0])
             ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=15)
             ws.send(_json.dumps({'id': 1, 'method': 'Runtime.evaluate', 'params': {
-                'expression': js, 'returnByValue': True}}))
+                'expression': resolve + js, 'returnByValue': True}}))
             resp = _json.loads(ws.recv())
             ws.close()
             val = resp.get('result', {}).get('result', {}).get('value')
@@ -1058,23 +1083,29 @@ class ScraplingGrabberGUI:
         except Exception:
             return None
 
+    def _ec_assign_expr(self, segs, value):
+        """生成给路径赋值的 JS 表达式（支持调用段 k()；末段为调用则不可赋值）"""
+        import json as _json
+        segj = _json.dumps(segs)
+        return ('(function(){var seg=%s;var cur=window;'
+                'for(var j=1;j<seg.length-1;j++){var k=seg[j];'
+                'cur=(typeof k==="string"&&k.slice(-2)==="()")?cur[k.slice(0,-2)]():cur[k];}'
+                'var last=seg[seg.length-1];'
+                'if(typeof last==="string"&&last.slice(-2)==="()"){return null;}'
+                'cur[last]=%s;return cur[last];})()'
+                % (segj, repr(value)))
+
     def _ai_ec_edit(self, segs, value):
-        """EC模式修改：把变量路径赋新值"""
-        expr = 'window'
-        for s in segs[1:]:
-            expr += '[%s]' % _json.dumps(str(s))
-        expr += ' = %r' % value
-        return self._ai_execute_js(expr, timeout=8)
+        """EC模式修改：把变量路径（支持调用段）赋新值"""
+        return self._ai_execute_js(self._ec_assign_expr(segs, value), timeout=8)
 
     def _ai_ec_lock(self, segs, value, enable):
         """EC模式锁定：定时把变量重写为目标值（enable=False 取消）"""
-        expr = 'window'
-        for s in segs[1:]:
-            expr += '[%s]' % _json.dumps(str(s))
+        expr = self._ec_assign_expr(segs, value)
         if enable:
             js = ('window.__ecLock&&clearInterval(window.__ecLock);'
-                  'window.__ecLock=setInterval(function(){try{%(e)s=%(v)r;}catch(e1){}},200);'
-                  'window.__ecLock;' % {'e': expr, 'v': value})
+                  'window.__ecLock=setInterval(function(){try{%(e)s;}catch(e1){}},200);'
+                  'window.__ecLock;' % {'e': expr})
         else:
             js = 'window.__ecLock&&(clearInterval(window.__ecLock),window.__ecLock=null);true;'
         return self._ai_execute_js(js, timeout=8)
@@ -1083,10 +1114,13 @@ class ScraplingGrabberGUI:
         """EC恢复：按保存的变量路径回读当前值（页面刷新后变量重建，路径一般仍有效）"""
         import json as _json
         import websocket as _ws
+        resolve = ('function __r(seg){var cur=window;'
+                   'for(var j=1;j<seg.length;j++){var k=seg[j];'
+                   'if(typeof k==="string"&&k.slice(-2)==="()"){cur=cur[k.slice(0,-2)]();}'
+                   'else{cur=cur[k];}}return cur;}')
         js = ('(function(){var prev=%(p)s;var out=[];'
               'for(var i=0;i<prev.length;i++){try{'
-              'var seg=prev[i];var cur=window;'
-              'for(var j=1;j<seg.length;j++){cur=cur[seg[j]];}'
+              'var seg=prev[i];var cur=__r(seg);'
               'if(typeof cur==="number"){out.push({s:seg,v:cur});}'
               '}catch(e){}}return out.slice(0,500);})()'
               % {'p': _json.dumps(segs)})
@@ -1098,7 +1132,7 @@ class ScraplingGrabberGUI:
             active = next((t for t in pages if t.get('active')), pages[0])
             ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=15)
             ws.send(_json.dumps({'id': 1, 'method': 'Runtime.evaluate', 'params': {
-                'expression': js, 'returnByValue': True}}))
+                'expression': resolve + js, 'returnByValue': True}}))
             resp = _json.loads(ws.recv())
             ws.close()
             val = resp.get('result', {}).get('result', {}).get('value')
@@ -1181,14 +1215,18 @@ class ScraplingGrabberGUI:
             self._ai_chat_history.append({'role': 'assistant', 'content': final})
 
     def _ai_chat_send(self):
-        """AI 对话（助手模式）：发送用户消息，模型可调用工具操作软件；若已添加截图则走看图识别"""
-        text = self.ai_chat_input.get().strip()
+        """AI 对话（页签版）：发送用户消息，模型可调用工具操作软件；若已添加截图则走看图识别"""
+        self._ai_chat_send_from(self.ai_chat_input)
+
+    def _ai_chat_send_from(self, entry):
+        """AI 对话通用发送：entry 为输入框（页签或磁吸窗共用）"""
+        text = entry.get().strip()
         if not text and not getattr(self, '_ai_pending_image', None):
             return
         if not (self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)):
             self._log('AI对话: AI服务未运行，请先点击「启动AI服务」')
             return
-        self.ai_chat_input.delete(0, 'end')
+        entry.delete(0, 'end')
         if getattr(self, '_ai_pending_image', None):
             pending = self._ai_pending_image
             self._ai_pending_image = None
@@ -1556,7 +1594,12 @@ class ScraplingGrabberGUI:
         self.ai_toggle_btn.pack(side='left', padx=6)
         self.ai_status_var = tk.StringVar(value=self._ai_state)
         ttk.Label(ai_opt, textvariable=self.ai_status_var, foreground='#888').pack(side='left')
-        ttk.Button(ai_opt, text='游戏修改', width=10, command=self._toggle_game_mod_window).pack(side='left', padx=(10, 0))
+
+        # 磁吸窗按钮行（独立一行，避免和AI选项挤在一起溢出）
+        win_btn = ttk.Frame(top_frame)
+        win_btn.pack(fill='x', pady=1)
+        ttk.Button(win_btn, text='AI对话', width=10, command=self._toggle_ai_float_window).pack(side='left', padx=(0, 4))
+        ttk.Button(win_btn, text='游戏修改', width=10, command=self._toggle_game_mod_window).pack(side='left')
 
         # AI 模型/服务路径变量（控件在设置窗口）
         self.ai_model_var = tk.StringVar()
@@ -2110,20 +2153,28 @@ class ScraplingGrabberGUI:
             pass
 
     def _on_root_configure(self, e):
-        """主窗口移动/缩放：贴合状态的修改器实时跟随（用winfo查询，不依赖e.x_root——Windows上它为0）"""
+        """主窗口移动/缩放：贴合状态的修改器/AI窗实时跟随（用winfo查询，不依赖e.x_root——Windows上它为0）"""
         try:
             if not (getattr(self, 'game_win', None) and self.game_win.winfo_exists()
                     and self.game_win.state() == 'normal' and getattr(self, '_ec_docked', False)):
+                pass
+            else:
+                cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
+                if cur != getattr(self, '_last_root_pos', None):
+                    self._last_root_pos = cur
+                    self._snap_game_win()
+            if not (getattr(self, 'ai_float_win', None) and self.ai_float_win.winfo_exists()
+                    and self.ai_float_win.state() == 'normal' and getattr(self, '_ai_float_docked', False)):
                 return
             cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
             if cur != getattr(self, '_last_root_pos', None):
                 self._last_root_pos = cur
-                self._snap_game_win()
+                self._snap_ai_float_win()
         except Exception:
             pass
 
     def _poll_game_snap(self):
-        """轮询兜底：Configure未触发时（如拖动中），贴合状态也跟随"""
+        """轮询兜底：Configure未触发时（如拖动中），贴合状态的窗口也跟随"""
         try:
             if (getattr(self, 'game_win', None) and self.game_win.winfo_exists()
                     and self.game_win.state() == 'normal' and getattr(self, '_ec_docked', False)):
@@ -2131,6 +2182,12 @@ class ScraplingGrabberGUI:
                 if cur != getattr(self, '_last_root_pos', None):
                     self._last_root_pos = cur
                     self._snap_game_win()
+            if (getattr(self, 'ai_float_win', None) and self.ai_float_win.winfo_exists()
+                    and self.ai_float_win.state() == 'normal' and getattr(self, '_ai_float_docked', False)):
+                cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
+                if cur != getattr(self, '_last_root_pos', None):
+                    self._last_root_pos = cur
+                    self._snap_ai_float_win()
         except Exception:
             pass
         self.root.after(150, self._poll_game_snap)
@@ -2224,6 +2281,101 @@ class ScraplingGrabberGUI:
                 self._snap_game_win()
             else:
                 self._ec_docked = False
+        except Exception:
+            pass
+
+    # ===== AI对话磁吸窗（与游戏修改窗口同款贴合机制） =====
+    def _toggle_ai_float_window(self):
+        """点一下：AI对话窗贴合主窗口右侧显示；再点：隐藏"""
+        if getattr(self, 'ai_float_win', None) is not None and self.ai_float_win.winfo_exists():
+            if self.ai_float_win.state() == 'normal':
+                self.ai_float_win.withdraw()
+                return
+            self.ai_float_win.deiconify()
+            self._snap_ai_float_win()
+            return
+        self._create_ai_float_win()
+        self._snap_ai_float_win()
+
+    def _snap_ai_float_win(self):
+        """AI对话窗磁吸主窗口右边缘（高度与主窗口同长）"""
+        try:
+            self.root.update_idletasks()
+            rx = self.root.winfo_x()
+            ry = self.root.winfo_y()
+            rw = self.root.winfo_width()
+            rh = max(300, self.root.winfo_height())
+            self.ai_float_win.geometry('360x%d+%d+%d' % (rh, rx + rw, ry))
+            self._ai_float_docked = True
+        except Exception:
+            pass
+
+    def _create_ai_float_win(self):
+        """AI对话磁吸窗：对话记录 + 输入发送/截图/清空（复用助手对话逻辑）"""
+        win = tk.Toplevel(self.root)
+        self.ai_float_win = win
+        win.title('AI对话')
+        win.geometry('360x600+0+0')
+        win.transient(self.root)
+        self._ai_float_docked = False
+        self._ai_float_last_xy = None
+
+        txt = tk.Text(win, wrap='word', font=('Consolas', 9))
+        ai_scroll = ttk.Scrollbar(win, command=txt.yview)
+        txt.configure(yscrollcommand=ai_scroll.set)
+        txt.pack(side='left', fill='both', expand=True)
+        ai_scroll.pack(side='right', fill='y')
+        txt.tag_configure('req', foreground='#1a56db')
+        txt.tag_configure('resp', foreground='#0d7a3d')
+        txt.tag_configure('tool', foreground='#b45309')
+        txt.tag_configure('sep', foreground='#bbbbbb')
+        self.ai_float_text = txt
+
+        bottom = ttk.Frame(win)
+        bottom.pack(side='bottom', fill='x', padx=6, pady=6)
+        self.ai_float_input = ttk.Entry(bottom)
+        self.ai_float_input.pack(side='left', fill='x', expand=True)
+        self.ai_float_input.bind('<Return>', lambda e: self._ai_chat_send_from(self.ai_float_input))
+        ttk.Button(bottom, text='发送', width=6,
+                   command=lambda: self._ai_chat_send_from(self.ai_float_input)).pack(side='left', padx=(4, 0))
+        ttk.Button(bottom, text='截图', width=6, command=self._ai_add_shot).pack(side='left', padx=(4, 0))
+        ttk.Button(bottom, text='清空', width=6, command=self._ai_clear_chat).pack(side='left', padx=(4, 0))
+
+        win.protocol('WM_DELETE_WINDOW', self._ai_float_close)
+        # 独立拖动/缩放：松手靠近主窗口自动吸回
+        win.bind('<Configure>', self._on_ai_float_configure)
+        # 把页签已有对话同步过来
+        try:
+            txt.insert('1.0', self.ai_chat_text.get('1.0', 'end'))
+        except Exception:
+            pass
+
+    def _ai_float_close(self):
+        """X 关闭 = 隐藏（贴合窗口复用）"""
+        try:
+            self.ai_float_win.withdraw()
+        except Exception:
+            pass
+
+    def _on_ai_float_configure(self, e):
+        """AI对话窗拖动/缩放：松手在边缘100px内自动吸回；拖远自由"""
+        try:
+            if e.widget != self.ai_float_win:
+                return
+            gw = self.ai_float_win
+            gx, gy = gw.winfo_x(), gw.winfo_y()
+            last = getattr(self, '_ai_float_last_xy', None)
+            if last == (gx, gy):
+                return
+            self._ai_float_last_xy = (gx, gy)
+            if gw.state() != 'normal':
+                return
+            rx, ry, rw = self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width()
+            rh = self.root.winfo_height()
+            if abs(gx - (rx + rw)) <= 100 and gy + gw.winfo_height() > ry and gy < ry + rh:
+                self._snap_ai_float_win()
+            else:
+                self._ai_float_docked = False
         except Exception:
             pass
 
