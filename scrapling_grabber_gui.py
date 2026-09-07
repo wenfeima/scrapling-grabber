@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.10'
+APP_VERSION = 'v2.12.11'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -1845,142 +1845,179 @@ class ScraplingGrabberGUI:
                     raise Exception('调试浏览器启动超时，请手动点击"启动调试浏览器"按钮后重试')
             try:
                 import websocket
-                # 获取浏览器级调试连接（用于创建/关闭标签页）
-                ver_resp = requests.get('http://127.0.0.1:9222/json/version', timeout=5)
-                browser_ws_url = ver_resp.json().get('webSocketDebuggerUrl')
-                if not browser_ws_url:
-                    raise Exception('无法获取浏览器调试地址')
-
-                # 创建独立标签页（避免多线程共用标签页互相干扰）
-                bws = websocket.create_connection(browser_ws_url, timeout=15)
-
-                def _send_browser_cmd(cmd_id, method, params=None):
-                    cmd = {'id': cmd_id, 'method': method}
-                    if params:
-                        cmd['params'] = params
-                    bws.send(json.dumps(cmd))
-                    while True:
-                        msg = json.loads(bws.recv())
-                        if msg.get('id') == cmd_id:
-                            return msg
-
-                target_res = _send_browser_cmd(1, 'Target.createTarget', {'url': 'about:blank'})
-                target_id = target_res.get('result', {}).get('targetId', '')
-                if not target_id:
-                    bws.close()
-                    raise Exception('创建独立标签页失败')
-
-                # 从标签页列表中找到新标签页的调试地址
-                tab_ws_url = None
-                for _try in range(20):
+                from urllib.parse import urlparse as _urlparse
+                import threading
+                # 全局锁：CDP 取页面串行化（多线程复用同一标签页时避免互踩）
+                if not hasattr(self, '_cdp_fetch_lock'):
+                    self._cdp_fetch_lock = threading.Lock()
+                with self._cdp_fetch_lock:
+                    # ===== 优先复用已打开的现有标签页（已通过站点CF验证，避免新标签导航触发反爬封禁）=====
+                    reuse_ws_url = None
+                    need_navigate = True
                     try:
-                        tabs = requests.get('http://127.0.0.1:9222/json', timeout=5).json()
-                        for t in tabs:
-                            if t.get('id') == target_id and t.get('webSocketDebuggerUrl'):
-                                tab_ws_url = t['webSocketDebuggerUrl']
+                        _tabs = requests.get('http://127.0.0.1:9222/json', timeout=5).json()
+                        _page_tabs = [t for t in _tabs if t.get('type') == 'page']
+                        _target_domain = _urlparse(url).netloc
+                        for _t in _page_tabs:
+                            if _t.get('url', '').rstrip('/') == url.rstrip('/'):
+                                reuse_ws_url = _t.get('webSocketDebuggerUrl')
+                                need_navigate = False
                                 break
+                        if not reuse_ws_url:
+                            for _t in _page_tabs:
+                                if _urlparse(_t.get('url', '')).netloc == _target_domain and _t.get('url', '').startswith('http'):
+                                    reuse_ws_url = _t.get('webSocketDebuggerUrl')
+                                    break
                     except Exception:
                         pass
-                    if tab_ws_url:
-                        break
-                    time.sleep(0.3)
-                if not tab_ws_url:
+
+                    bws = None
+                    target_id = ''
+                    if reuse_ws_url:
+                        # 复用现有标签页，不创建新标签
+                        self._log('CDP浏览器模式: 复用已打开的浏览器标签页' + ('' if not need_navigate else '（导航到目标URL）'))
+                        ws = websocket.create_connection(reuse_ws_url, timeout=timeout + 10)
+                    else:
+                        # 获取浏览器级调试连接（用于创建/关闭标签页）
+                        ver_resp = requests.get('http://127.0.0.1:9222/json/version', timeout=5)
+                        browser_ws_url = ver_resp.json().get('webSocketDebuggerUrl')
+                        if not browser_ws_url:
+                            raise Exception('无法获取浏览器调试地址')
+
+                        # 创建独立标签页（避免多线程共用标签页互相干扰）
+                        bws = websocket.create_connection(browser_ws_url, timeout=15)
+
+                        def _send_browser_cmd(cmd_id, method, params=None):
+                            cmd = {'id': cmd_id, 'method': method}
+                            if params:
+                                cmd['params'] = params
+                            bws.send(json.dumps(cmd))
+                            while True:
+                                msg = json.loads(bws.recv())
+                                if msg.get('id') == cmd_id:
+                                    return msg
+
+                        target_res = _send_browser_cmd(1, 'Target.createTarget', {'url': 'about:blank'})
+                        target_id = target_res.get('result', {}).get('targetId', '')
+                        if not target_id:
+                            bws.close()
+                            raise Exception('创建独立标签页失败')
+
+                        # 从标签页列表中找到新标签页的调试地址
+                        tab_ws_url = None
+                        for _try in range(20):
+                            try:
+                                tabs = requests.get('http://127.0.0.1:9222/json', timeout=5).json()
+                                for t in tabs:
+                                    if t.get('id') == target_id and t.get('webSocketDebuggerUrl'):
+                                        tab_ws_url = t['webSocketDebuggerUrl']
+                                        break
+                            except Exception:
+                                pass
+                            if tab_ws_url:
+                                break
+                            time.sleep(0.3)
+                        if not tab_ws_url:
+                            try:
+                                _send_browser_cmd(99, 'Target.closeTarget', {'targetId': target_id})
+                            except Exception:
+                                pass
+                            bws.close()
+                            raise Exception('无法获取新标签页的调试地址')
+
+                        ws = websocket.create_connection(tab_ws_url, timeout=timeout + 10)
+
+                    # 辅助函数：发送CDP命令并等待对应ID的响应（忽略事件消息）
+                    def send_cdp(cmd_id, method, params=None):
+                        cmd = {'id': cmd_id, 'method': method}
+                        if params:
+                            cmd['params'] = params
+                        ws.send(json.dumps(cmd))
+                        while True:
+                            msg = json.loads(ws.recv())
+                            if msg.get('id') == cmd_id:
+                                return msg
+                            # 事件消息，继续等待
+
+                    # 导航到用户输入的URL（复用标签且URL一致时跳过导航，避免触发反爬）
+                    if need_navigate:
+                        self._log('CDP浏览器模式: 正在导航到 %s' % url[:80])
+                        send_cdp(1, 'Page.navigate', {'url': url})
+                    else:
+                        self._log('CDP浏览器模式: 当前标签页已是目标页面，直接提取')
+
+                    # 启用页面事件监听
                     try:
-                        _send_browser_cmd(99, 'Target.closeTarget', {'targetId': target_id})
+                        send_cdp(10, 'Page.enable')
                     except Exception:
                         pass
-                    bws.close()
-                    raise Exception('无法获取新标签页的调试地址')
 
-                ws = websocket.create_connection(tab_ws_url, timeout=timeout + 10)
+                    # 等待页面加载事件（最多等待15秒；复用已打开标签页时跳过等待）
+                    load_event_detected = not need_navigate
+                    wait_start = time.time()
+                    while not load_event_detected and time.time() - wait_start < 15:
+                        try:
+                            ws.settimeout(1)
+                            msg = json.loads(ws.recv())
+                            if msg.get('method') == 'Page.loadEventFired':
+                                load_event_detected = True
+                                break
+                        except Exception:
+                            # 超时继续等待
+                            pass
+                    ws.settimeout(None)
 
-                # 辅助函数：发送CDP命令并等待对应ID的响应（忽略事件消息）
-                def send_cdp(cmd_id, method, params=None):
-                    cmd = {'id': cmd_id, 'method': method}
-                    if params:
-                        cmd['params'] = params
-                    ws.send(json.dumps(cmd))
-                    while True:
-                        msg = json.loads(ws.recv())
-                        if msg.get('id') == cmd_id:
-                            return msg
-                        # 事件消息，继续等待
-
-                # 先导航到用户输入的URL
-                self._log('CDP浏览器模式: 正在导航到 %s' % url[:80])
-                nav_result = send_cdp(1, 'Page.navigate', {'url': url})
-
-                # 启用页面事件监听
-                try:
-                    send_cdp(10, 'Page.enable')
-                except Exception:
-                    pass
-
-                # 等待页面加载事件（最多等待15秒）
-                load_event_detected = False
-                wait_start = time.time()
-                while time.time() - wait_start < 15:
-                    try:
-                        ws.settimeout(1)
-                        msg = json.loads(ws.recv())
-                        if msg.get('method') == 'Page.loadEventFired':
-                            load_event_detected = True
-                            break
-                    except Exception:
-                        # 超时继续等待
-                        pass
-                ws.settimeout(None)
-
-                # 如果没有检测到加载事件，额外等待3秒
-                if not load_event_detected:
-                    time.sleep(3)
-                else:
-                    # 检测到加载事件后，额外等待2秒确保动态内容加载
-                    time.sleep(2)
-
-                # 多次滚动页面，触发懒加载图片
-                try:
-                    for scroll_round in range(3):
-                        # 滚动到页面底部
-                        send_cdp(2 + scroll_round * 2, 'Runtime.evaluate', {
-                            'expression': 'window.scrollTo(0, document.body.scrollHeight)',
-                            'returnByValue': True
-                        })
+                    # 如果没有检测到加载事件，额外等待3秒
+                    if not load_event_detected:
+                        time.sleep(3)
+                    else:
+                        # 检测到加载事件后，额外等待2秒确保动态内容加载
                         time.sleep(2)
-                        # 滚动到页面中间
-                        send_cdp(2 + scroll_round * 2 + 1, 'Runtime.evaluate', {
-                            'expression': 'window.scrollTo(0, document.body.scrollHeight / 2)',
+
+                    # 多次滚动页面，触发懒加载图片
+                    try:
+                        for scroll_round in range(3):
+                            # 滚动到页面底部
+                            send_cdp(2 + scroll_round * 2, 'Runtime.evaluate', {
+                                'expression': 'window.scrollTo(0, document.body.scrollHeight)',
+                                'returnByValue': True
+                            })
+                            time.sleep(2)
+                            # 滚动到页面中间
+                            send_cdp(2 + scroll_round * 2 + 1, 'Runtime.evaluate', {
+                                'expression': 'window.scrollTo(0, document.body.scrollHeight / 2)',
+                                'returnByValue': True
+                            })
+                            time.sleep(1)
+                        # 最后滚动回顶部
+                        send_cdp(100, 'Runtime.evaluate', {
+                            'expression': 'window.scrollTo(0, 0)',
                             'returnByValue': True
                         })
                         time.sleep(1)
-                    # 最后滚动回顶部
-                    send_cdp(100, 'Runtime.evaluate', {
-                        'expression': 'window.scrollTo(0, 0)',
+                    except Exception:
+                        pass
+
+                    # 获取页面HTML
+                    result = send_cdp(4, 'Runtime.evaluate', {
+                        'expression': 'document.documentElement.outerHTML',
                         'returnByValue': True
                     })
-                    time.sleep(1)
-                except Exception:
-                    pass
+                    ws.close()
 
-                # 获取页面HTML
-                result = send_cdp(4, 'Runtime.evaluate', {
-                    'expression': 'document.documentElement.outerHTML',
-                    'returnByValue': True
-                })
-                ws.close()
+                    # 关闭独立标签页（复用用户标签页时不关闭）
+                    if bws is not None:
+                        try:
+                            _send_browser_cmd(2, 'Target.closeTarget', {'targetId': target_id})
+                            bws.close()
+                        except Exception:
+                            pass
 
-                # 关闭独立标签页
-                try:
-                    _send_browser_cmd(2, 'Target.closeTarget', {'targetId': target_id})
-                    bws.close()
-                except Exception:
-                    pass
-
-                if 'result' in result and 'result' in result['result']:
-                    html = result['result']['result'].get('value', '')
-                if not html:
-                    raise Exception('无法获取页面HTML')
-                self._log('CDP浏览器模式: 已获取页面HTML (长度=%d)' % len(html))
+                    if 'result' in result and 'result' in result['result']:
+                        html = result['result']['result'].get('value', '')
+                    if not html:
+                        raise Exception('无法获取页面HTML')
+                    self._log('CDP浏览器模式: 已获取页面HTML (长度=%d)' % len(html))
             except Exception as e:
                 raise Exception('CDP浏览器模式连接失败: %s，请先启动调试浏览器（9222端口）' % e)
         elif render_mode == '浏览器渲染':
@@ -3363,6 +3400,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
