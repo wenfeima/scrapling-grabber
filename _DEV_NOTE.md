@@ -1,6 +1,11 @@
-# Scrapling 图片爬虫 - 开发交接笔记（v2.12.5）
+# Scrapling 图片爬虫 - 开发交接笔记（v2.12.6）
 
-## v2.12.5 修复（内嵌浏览器图标/图层缺失，彻底解决）
+## v2.12.6 修复（内嵌浏览器元素缺失，真根因）
+- **关键认知**：v2.12.4/2.12.5 的 --disable-gpu 系列没用 → 不是 GPU 问题
+- **真根因**：Chrome 被 SetParent 嵌入后，系统判定窗口"被遮挡/不可见"（occluded）→ Chrome 按后台窗口节流渲染与资源加载 → favicon/快捷方式图标不绘制、严重时整页黑屏
+- **修复**：启动参数加 `--disable-backgrounding-occluded-windows`（强制嵌入窗口按前台渲染）+ `--disable-renderer-backgrounding`，保留 GPU 组合；3 处启动路径
+
+## v2.12.5 修复（内嵌浏览器图标/图层缺失，未完全解决）
 - **现象**：内嵌浏览器（SetParent 嵌入 Tkinter）页面主体能显示，但部分 UI 元素渲染缺失——地址栏右侧图标空白、快捷方式图标只剩"推"/叉号
 - **根因**：Chrome 被 SetParent 嵌入另一进程窗口后，GPU 合成（compositing）失效导致部分图层不绘制；v2.12.4 的 --disable-gpu 单独不够
 - **修复**：启动参数再补 `--disable-gpu-compositing`（强制软件合成），与 --disable-gpu 组合（Chrome/Edge/独立窗口 3 处启动路径）——SetParent 嵌入 Chrome 的成熟方案
