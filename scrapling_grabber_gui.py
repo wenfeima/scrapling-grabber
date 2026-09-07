@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.9.0'
+APP_VERSION = 'v2.10.0'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -60,6 +60,27 @@ AI_JUDGE_PROMPT = ('这是网页抓取的一张图片。请判断它属于哪一
                    '或"无关"（logo、图标、表情包、按钮、横幅、纯色背景、文字截图等页面装饰元素）。'
                    '注意：图片带水印或网站标记不影响判断，内容为写真/主题图的仍属于正文。'
                    '只回答两个字：正文 或 无关')
+
+# AI 判断 + 提示词生成（启用"AI生成提示词"时使用）
+AI_PROMPT_PROMPT = ('这是网页抓取的一张图片。请完成两项任务：\n'
+                    '1. 判断图片类别："正文"（人物写真、主题摄影、插画、风景等帖子正文内容）'
+                    '或"无关"（logo、图标、表情包、按钮、横幅、文字截图等页面装饰元素），带水印不影响判断；\n'
+                    '2. 如果属于"正文"，为这张图生成一份 AI 绘图提示词，用于图像生成模型复现这张图。\n'
+                    '严格按以下格式输出（只输出以下三行，不要输出其他内容）：\n'
+                    '类别: 正文 或 无关\n'
+                    '中文: 详细的中文提示词，包含人物外貌特征、服装、姿态、表情、场景、光线氛围，'
+                    '以及镜头焦距、光圈等专业摄影描述\n'
+                    '英文: 英文逗号分隔的提示词tag，适合Stable Diffusion风格，'
+                    '如 masterpiece, best quality, 1girl, detailed face 等\n'
+                    '示例：\n'
+                    '类别: 正文\n'
+                    '中文: 一个18岁的东亚女孩，椭圆形脸型，深棕色眼睛直视镜头，自然水润妆容，穿着白色吊带裙，'
+                    '站在海边沙滩上，金色阳光洒在脸上，背景是蓝色海洋和天空，镜头采用85mm焦距，光圈设置为f/1.8，'
+                    '浅景深，柔和逆光，皮肤质感细腻\n'
+                    '英文: masterpiece, best quality, 1girl, chinese girl, long black hair, brown eyes, white sundress, '
+                    'beach, ocean, sunlight, backlight, 85mm, f1.8, bokeh, detailed skin, looking at viewer')
+# 启用提示词时模型输出的最大 token 数
+AI_PROMPT_MAX_TOKENS = 800
 
 # 配置文件路径
 CONFIG_FILE = os.path.join(os.path.expanduser('~'), '.scrapling_grabber_config.json')
@@ -176,6 +197,7 @@ class ScraplingGrabberGUI:
         self.min_size_var.set(self.cfg.get('min_size', 0))
         # AI 过滤设置
         self.ai_filter_var.set(self.cfg.get('ai_filter', False))
+        self.ai_prompt_var.set(self.cfg.get('ai_prompt', False))
         self.ai_preset_var.set(self.cfg.get('ai_preset', '内置4B（笔记本1660）'))
         self.ai_model_var.set(self.cfg.get('ai_model', ''))
         self.ai_mmproj_var.set(self.cfg.get('ai_mmproj', ''))
@@ -198,6 +220,7 @@ class ScraplingGrabberGUI:
             'min_size': self.min_size_var.get(),
             # AI 过滤设置
             'ai_filter': self.ai_filter_var.get(),
+            'ai_prompt': self.ai_prompt_var.get(),
             'ai_preset': self.ai_preset_var.get(),
             'ai_model': self.ai_model_var.get().strip(),
             'ai_mmproj': self.ai_mmproj_var.get().strip(),
@@ -328,12 +351,15 @@ class ScraplingGrabberGUI:
         return False
 
     def _ai_judge_one(self, img_path):
-        """单张图片 AI 判断，返回 '正文' / '无关' / '保留(...)'"""
+        """单张图片 AI 判断。
+        返回 '正文' / '无关' / '保留(...)'（仅过滤模式）；
+        启用提示词时返回 {'cat': ..., 'cn': ..., 'en': ...}"""
         if img_path in self.ai_cache:
             return self.ai_cache[img_path]
         import requests
         import base64
-        result = '保留(错误)'
+        use_prompt = bool(self.ai_prompt_var.get())
+        result = '保留(错误)' if not use_prompt else {'cat': '保留(错误)', 'cn': '', 'en': ''}
         try:
             with open(img_path, 'rb') as f:
                 b64 = base64.b64encode(f.read()).decode()
@@ -342,38 +368,78 @@ class ScraplingGrabberGUI:
                 ext = 'jpeg'
             url = 'data:image/%s;base64,%s' % (ext, b64)
             port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
+            prompt_text = AI_PROMPT_PROMPT if use_prompt else AI_JUDGE_PROMPT
+            max_tokens = AI_PROMPT_MAX_TOKENS if use_prompt else 128
             r = requests.post(
                 'http://127.0.0.1:%d/v1/chat/completions' % port,
                 json={'messages': [{'role': 'user', 'content': [
                     {'type': 'image_url', 'image_url': {'url': url}},
-                    {'type': 'text', 'text': AI_JUDGE_PROMPT}]}],
-                    'max_tokens': 128, 'temperature': 0.1},
+                    {'type': 'text', 'text': prompt_text}]}],
+                    'max_tokens': max_tokens, 'temperature': 0.1},
                 timeout=300)
             if r.status_code == 200:
                 content = (r.json()['choices'][0]['message'].get('content') or '').strip()
-                if '无关' in content:
+                if use_prompt:
+                    result = self._ai_parse_prompt(content)
+                elif '无关' in content:
                     result = '无关'
                 elif '正文' in content:
                     result = '正文'
                 else:
                     result = '保留(未知:%s)' % content[:10]
             else:
-                result = '保留(HTTP%d)' % r.status_code
+                if use_prompt:
+                    result = {'cat': '保留(HTTP%d)' % r.status_code, 'cn': '', 'en': ''}
+                else:
+                    result = '保留(HTTP%d)' % r.status_code
         except Exception as e:
-            result = '保留(错误)'
+            if use_prompt:
+                result = {'cat': '保留(错误)', 'cn': '', 'en': ''}
+            else:
+                result = '保留(错误)'
         self.ai_cache[img_path] = result
         return result
 
+    @staticmethod
+    def _ai_parse_prompt(content):
+        """解析提示词模式输出：类别/中文/英文 三行格式，返回 dict"""
+        cat = '保留(未知)'
+        cn = ''
+        en = ''
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith('类别'):
+                val = line.split(':', 1)[1].strip() if ':' in line else ''
+                if '无关' in val:
+                    cat = '无关'
+                elif '正文' in val:
+                    cat = '正文'
+            elif line.startswith('中文'):
+                cn = line.split(':', 1)[1].strip() if ':' in line else ''
+            elif line.startswith('英文'):
+                en = line.split(':', 1)[1].strip() if ':' in line else ''
+        if cat == '保留(未知)':
+            # 容错：模型没按格式输出时回退到关键词判断
+            if '无关' in content:
+                cat = '无关'
+            elif '正文' in content:
+                cat = '正文'
+        return {'cat': cat, 'cn': cn, 'en': en}
+
     def _ai_filter_images(self, save_dir, task_id=None):
-        """对已下载图片做 AI 过滤，删除无关图，返回删除数量"""
+        """对已下载图片做 AI 过滤：删除无关图，可选生成提示词 txt，返回删除数量"""
         if not self._ai_server_ok():
             return 0
         files = sorted(glob.glob(os.path.join(save_dir, 'img_*.*')))
         if not files:
             return 0
+        use_prompt = bool(self.ai_prompt_var.get())
         self._log('AI过滤: 开始判断 %d 张图片（本地模型，速度较慢，请耐心等待）...' % len(files))
+        if use_prompt:
+            self._log('AI提示词: 已开启，每张图将生成中英文提示词（耗时更长，约1-2分钟/张）')
         removed = 0
         kept = 0
+        prompt_cnt = 0
         for i, fp in enumerate(files, 1):
             if self.stop_flag.is_set():
                 self._log('AI过滤: 已停止')
@@ -381,7 +447,11 @@ class ScraplingGrabberGUI:
             self.stat_var.set('AI过滤中 %d/%d ...' % (i, len(files)))
             result = self._ai_judge_one(fp)
             name = os.path.basename(fp)
-            if result == '无关':
+            if use_prompt:
+                cat = result.get('cat', '保留(错误)') if isinstance(result, dict) else result
+            else:
+                cat = result
+            if cat == '无关':
                 try:
                     os.remove(fp)
                     removed += 1
@@ -390,11 +460,41 @@ class ScraplingGrabberGUI:
                     self._log('AI过滤: [%d/%d] %s 删除失败' % (i, len(files), name))
             else:
                 kept += 1
-                self._log('AI过滤: [%d/%d] 保留 %s（%s）' % (i, len(files), name, result))
-        self._log('AI过滤完成: 保留 %d 张，删除 %d 张' % (kept, removed))
+                if use_prompt and isinstance(result, dict):
+                    if result.get('cn') or result.get('en'):
+                        if self._ai_save_prompt(fp, result):
+                            prompt_cnt += 1
+                            self._log('AI过滤: [%d/%d] 保留 %s（已生成提示词）' % (i, len(files), name))
+                        else:
+                            self._log('AI过滤: [%d/%d] 保留 %s（%s）' % (i, len(files), name, cat))
+                    else:
+                        self._log('AI过滤: [%d/%d] 保留 %s（%s，无提示词）' % (i, len(files), name, cat))
+                else:
+                    self._log('AI过滤: [%d/%d] 保留 %s（%s）' % (i, len(files), name, cat))
+        self._log('AI过滤完成: 保留 %d 张，删除 %d 张%s' % (kept, removed, '，生成提示词 %d 份' % prompt_cnt if prompt_cnt else ''))
         if task_id:
             self._update_task(task_id, status='完成')
         return removed
+
+    def _ai_save_prompt(self, img_path, result):
+        """把提示词结果保存为同名 txt（img_001.jpg -> img_001.txt）"""
+        try:
+            txt_path = os.path.splitext(img_path)[0] + '.txt'
+            cn = (result.get('cn') or '').strip()
+            en = (result.get('en') or '').strip()
+            lines = []
+            if cn:
+                lines.append('# 中文提示词')
+                lines.append(cn)
+                lines.append('')
+            if en:
+                lines.append('# 英文 Tag')
+                lines.append(en)
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            return True
+        except Exception:
+            return False
 
     def _on_closing(self):
         """窗口关闭时保存设置"""
@@ -514,12 +614,15 @@ class ScraplingGrabberGUI:
         # （智能过滤、增量扫描、强制重扫已移到保存目录行）
 
         # ===== AI 智能过滤设置（可选，需本地模型） =====
-        ai_frame = ttk.LabelFrame(top_frame, text='AI 智能过滤（可选功能，需本地 Qwen 模型）')
+        ai_frame = ttk.LabelFrame(top_frame, text='AI 智能处理（过滤+提示词，可选，需本地 Qwen 模型）')
         ai_frame.pack(fill='x', pady=3)
         ai_row1 = ttk.Frame(ai_frame)
         ai_row1.pack(fill='x', padx=5, pady=2)
         self.ai_filter_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(ai_row1, text='启用AI过滤', variable=self.ai_filter_var).pack(side='left')
+        self.ai_prompt_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ai_row1, text='AI生成提示词', variable=self.ai_prompt_var).pack(side='left', padx=(8, 0))
+        ttk.Label(ai_row1, text='（每张图输出中英文提示词，存同名txt）', foreground='#999').pack(side='left', padx=(2, 0))
         ttk.Label(ai_row1, text='模型:').pack(side='left', padx=(10, 2))
         self.ai_preset_var = tk.StringVar(value='内置4B（笔记本1660）')
         preset_combo = ttk.Combobox(ai_row1, textvariable=self.ai_preset_var, width=24, state='readonly')
