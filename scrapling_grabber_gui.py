@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.10.0'
+APP_VERSION = 'v2.10.1'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -44,11 +44,11 @@ AI_DEFAULT_PORT = 8080
 AI_SERVER_DEFAULT = r'L:\工作流\千问无审查模型配置\llama-b9297-bin-win-cuda-12.4-x64\llama-server.exe'
 # 模型预设：名称 -> (主模型, 视觉模型)
 AI_MODEL_PRESETS = {
-    '内置4B（笔记本1660）': (
+    '内置4B（6G显存）': (
         r'L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-4B-Q4_K_M.gguf',
         r'L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-4B-mmproj-BF16.gguf',
     ),
-    '内置9B（台式机4070）': (
+    '内置9B（12G显存）': (
         r'L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf',
         r'L:\ComfyUI\ComfyUI\models\LLM\mmproj-Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-BF16.gguf',
     ),
@@ -146,6 +146,9 @@ class ScraplingGrabberGUI:
         self.ai_ok = False           # 服务是否就绪
         self.ai_cache = {}           # 图片路径 -> 判断结果缓存
         self._ai_state = '未启动'     # 服务状态（工作线程写入，主线程轮询显示）
+        self.ai_toggle_btn = None    # 设置窗口里的启停按钮（打开设置窗口时才创建）
+        self.ai_status_var = None    # 设置窗口里的状态标签
+        self.settings_win = None     # 设置窗口句柄
 
         self._create_widgets()
         self._load_settings()
@@ -195,10 +198,14 @@ class ScraplingGrabberGUI:
         self.grab_mode_var.set(self.cfg.get('grab_mode', '单页'))
         self.post_range_var.set(self.cfg.get('post_range', '20'))
         self.min_size_var.set(self.cfg.get('min_size', 0))
-        # AI 过滤设置
+        # AI 过滤设置（旧预设名自动回退到新默认）
+        preset = self.cfg.get('ai_preset', '内置4B（6G显存）')
+        if preset not in AI_MODEL_PRESETS:
+            preset = '内置4B（6G显存）'
         self.ai_filter_var.set(self.cfg.get('ai_filter', False))
         self.ai_prompt_var.set(self.cfg.get('ai_prompt', False))
-        self.ai_preset_var.set(self.cfg.get('ai_preset', '内置4B（笔记本1660）'))
+        self.ai_auto_stop_var.set(self.cfg.get('ai_auto_stop', False))
+        self.ai_preset_var.set(preset)
         self.ai_model_var.set(self.cfg.get('ai_model', ''))
         self.ai_mmproj_var.set(self.cfg.get('ai_mmproj', ''))
         self.ai_server_var.set(self.cfg.get('ai_server', AI_SERVER_DEFAULT))
@@ -221,6 +228,7 @@ class ScraplingGrabberGUI:
             # AI 过滤设置
             'ai_filter': self.ai_filter_var.get(),
             'ai_prompt': self.ai_prompt_var.get(),
+            'ai_auto_stop': self.ai_auto_stop_var.get(),
             'ai_preset': self.ai_preset_var.get(),
             'ai_model': self.ai_model_var.get().strip(),
             'ai_mmproj': self.ai_mmproj_var.get().strip(),
@@ -246,9 +254,11 @@ class ScraplingGrabberGUI:
             getattr(self, var_name).set(path)
 
     def _ai_update_status(self, text, color='#888'):
-        self.ai_status_var.set(text)
-        running = self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)
-        self.ai_toggle_btn.config(text='停止AI服务' if running else '启动AI服务')
+        if self.ai_status_var is not None:
+            self.ai_status_var.set(text)
+        if self.ai_toggle_btn is not None:
+            running = self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)
+            self.ai_toggle_btn.config(text='停止AI服务' if running else '启动AI服务')
 
     def _ai_toggle_server(self):
         """启动/停止 AI 服务"""
@@ -553,15 +563,16 @@ class ScraplingGrabberGUI:
         self.url_combo.pack(side='left', padx=3)
         # 收藏按钮
         ttk.Button(url_frame, text='收藏', command=self._favorite_url, width=6).pack(side='left', padx=3)
+        # 设置按钮（模型/保存路径等不常改的配置）
+        ttk.Button(url_frame, text='设置', command=self._open_settings, width=6).pack(side='left', padx=3)
         self._load_url_history()
 
-        # 保存目录
+        # 保存目录（只读显示，修改在设置窗口）
         dir_frame = ttk.Frame(top_frame)
         dir_frame.pack(fill='x', pady=1)
         ttk.Label(dir_frame, text='保存到:', width=6).pack(side='left')
         self.dir_var = tk.StringVar(value=os.path.join(os.getcwd(), 'downloads'))
-        ttk.Entry(dir_frame, textvariable=self.dir_var, width=60).pack(side='left', padx=3)
-        ttk.Button(dir_frame, text='浏览', command=self._browse_dir, width=6).pack(side='left', padx=3)
+        ttk.Label(dir_frame, textvariable=self.dir_var, foreground='#555').pack(side='left')
 
         self.smart_filter_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(dir_frame, text='智能过滤', variable=self.smart_filter_var).pack(side='left', padx=5)
@@ -611,49 +622,31 @@ class ScraplingGrabberGUI:
         render_combo['values'] = ('直连模式', '浏览器渲染', '浏览器模式(CDP)')
         render_combo.pack(side='left', padx=(2, 10))
 
-        # （智能过滤、增量扫描、强制重扫已移到保存目录行）
-
-        # ===== AI 智能过滤设置（可选，需本地模型） =====
-        ai_frame = ttk.LabelFrame(top_frame, text='AI 智能处理（过滤+提示词，可选，需本地 Qwen 模型）')
-        ai_frame.pack(fill='x', pady=3)
-        ai_row1 = ttk.Frame(ai_frame)
-        ai_row1.pack(fill='x', padx=5, pady=2)
+        # AI 操作行（模型路径等配置在设置窗口）
+        ai_opt = ttk.Frame(top_frame)
+        ai_opt.pack(fill='x', pady=1)
         self.ai_filter_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ai_row1, text='启用AI过滤', variable=self.ai_filter_var).pack(side='left')
+        ttk.Checkbutton(ai_opt, text='启用AI过滤', variable=self.ai_filter_var).pack(side='left')
         self.ai_prompt_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ai_row1, text='AI生成提示词', variable=self.ai_prompt_var).pack(side='left', padx=(8, 0))
-        ttk.Label(ai_row1, text='（每张图输出中英文提示词，存同名txt）', foreground='#999').pack(side='left', padx=(2, 0))
-        ttk.Label(ai_row1, text='模型:').pack(side='left', padx=(10, 2))
-        self.ai_preset_var = tk.StringVar(value='内置4B（笔记本1660）')
-        preset_combo = ttk.Combobox(ai_row1, textvariable=self.ai_preset_var, width=24, state='readonly')
+        ttk.Checkbutton(ai_opt, text='AI生成提示词', variable=self.ai_prompt_var).pack(side='left', padx=(8, 0))
+        self.ai_auto_stop_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ai_opt, text='抓取完自动停止', variable=self.ai_auto_stop_var).pack(side='left', padx=(8, 0))
+        ttk.Label(ai_opt, text='模型:').pack(side='left', padx=(10, 2))
+        self.ai_preset_var = tk.StringVar(value='内置4B（6G显存）')
+        preset_combo = ttk.Combobox(ai_opt, textvariable=self.ai_preset_var, width=24, state='readonly')
         preset_combo['values'] = list(AI_MODEL_PRESETS.keys())
         preset_combo.pack(side='left', padx=2)
         preset_combo.bind('<<ComboboxSelected>>', lambda e: self._ai_apply_preset())
-        self.ai_toggle_btn = ttk.Button(ai_row1, text='启动AI服务', command=self._ai_toggle_server, width=12)
+        self.ai_toggle_btn = ttk.Button(ai_opt, text='启动AI服务', command=self._ai_toggle_server, width=12)
         self.ai_toggle_btn.pack(side='left', padx=6)
-        self.ai_status_var = tk.StringVar(value='未启动')
-        ttk.Label(ai_row1, textvariable=self.ai_status_var, foreground='#888').pack(side='left')
-        ai_row2 = ttk.Frame(ai_frame)
-        ai_row2.pack(fill='x', padx=5, pady=1)
-        ttk.Label(ai_row2, text='主模型:').pack(side='left')
+        self.ai_status_var = tk.StringVar(value=self._ai_state)
+        ttk.Label(ai_opt, textvariable=self.ai_status_var, foreground='#888').pack(side='left')
+
+        # AI 模型/服务路径变量（控件在设置窗口）
         self.ai_model_var = tk.StringVar()
-        ttk.Entry(ai_row2, textvariable=self.ai_model_var, width=50).pack(side='left', padx=2)
-        ttk.Button(ai_row2, text='浏览', width=4, command=lambda: self._browse_ai_file('ai_model_var')).pack(side='left')
-        ai_row3 = ttk.Frame(ai_frame)
-        ai_row3.pack(fill='x', padx=5, pady=1)
-        ttk.Label(ai_row3, text='视觉模块:').pack(side='left')
         self.ai_mmproj_var = tk.StringVar()
-        ttk.Entry(ai_row3, textvariable=self.ai_mmproj_var, width=50).pack(side='left', padx=2)
-        ttk.Button(ai_row3, text='浏览', width=4, command=lambda: self._browse_ai_file('ai_mmproj_var')).pack(side='left')
-        ai_row4 = ttk.Frame(ai_frame)
-        ai_row4.pack(fill='x', padx=5, pady=1)
-        ttk.Label(ai_row4, text='服务程序:').pack(side='left')
         self.ai_server_var = tk.StringVar(value=AI_SERVER_DEFAULT)
-        ttk.Entry(ai_row4, textvariable=self.ai_server_var, width=44).pack(side='left', padx=2)
-        ttk.Button(ai_row4, text='浏览', width=4, command=lambda: self._browse_ai_file('ai_server_var')).pack(side='left')
-        ttk.Label(ai_row4, text='端口:').pack(side='left', padx=(10, 2))
         self.ai_port_var = tk.IntVar(value=AI_DEFAULT_PORT)
-        ttk.Spinbox(ai_row4, from_=1024, to=65535, textvariable=self.ai_port_var, width=5).pack(side='left')
 
         # 按钮行
         btn_frame = ttk.Frame(top_frame)
@@ -1037,6 +1030,66 @@ class ScraplingGrabberGUI:
         directory = filedialog.askdirectory(title='选择保存目录')
         if directory:
             self.dir_var.set(directory)
+
+    def _open_settings(self):
+        """打开设置窗口：保存目录/线程/超时/最小图 + AI 模型与服务配置"""
+        if self.settings_win is not None and self.settings_win.winfo_exists():
+            self.settings_win.lift()
+            self.settings_win.focus_set()
+            return
+        win = tk.Toplevel(self.root)
+        self.settings_win = win
+        win.title('设置')
+        win.geometry('640x320')
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+        win.protocol('WM_DELETE_WINDOW', self._close_settings)
+
+        # ===== 常规 =====
+        gen = ttk.LabelFrame(win, text='常规')
+        gen.pack(fill='x', padx=8, pady=6)
+        r1 = ttk.Frame(gen)
+        r1.pack(fill='x', padx=6, pady=3)
+        ttk.Label(r1, text='保存目录:').pack(side='left')
+        ttk.Entry(r1, textvariable=self.dir_var, width=48).pack(side='left', padx=2)
+        ttk.Button(r1, text='浏览', width=5, command=self._browse_dir).pack(side='left')
+
+        # ===== AI 模型与服务 =====
+        ai = ttk.LabelFrame(win, text='AI 模型与服务（本地 Qwen）')
+        ai.pack(fill='x', padx=8, pady=6)
+        r4 = ttk.Frame(ai)
+        r4.pack(fill='x', padx=6, pady=3)
+        ttk.Label(r4, text='主模型:').pack(side='left')
+        ttk.Entry(r4, textvariable=self.ai_model_var, width=48).pack(side='left', padx=2)
+        ttk.Button(r4, text='浏览', width=5, command=lambda: self._browse_ai_file('ai_model_var')).pack(side='left')
+        r5 = ttk.Frame(ai)
+        r5.pack(fill='x', padx=6, pady=2)
+        ttk.Label(r5, text='视觉模块:').pack(side='left')
+        ttk.Entry(r5, textvariable=self.ai_mmproj_var, width=48).pack(side='left', padx=2)
+        ttk.Button(r5, text='浏览', width=5, command=lambda: self._browse_ai_file('ai_mmproj_var')).pack(side='left')
+        r6 = ttk.Frame(ai)
+        r6.pack(fill='x', padx=6, pady=2)
+        ttk.Label(r6, text='服务程序:').pack(side='left')
+        ttk.Entry(r6, textvariable=self.ai_server_var, width=42).pack(side='left', padx=2)
+        ttk.Button(r6, text='浏览', width=5, command=lambda: self._browse_ai_file('ai_server_var')).pack(side='left')
+        ttk.Label(r6, text='端口:').pack(side='left', padx=(10, 2))
+        ttk.Spinbox(r6, from_=1024, to=65535, textvariable=self.ai_port_var, width=6).pack(side='left')
+
+        # 底部按钮
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill='x', pady=8)
+        ttk.Button(btn_row, text='关闭', command=self._close_settings).pack(side='right', padx=10)
+
+    def _close_settings(self):
+        """关闭设置窗口并保存设置"""
+        self._save_settings()
+        if self.settings_win is not None:
+            try:
+                self.settings_win.destroy()
+            except Exception:
+                pass
+        self.settings_win = None
 
     def _log(self, msg):
         """输出日志"""
@@ -2470,6 +2523,11 @@ class ScraplingGrabberGUI:
         self.pause_flag.clear()
         if self.stop_flag.is_set():
             self.stat_var.set('已停止')
+        # 可选：抓取完成后自动停止 AI 服务，释放显存/内存
+        if getattr(self, 'ai_auto_stop_var', None) is not None and self.ai_auto_stop_var.get():
+            if self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None):
+                self._stop_ai_server()
+                self._log('AI服务: 已自动停止（抓取完成，释放显存）')
 
 
 def main():
