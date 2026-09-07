@@ -4,6 +4,8 @@ import os
 import sys
 import time
 import threading
+import subprocess
+import glob
 import urllib.parse
 import urllib.request
 import ssl
@@ -34,7 +36,30 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.8.6'
+APP_VERSION = 'v2.9.0'
+
+# ===== AI 过滤配置 =====
+AI_DEFAULT_PORT = 8080
+# llama-server 可执行文件（官方预编译版）
+AI_SERVER_DEFAULT = r'L:\工作流\千问无审查模型配置\llama-b9297-bin-win-cuda-12.4-x64\llama-server.exe'
+# 模型预设：名称 -> (主模型, 视觉模型)
+AI_MODEL_PRESETS = {
+    '内置4B（笔记本1660）': (
+        r'L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-4B-Q4_K_M.gguf',
+        r'L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-4B-mmproj-BF16.gguf',
+    ),
+    '内置9B（台式机4070）': (
+        r'L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf',
+        r'L:\ComfyUI\ComfyUI\models\LLM\mmproj-Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-BF16.gguf',
+    ),
+    '自定义': (None, None),
+}
+# AI 判断提示词（正文图保留，无关图删除；水印不影响）
+AI_JUDGE_PROMPT = ('这是网页抓取的一张图片。请判断它属于哪一类：'
+                   '"正文"（人物写真、主题摄影、插画、风景等帖子正文内容）'
+                   '或"无关"（logo、图标、表情包、按钮、横幅、纯色背景、文字截图等页面装饰元素）。'
+                   '注意：图片带水印或网站标记不影响判断，内容为写真/主题图的仍属于正文。'
+                   '只回答两个字：正文 或 无关')
 
 # 配置文件路径
 CONFIG_FILE = os.path.join(os.path.expanduser('~'), '.scrapling_grabber_config.json')
@@ -87,13 +112,19 @@ class ScraplingGrabberGUI:
     def __init__(self, root):
         self.root = root
         self.root.title('Scrapling 图片爬虫 %s' % APP_VERSION)
-        self.root.geometry('900x650')
+        self.root.geometry('900x740')
         self.root.minsize(800, 550)
 
         self.is_running = False
         self.stop_flag = threading.Event()
         self.pause_flag = threading.Event()  # 暂停标志
         self.cfg = load_config()
+
+        # AI 过滤状态
+        self.ai_proc = None          # llama-server 进程
+        self.ai_ok = False           # 服务是否就绪
+        self.ai_cache = {}           # 图片路径 -> 判断结果缓存
+        self._ai_state = '未启动'     # 服务状态（工作线程写入，主线程轮询显示）
 
         self._create_widgets()
         self._load_settings()
@@ -143,6 +174,14 @@ class ScraplingGrabberGUI:
         self.grab_mode_var.set(self.cfg.get('grab_mode', '单页'))
         self.post_range_var.set(self.cfg.get('post_range', '20'))
         self.min_size_var.set(self.cfg.get('min_size', 0))
+        # AI 过滤设置
+        self.ai_filter_var.set(self.cfg.get('ai_filter', False))
+        self.ai_preset_var.set(self.cfg.get('ai_preset', '内置4B（笔记本1660）'))
+        self.ai_model_var.set(self.cfg.get('ai_model', ''))
+        self.ai_mmproj_var.set(self.cfg.get('ai_mmproj', ''))
+        self.ai_server_var.set(self.cfg.get('ai_server', AI_SERVER_DEFAULT))
+        self.ai_port_var.set(self.cfg.get('ai_port', AI_DEFAULT_PORT))
+        self._ai_apply_preset()
 
     def _save_settings(self):
         """保存当前设置到配置文件"""
@@ -157,12 +196,218 @@ class ScraplingGrabberGUI:
             'grab_mode': self.grab_mode_var.get(),
             'post_range': self.post_range_var.get(),
             'min_size': self.min_size_var.get(),
+            # AI 过滤设置
+            'ai_filter': self.ai_filter_var.get(),
+            'ai_preset': self.ai_preset_var.get(),
+            'ai_model': self.ai_model_var.get().strip(),
+            'ai_mmproj': self.ai_mmproj_var.get().strip(),
+            'ai_server': self.ai_server_var.get().strip(),
+            'ai_port': self.ai_port_var.get(),
         })
         save_config(self.cfg)
+
+    # ===== AI 智能过滤方法 =====
+    def _ai_apply_preset(self):
+        """按预设自动填充模型路径"""
+        name = self.ai_preset_var.get()
+        m, v = AI_MODEL_PRESETS.get(name, (None, None))
+        if m:
+            self.ai_model_var.set(m)
+        if v:
+            self.ai_mmproj_var.set(v)
+
+    def _browse_ai_file(self, var_name):
+        """浏览选择模型/服务文件"""
+        path = filedialog.askopenfilename(title='选择文件', filetypes=[('模型/程序', '*.gguf *.exe'), ('所有文件', '*.*')])
+        if path:
+            getattr(self, var_name).set(path)
+
+    def _ai_update_status(self, text, color='#888'):
+        self.ai_status_var.set(text)
+        running = self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)
+        self.ai_toggle_btn.config(text='停止AI服务' if running else '启动AI服务')
+
+    def _ai_toggle_server(self):
+        """启动/停止 AI 服务"""
+        if self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None):
+            self._stop_ai_server()
+        else:
+            self._start_ai_server()
+
+    def _start_ai_server(self):
+        """启动 llama-server 本地服务"""
+        if self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None):
+            return
+        server = self.ai_server_var.get().strip() or AI_SERVER_DEFAULT
+        model = self.ai_model_var.get().strip()
+        mmproj = self.ai_mmproj_var.get().strip()
+        if not os.path.exists(server):
+            self._log('AI服务: 找不到 llama-server.exe：%s' % server)
+            self._ai_update_status('服务程序不存在')
+            return
+        if not os.path.exists(model) or not os.path.exists(mmproj):
+            self._log('AI服务: 模型文件不存在，请检查主模型/视觉模块路径')
+            self._ai_update_status('模型文件不存在')
+            return
+        try:
+            port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
+        except Exception:
+            port = AI_DEFAULT_PORT
+        args = [server, '-m', model, '--mmproj', mmproj,
+                '-ngl', '999', '-c', '8192', '--parallel', '1',
+                '--image-min-tokens', '1024', '--cache-ram', '0',
+                '--reasoning', 'off',
+                '--host', '127.0.0.1', '--port', str(port)]
+        try:
+            CREATE_NO_WINDOW = 0x08000000
+            self.ai_proc = subprocess.Popen(args, creationflags=CREATE_NO_WINDOW,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            self._log('AI服务: 启动失败: %s' % e)
+            self._ai_update_status('启动失败')
+            return
+        self._log('AI服务: 正在启动（加载模型约10秒）...')
+        self._ai_update_status('启动中...')
+        self._ai_state = '启动中'
+        threading.Thread(target=self._ai_wait_ready, args=(port,), daemon=True).start()
+        self.root.after(500, self._ai_poll_status)
+
+    def _ai_wait_ready(self, port):
+        """工作线程：轮询服务就绪状态（只写普通属性，不碰 tkinter）"""
+        import requests
+        for _ in range(90):
+            time.sleep(1)
+            if self.ai_proc is None or self.ai_proc.poll() is not None:
+                self._ai_state = '启动失败'
+                return
+            try:
+                r = requests.get('http://127.0.0.1:%d/health' % port, timeout=2)
+                if r.status_code == 200:
+                    self.ai_ok = True
+                    self._ai_state = '运行中'
+                    return
+            except Exception:
+                pass
+        self._ai_state = '启动超时'
+
+    def _ai_poll_status(self):
+        """主线程轮询：把工作线程的 _ai_state 更新到界面"""
+        if self._ai_state == '启动中':
+            self.root.after(500, self._ai_poll_status)
+            return
+        if self._ai_state == '启动失败':
+            self._log('AI服务: 启动失败（进程退出）')
+        elif self._ai_state == '启动超时':
+            self._log('AI服务: 启动超时，请检查模型文件是否损坏或端口被占用')
+        elif self._ai_state == '运行中':
+            self._log('AI服务: 已就绪')
+        self._ai_update_status(self._ai_state)
+
+    def _stop_ai_server(self):
+        """停止 AI 服务"""
+        if self.ai_proc:
+            try:
+                self.ai_proc.terminate()
+            except Exception:
+                pass
+            try:
+                self.ai_proc.kill()
+            except Exception:
+                pass
+        self.ai_proc = None
+        self.ai_ok = False
+        self._ai_state = '已停止'
+        self._ai_update_status('已停止')
+        self._log('AI服务: 已停止')
+
+    def _ai_server_ok(self):
+        """检查服务是否可用，不可用时提示"""
+        if self.ai_ok:
+            return True
+        self._log('AI过滤: AI服务未运行，请先点击「启动AI服务」（或关闭AI过滤开关）')
+        return False
+
+    def _ai_judge_one(self, img_path):
+        """单张图片 AI 判断，返回 '正文' / '无关' / '保留(...)'"""
+        if img_path in self.ai_cache:
+            return self.ai_cache[img_path]
+        import requests
+        import base64
+        result = '保留(错误)'
+        try:
+            with open(img_path, 'rb') as f:
+                b64 = base64.b64encode(f.read()).decode()
+            ext = os.path.splitext(img_path)[1].lower().lstrip('.') or 'jpg'
+            if ext == 'jpeg':
+                ext = 'jpeg'
+            url = 'data:image/%s;base64,%s' % (ext, b64)
+            port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
+            r = requests.post(
+                'http://127.0.0.1:%d/v1/chat/completions' % port,
+                json={'messages': [{'role': 'user', 'content': [
+                    {'type': 'image_url', 'image_url': {'url': url}},
+                    {'type': 'text', 'text': AI_JUDGE_PROMPT}]}],
+                    'max_tokens': 128, 'temperature': 0.1},
+                timeout=300)
+            if r.status_code == 200:
+                content = (r.json()['choices'][0]['message'].get('content') or '').strip()
+                if '无关' in content:
+                    result = '无关'
+                elif '正文' in content:
+                    result = '正文'
+                else:
+                    result = '保留(未知:%s)' % content[:10]
+            else:
+                result = '保留(HTTP%d)' % r.status_code
+        except Exception as e:
+            result = '保留(错误)'
+        self.ai_cache[img_path] = result
+        return result
+
+    def _ai_filter_images(self, save_dir, task_id=None):
+        """对已下载图片做 AI 过滤，删除无关图，返回删除数量"""
+        if not self._ai_server_ok():
+            return 0
+        files = sorted(glob.glob(os.path.join(save_dir, 'img_*.*')))
+        if not files:
+            return 0
+        self._log('AI过滤: 开始判断 %d 张图片（本地模型，速度较慢，请耐心等待）...' % len(files))
+        removed = 0
+        kept = 0
+        for i, fp in enumerate(files, 1):
+            if self.stop_flag.is_set():
+                self._log('AI过滤: 已停止')
+                break
+            self.stat_var.set('AI过滤中 %d/%d ...' % (i, len(files)))
+            result = self._ai_judge_one(fp)
+            name = os.path.basename(fp)
+            if result == '无关':
+                try:
+                    os.remove(fp)
+                    removed += 1
+                    self._log('AI过滤: [%d/%d] 删除 %s（无关图）' % (i, len(files), name))
+                except Exception:
+                    self._log('AI过滤: [%d/%d] %s 删除失败' % (i, len(files), name))
+            else:
+                kept += 1
+                self._log('AI过滤: [%d/%d] 保留 %s（%s）' % (i, len(files), name, result))
+        self._log('AI过滤完成: 保留 %d 张，删除 %d 张' % (kept, removed))
+        if task_id:
+            self._update_task(task_id, status='完成')
+        return removed
 
     def _on_closing(self):
         """窗口关闭时保存设置"""
         self._save_settings()
+        if self.ai_proc:
+            try:
+                self.ai_proc.terminate()
+            except Exception:
+                pass
+            try:
+                self.ai_proc.kill()
+            except Exception:
+                pass
         self.root.destroy()
 
     def _create_widgets(self):
@@ -267,6 +512,45 @@ class ScraplingGrabberGUI:
         render_combo.pack(side='left', padx=(2, 10))
 
         # （智能过滤、增量扫描、强制重扫已移到保存目录行）
+
+        # ===== AI 智能过滤设置（可选，需本地模型） =====
+        ai_frame = ttk.LabelFrame(top_frame, text='AI 智能过滤（可选功能，需本地 Qwen 模型）')
+        ai_frame.pack(fill='x', pady=3)
+        ai_row1 = ttk.Frame(ai_frame)
+        ai_row1.pack(fill='x', padx=5, pady=2)
+        self.ai_filter_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ai_row1, text='启用AI过滤', variable=self.ai_filter_var).pack(side='left')
+        ttk.Label(ai_row1, text='模型:').pack(side='left', padx=(10, 2))
+        self.ai_preset_var = tk.StringVar(value='内置4B（笔记本1660）')
+        preset_combo = ttk.Combobox(ai_row1, textvariable=self.ai_preset_var, width=24, state='readonly')
+        preset_combo['values'] = list(AI_MODEL_PRESETS.keys())
+        preset_combo.pack(side='left', padx=2)
+        preset_combo.bind('<<ComboboxSelected>>', lambda e: self._ai_apply_preset())
+        self.ai_toggle_btn = ttk.Button(ai_row1, text='启动AI服务', command=self._ai_toggle_server, width=12)
+        self.ai_toggle_btn.pack(side='left', padx=6)
+        self.ai_status_var = tk.StringVar(value='未启动')
+        ttk.Label(ai_row1, textvariable=self.ai_status_var, foreground='#888').pack(side='left')
+        ai_row2 = ttk.Frame(ai_frame)
+        ai_row2.pack(fill='x', padx=5, pady=1)
+        ttk.Label(ai_row2, text='主模型:').pack(side='left')
+        self.ai_model_var = tk.StringVar()
+        ttk.Entry(ai_row2, textvariable=self.ai_model_var, width=50).pack(side='left', padx=2)
+        ttk.Button(ai_row2, text='浏览', width=4, command=lambda: self._browse_ai_file('ai_model_var')).pack(side='left')
+        ai_row3 = ttk.Frame(ai_frame)
+        ai_row3.pack(fill='x', padx=5, pady=1)
+        ttk.Label(ai_row3, text='视觉模块:').pack(side='left')
+        self.ai_mmproj_var = tk.StringVar()
+        ttk.Entry(ai_row3, textvariable=self.ai_mmproj_var, width=50).pack(side='left', padx=2)
+        ttk.Button(ai_row3, text='浏览', width=4, command=lambda: self._browse_ai_file('ai_mmproj_var')).pack(side='left')
+        ai_row4 = ttk.Frame(ai_frame)
+        ai_row4.pack(fill='x', padx=5, pady=1)
+        ttk.Label(ai_row4, text='服务程序:').pack(side='left')
+        self.ai_server_var = tk.StringVar(value=AI_SERVER_DEFAULT)
+        ttk.Entry(ai_row4, textvariable=self.ai_server_var, width=44).pack(side='left', padx=2)
+        ttk.Button(ai_row4, text='浏览', width=4, command=lambda: self._browse_ai_file('ai_server_var')).pack(side='left')
+        ttk.Label(ai_row4, text='端口:').pack(side='left', padx=(10, 2))
+        self.ai_port_var = tk.IntVar(value=AI_DEFAULT_PORT)
+        ttk.Spinbox(ai_row4, from_=1024, to=65535, textvariable=self.ai_port_var, width=5).pack(side='left')
 
         # 按钮行
         btn_frame = ttk.Frame(top_frame)
@@ -2052,6 +2336,12 @@ class ScraplingGrabberGUI:
             self._update_task(task_id, status='下载中')
 
         success, fail, skipped = self._download_image_list(img_urls, save_dir, max_threads, min_size, task_id)
+
+        # AI 智能过滤（可选，未启用或服务未启动则自动跳过）
+        if self.ai_filter_var.get():
+            removed = self._ai_filter_images(save_dir, task_id)
+            if removed:
+                self.stat_done.set('已下载: %d/%d（AI过滤删除 %d）' % (success, len(img_urls), removed))
 
         # 更新统计信息
         self.stat_total.set('图片总数: %d' % len(img_urls))
