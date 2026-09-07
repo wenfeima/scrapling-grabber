@@ -38,10 +38,34 @@ IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
 APP_VERSION = 'v2.12.27'
 
+
+def ver_gt(a, b):
+    """版本号比较：a > b 返回 True（支持 1.2.3 / 1.2.3-beta 形式）"""
+    def tup(v):
+        out = []
+        for x in str(v).replace('-', '.').split('.'):
+            if x.isdigit():
+                out.append(int(x))
+            else:
+                out.append(x)
+        return out
+    return tup(a) > tup(b)
+
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
 # llama-server 可执行文件（官方预编译版）
 AI_SERVER_DEFAULT = r'L:\工作流\千问无审查模型配置\llama-b9297-bin-win-cuda-12.4-x64\llama-server.exe'
+
+# 云端 API 服务商预设（选服务商自动填 API 地址）
+AI_PROVIDERS = {
+    '智谱开放平台': 'https://open.bigmodel.cn/api/paas/v4',
+    '硅基流动': 'https://api.siliconflow.cn/v1',
+    '深度求索(DeepSeek)': 'https://api.deepseek.com/v1',
+    'OpenRouter': 'https://openrouter.ai/api/v1',
+    'OpenAI': 'https://api.openai.com/v1',
+    'Ollama(本地)': 'http://127.0.0.1:11434/v1',
+    '自定义': '',
+}
 # 模型预设：名称 -> (主模型, 视觉模型)
 AI_MODEL_PRESETS = {
     '内置4B（6G显存）': (
@@ -233,10 +257,30 @@ class ScraplingGrabberGUI:
         self.ai_server_var.set(self.cfg.get('ai_server', AI_SERVER_DEFAULT))
         self.ai_port_var.set(self.cfg.get('ai_port', AI_DEFAULT_PORT))
         self.ai_chat_ctx_var.set(self.cfg.get('ai_chat_ctx', 12))
+        self.ai_mode_var.set(self.cfg.get('ai_mode', 'local'))
+        self.ai_api_base_var.set(self.cfg.get('ai_api_base', ''))
+        # 按地址反推服务商预设（命中则选中，否则自定义）
+        cur_base = self.ai_api_base_var.get().strip().rstrip('/')
+        matched = next((k for k, v in AI_PROVIDERS.items() if v and v == cur_base), '自定义')
+        self.ai_provider_var.set(matched)
+        # 各服务商独立配置（Key/LLM/VLM/模型列表），切服务商自动带上
+        self._ai_providers_cfg = dict(self.cfg.get('ai_providers_cfg') or {})
+        pcfg = self._ai_providers_cfg.get(matched) or {}
+        self.ai_api_key_var.set(pcfg.get('key', self.cfg.get('ai_api_key', '')))
+        self.ai_api_key_var.set(self.cfg.get('ai_api_key', ''))
+        self.ai_api_model_var.set(pcfg.get('llm', self.cfg.get('ai_api_model', '')))
+        self.ai_api_vlm_var.set(pcfg.get('vlm', self.cfg.get('ai_api_vlm', '')))
+        self._ai_api_models = list(pcfg.get('models') or self.cfg.get('ai_api_models') or [])
+        self.ai_api_no_thinking_var.set(self.cfg.get('ai_api_no_thinking', False))
+        self.ai_api_adv_var.set(self.cfg.get('ai_api_adv', False))
+        self.ai_api_temperature_var.set(self.cfg.get('ai_api_temperature', 0.3))
+        self.ai_api_max_tokens_var.set(self.cfg.get('ai_api_max_tokens', 1024))
         self._ai_apply_preset()
 
     def _save_settings(self):
         """保存当前设置到配置文件"""
+        # 先把当前服务商的 Key/模型配置归档
+        self._save_provider_state()
         self.cfg.update({
             'url': self.url_var.get().strip(),
             'save_dir': self.dir_var.get().strip(),
@@ -259,6 +303,17 @@ class ScraplingGrabberGUI:
             'ai_server': self.ai_server_var.get().strip(),
             'ai_port': self.ai_port_var.get(),
             'ai_chat_ctx': self.ai_chat_ctx_var.get(),
+            'ai_mode': self.ai_mode_var.get(),
+            'ai_api_base': self.ai_api_base_var.get().strip(),
+            'ai_api_key': self.ai_api_key_var.get().strip(),
+            'ai_api_model': self.ai_api_model_var.get().strip(),
+            'ai_api_vlm': self.ai_api_vlm_var.get().strip(),
+            'ai_api_models': list(getattr(self, '_ai_api_models', [])),
+            'ai_providers_cfg': dict(getattr(self, '_ai_providers_cfg', {})),
+            'ai_api_no_thinking': self.ai_api_no_thinking_var.get(),
+            'ai_api_adv': self.ai_api_adv_var.get(),
+            'ai_api_temperature': self.ai_api_temperature_var.get(),
+            'ai_api_max_tokens': self.ai_api_max_tokens_var.get(),
         })
         save_config(self.cfg)
 
@@ -296,9 +351,65 @@ class ScraplingGrabberGUI:
             self._start_ai_server()
 
     def _start_ai_server(self):
-        """启动 llama-server 本地服务"""
+        """启动/连接 AI 服务：local=拉起llama-server；ollama=检查本机Ollama；api=测试云端连通"""
         if self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None):
             return
+        mode = self.ai_mode_var.get()
+        if mode == 'api':
+            base = self.ai_api_base_var.get().strip()
+            key = self.ai_api_key_var.get().strip()
+            model = (self.ai_api_model_var.get().strip()
+                     or (getattr(self, '_ai_api_models', [None])[0]
+                         if getattr(self, '_ai_api_models', []) else ''))
+            if not base or not key or not model:
+                self._log('AI服务(API): 请先在设置里填 API地址/Key/模型名')
+                self._ai_update_status('API未配置')
+                return
+            # 连通测试：极短请求
+            import requests
+            url = base.rstrip('/')
+            url = url if url.endswith('/chat/completions') else (
+                url + '/chat/completions' if url.endswith('/v1') else url + '/v1/chat/completions')
+            try:
+                r = requests.post(url,
+                                  json={'model': model, 'messages': [{'role': 'user', 'content': 'hi'}],
+                                        'max_tokens': 4},
+                                  headers={'Authorization': 'Bearer ' + key}, timeout=15)
+                if r.status_code != 200:
+                    self._log('AI服务(API): 连通测试失败 HTTP %d（%s）' % (r.status_code, r.text[:120]))
+                    self._ai_update_status('API测试失败')
+                    return
+                self.ai_ok = True
+                self._ai_state = '运行中'
+                self._ai_update_status('运行中(API)')
+                self._log('AI服务: 云端API已连通（%s）' % model)
+            except Exception as e:
+                self._log('AI服务(API): 连接失败: %s' % e)
+                self._ai_update_status('API连接失败')
+            return
+        if mode == 'ollama':
+            # Ollama 已由本机服务运行，只检查端口
+            import requests
+            try:
+                port = int(self.ai_port_var.get() or 11434)
+            except Exception:
+                port = 11434
+            try:
+                r = requests.get('http://127.0.0.1:%d/v1/models' % port, timeout=5)
+                if r.status_code != 200:
+                    self._log('AI服务(Ollama): 端口%d无响应（HTTP %d），请先启动Ollama' % (port, r.status_code))
+                    self._ai_update_status('Ollama未运行')
+                    return
+                names = [x.get('id', '') for x in r.json().get('data', [])][:8]
+                self.ai_ok = True
+                self._ai_state = '运行中'
+                self._ai_update_status('运行中(Ollama)')
+                self._log('AI服务: Ollama已连接（%s）' % (', '.join(names) if names else '端口%d' % port))
+            except Exception as e:
+                self._log('AI服务(Ollama): 连接失败: %s' % e)
+                self._ai_update_status('Ollama未运行')
+            return
+        # local：拉起 llama-server
         server = self.ai_server_var.get().strip() or AI_SERVER_DEFAULT
         model = self.ai_model_var.get().strip()
         mmproj = self.ai_mmproj_var.get().strip()
@@ -409,15 +520,14 @@ class ScraplingGrabberGUI:
             prompt_text = AI_PROMPT_PROMPT if use_prompt else AI_JUDGE_PROMPT
             max_tokens = AI_PROMPT_MAX_TOKENS if use_prompt else 128
             self._ai_log_chat('req', '[图片判断] %s\n%s' % (os.path.basename(img_path), prompt_text))
-            r = requests.post(
-                'http://127.0.0.1:%d/v1/chat/completions' % port,
-                json={'messages': [{'role': 'user', 'content': [
+            ok, resp = self._ai_completion(
+                {'messages': [{'role': 'user', 'content': [
                     {'type': 'image_url', 'image_url': {'url': url}},
                     {'type': 'text', 'text': prompt_text}]}],
                     'max_tokens': max_tokens, 'temperature': 0.1},
                 timeout=300)
-            if r.status_code == 200:
-                content = (r.json()['choices'][0]['message'].get('content') or '').strip()
+            if ok:
+                content = (resp['choices'][0]['message'].get('content') or '').strip()
                 self._ai_log_chat('resp', content or '(空回复)')
                 if use_prompt:
                     result = self._ai_parse_prompt(content)
@@ -429,9 +539,9 @@ class ScraplingGrabberGUI:
                     result = '保留(未知:%s)' % content[:10]
             else:
                 if use_prompt:
-                    result = {'cat': '保留(HTTP%d)' % r.status_code, 'cn': '', 'en': ''}
+                    result = {'cat': '保留(调用失败)', 'cn': '', 'en': ''}
                 else:
-                    result = '保留(HTTP%d)' % r.status_code
+                    result = '保留(调用失败)'
         except Exception as e:
             if use_prompt:
                 result = {'cat': '保留(错误)', 'cn': '', 'en': ''}
@@ -466,8 +576,9 @@ class ScraplingGrabberGUI:
                 cat = '正文'
         return {'cat': cat, 'cn': cn, 'en': en}
 
-    def _ai_log_chat(self, role, content):
-        """记录一次 AI 对话到「AI对话」页签和磁吸窗：req=发给模型的请求，resp=模型回复"""
+    def _ai_log_chat(self, role, content, image_path=None):
+        """记录一次 AI 对话到「AI对话」页签和磁吸窗：req=用户消息(右蓝气泡)，resp=模型回复(左绿气泡)
+        image_path 存在时在内容前插入图片缩略图"""
         try:
             ts = time.strftime('%H:%M:%S')
             for txt in (self.ai_chat_text, getattr(self, 'ai_float_text', None)):
@@ -475,16 +586,161 @@ class ScraplingGrabberGUI:
                     continue
                 try:
                     if role == 'req':
-                        txt.insert('end', '[%s] → 模型:\n' % ts, 'req')
+                        bubble, who = 'req_bubble', '你'
+                    elif role == 'tool':
+                        bubble, who = 'tool', '工具'
                     else:
-                        txt.insert('end', '[%s] ← 模型:\n' % ts, 'resp')
-                    txt.insert('end', (content or '') + '\n', role)
-                    txt.insert('end', '-' * 70 + '\n', 'sep')
+                        bubble, who = 'resp_bubble', 'AI'
+                    txt.insert('end', '  %s  %s\n' % (ts, who), 'ts')
+                    if image_path:
+                        self._ai_insert_thumb(txt, image_path)
+                    txt.insert('end', (content or '') + '\n', bubble)
+                    txt.insert('end', '\n')
                     txt.see('end')
                 except Exception:
                     pass
         except Exception:
             pass
+
+    def _ai_insert_thumb(self, txt, img_path):
+        """在对话 Text 中插入图片缩略图（保持引用防GC回收）"""
+        try:
+            from PIL import Image
+            from PIL import ImageTk
+            img = Image.open(img_path)
+            img.thumbnail((220, 220))
+            photo = ImageTk.PhotoImage(img)
+            if not hasattr(self, '_ai_float_images'):
+                self._ai_float_images = []
+            self._ai_float_images.append(photo)
+            txt.image_create('end', image=photo)
+            txt.insert('end', '\n')
+        except Exception:
+            pass
+
+    def _ai_paste_shot(self):
+        """「粘贴」：读取剪贴板里的图片（如 Win+Shift+S 系统截图）加入对话"""
+        try:
+            from PIL import ImageGrab
+            import io
+            import base64
+            img = ImageGrab.grabclipboard()
+            if not isinstance(img, object) or not hasattr(img, 'save'):
+                self._log('粘贴截图失败：剪贴板里没有图片（先用 Win+Shift+S 或任意截图工具截图）')
+                return
+            img = img.convert('RGB')
+            img.thumbnail((1280, 1280))
+            buf = io.BytesIO()
+            img.save(buf, 'JPEG', quality=85)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
+            os.makedirs(shot_dir, exist_ok=True)
+            shot_path = os.path.join(shot_dir, 'paste_%s.jpg' % time.strftime('%Y%m%d_%H%M%S'))
+            with open(shot_path, 'wb') as f:
+                f.write(buf.getvalue())
+            self._clean_screenshots(200)
+            self._ai_pending_image = {'b64': b64, 'path': shot_path}
+            self._ai_log_chat('req', '[已添加截图] 剪贴板截图已就绪，输入问题后点「发送」即可让AI看图回答')
+            self._ai_show_shot_in_chat(shot_path)
+        except Exception as e:
+            self._log('粘贴截图失败: %s' % e)
+
+    def _ai_region_shot(self):
+        """「选区」：全屏遮罩 + 鼠标框选区域截图加入对话"""
+        try:
+            from PIL import ImageGrab, Image, ImageTk
+            import ctypes
+            hides = []
+            for w in (getattr(self, 'ai_float_win', None), self.root):
+                try:
+                    if w is not None and w.state() == 'normal':
+                        hides.append(w)
+                except Exception:
+                    pass
+            for w in hides:
+                w.withdraw()
+            self.root.update_idletasks()
+            time.sleep(0.4)
+            full = ImageGrab.grab().convert('RGB')
+            for w in hides:
+                try:
+                    w.deiconify()
+                except Exception:
+                    pass
+            wpx, hpx = full.size
+            scale = 1.0
+            try:
+                scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
+            except Exception:
+                pass
+            tw = max(1, int(wpx / scale))
+            th = max(1, int(hpx / scale))
+            canvas_img = full.copy()
+            canvas_img.thumbnail((tw, th))
+            mask = tk.Toplevel(self.root)
+            mask.overrideredirect(True)
+            mask.attributes('-topmost', True)
+            mask.geometry('%dx%d+0+0' % (tw, th))
+            cv = tk.Canvas(mask, width=tw, height=th, cursor='crosshair', highlightthickness=0)
+            cv.pack()
+            self._mask_photo = ImageTk.PhotoImage(canvas_img)
+            cv.create_image(0, 0, anchor='nw', image=self._mask_photo)
+            state = {'start': None, 'rect': None}
+
+            def on_press(e):
+                state['start'] = (e.x, e.y)
+                state['rect'] = cv.create_rectangle(e.x, e.y, e.x, e.y,
+                                                    outline='#ff3b30', width=2, fill='rgba(0,0,0,0)')
+
+            def on_drag(e):
+                if state['start'] and state['rect']:
+                    cv.coords(state['rect'], state['start'][0], state['start'][1], e.x, e.y)
+
+            def on_release(e):
+                if not state['start']:
+                    return
+                x1, y1 = state['start']
+                x2, y2 = e.x, e.y
+                x1, x2 = sorted((x1, x2))
+                y1, y2 = sorted((y1, y2))
+                try:
+                    mask.destroy()
+                except Exception:
+                    pass
+                if x2 - x1 < 10 or y2 - y1 < 10:
+                    self._log('选区截图已取消（区域太小）')
+                    return
+                px1, py1 = int(x1 * scale), int(y1 * scale)
+                px2, py2 = int(x2 * scale), int(y2 * scale)
+                crop = full.crop((px1, py1, px2, py2))
+                import io
+                import base64
+                buf = io.BytesIO()
+                crop.save(buf, 'JPEG', quality=90)
+                b64 = base64.b64encode(buf.getvalue()).decode()
+                shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
+                os.makedirs(shot_dir, exist_ok=True)
+                shot_path = os.path.join(shot_dir, 'region_%s.jpg' % time.strftime('%Y%m%d_%H%M%S'))
+                with open(shot_path, 'wb') as f:
+                    f.write(buf.getvalue())
+                self._clean_screenshots(200)
+                self._ai_pending_image = {'b64': b64, 'path': shot_path}
+                self._ai_log_chat('req', '[已添加截图] 选区截图已就绪，输入问题后点「发送」即可让AI看图回答')
+                self._ai_show_shot_in_chat(shot_path)
+
+            def on_cancel(_=None):
+                try:
+                    mask.destroy()
+                except Exception:
+                    pass
+                self._log('选区截图已取消')
+
+            cv.bind('<ButtonPress-1>', on_press)
+            cv.bind('<B1-Motion>', on_drag)
+            cv.bind('<ButtonRelease-1>', on_release)
+            mask.bind('<Escape>', on_cancel)
+        except Exception as e:
+            self._log('选区截图失败: %s' % e)
 
     def _ai_clear_chat(self):
         """清空 AI 对话记录（页签+磁吸窗）"""
@@ -803,21 +1059,15 @@ class ScraplingGrabberGUI:
             return False, '图片处理失败: %s' % e
         # 3. 视觉模型理解
         question = prompt or '简要描述这个网页页面的内容和布局：是什么网站、页面上有什么主要内容'
-        body = {'model': _json.loads(_ur.urlopen('http://127.0.0.1:%s/v1/models' % self.ai_port_var.get(), timeout=5).read())['data'][0]['id'],
-                'messages': [{'role': 'user', 'content': [
+        body = {'messages': [{'role': 'user', 'content': [
                     {'type': 'text', 'text': question},
                     {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + jpg_b64}},
                 ]}],
                 'max_tokens': 600}
-        try:
-            req = _ur.Request('http://127.0.0.1:%s/v1/chat/completions' % self.ai_port_var.get(),
-                              data=_json.dumps(body).encode(),
-                              headers={'Content-Type': 'application/json'})
-            with _ur.urlopen(req, timeout=240) as r:
-                out = _json.loads(r.read())
-            desc = out['choices'][0]['message']['content'].strip()
-        except Exception as e:
-            return False, '视觉模型调用失败: %s' % e
+        ok, out = self._ai_completion(body, timeout=240)
+        if not ok:
+            return False, '视觉模型调用失败'
+        desc = out['choices'][0]['message']['content'].strip()
         result = '已截取浏览器当前页(%s)并查看：\n%s\n（截图已保存: %s）' % (active.get('url', '')[:60], desc[:800], shot_path)
         return True, result
 
@@ -871,14 +1121,12 @@ class ScraplingGrabberGUI:
         last_fail = None   # 连续失败保护：(name, error) 相同连续2次则中断
         for _ in range(5):
             try:
-                r = requests.post(
-                    'http://127.0.0.1:%d/v1/chat/completions' % port,
-                    json={'messages': messages, 'max_tokens': 1024, 'temperature': 0.3},
-                    timeout=300)
-                if r.status_code != 200:
-                    final = '(HTTP %d)' % r.status_code
+                ok, resp = self._ai_completion(
+                    {'messages': messages, 'max_tokens': 1024, 'temperature': 0.3}, timeout=300)
+                if not ok:
+                    final = '(调用失败)'
                     break
-                content = (r.json()['choices'][0]['message'].get('content') or '').strip()
+                content = (resp['choices'][0]['message'].get('content') or '').strip()
             except Exception as e:
                 final = '(调用失败: %s)' % e
                 break
@@ -1143,17 +1391,76 @@ class ScraplingGrabberGUI:
             return None
 
     def _ai_add_shot(self):
-        """「截图给AI」：截取当前浏览器页面加入对话，发送时随问题一起让AI看图"""
+        """「截图给AI」：优先截调试浏览器当前页；未开浏览器则截全屏"""
         if not (self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)):
             self._log('AI对话: AI服务未运行，请先点击「启动AI服务」')
             return
         shot = self._ai_capture_shot()
+        src = '浏览器'
         if not shot:
-            self._log('截图给AI失败：调试浏览器未运行或截图出错')
+            shot = self._ai_capture_fullscreen()
+            src = '全屏'
+        if not shot:
+            self._log('截图给AI失败：浏览器未运行且全屏截图失败')
             return
         b64, path = shot
         self._ai_pending_image = {'b64': b64, 'path': path}
-        self._ai_log_chat('req', '[已添加截图] 浏览器截图已就绪，输入问题后点「发送」即可让AI看图回答\n（截图已保存: %s）' % path)
+        self._ai_log_chat('req', '[已添加截图] %s截图已就绪，输入问题后点「发送」即可让AI看图回答' % src)
+        self._ai_show_shot_in_chat(path)
+
+    def _ai_show_shot_in_chat(self, path):
+        """把截图缩略图嵌入对话记录（AI对话页签 + 磁吸窗），像正常聊天一样能看到图"""
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(path)
+            img.thumbnail((240, 240))
+            photo = ImageTk.PhotoImage(img)
+            if not hasattr(self, '_ai_shot_images'):
+                self._ai_shot_images = []
+            self._ai_shot_images.append(photo)  # 保持引用，防被回收
+            for txt in (self.ai_chat_text, getattr(self, 'ai_float_text', None)):
+                if not txt:
+                    continue
+                try:
+                    txt.image_create('end', image=photo)
+                    txt.insert('end', '\n')
+                    txt.see('end')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _ai_capture_fullscreen(self):
+        """截取整个屏幕（调试浏览器未运行时兜底）；自动隐藏AI窗避免截入自身"""
+        try:
+            import io
+            import time
+            import base64
+            from PIL import ImageGrab
+            hide = False
+            if getattr(self, 'ai_float_win', None) is not None and self.ai_float_win.state() == 'normal':
+                self.ai_float_win.withdraw()
+                hide = True
+            self.root.update_idletasks()
+            time.sleep(0.35)
+            try:
+                img = ImageGrab.grab().convert('RGB')
+            finally:
+                if hide:
+                    self.ai_float_win.deiconify()
+            img.thumbnail((1280, 1280))
+            buf = io.BytesIO()
+            img.save(buf, 'JPEG', quality=85)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
+            os.makedirs(shot_dir, exist_ok=True)
+            shot_path = os.path.join(shot_dir, 'full_%s.jpg' % time.strftime('%Y%m%d_%H%M%S'))
+            with open(shot_path, 'wb') as f:
+                f.write(buf.getvalue())
+            self._clean_screenshots(200)
+            return b64, shot_path
+        except Exception:
+            return None
 
     def _ai_vision_chat(self, user_text, jpg_b64, shot_path):
         """带截图对话：截图+问题 → 模型看图回答，可调用工具（如 ai_adjust_crawl 调整抓取策略）"""
@@ -1165,10 +1472,6 @@ class ScraplingGrabberGUI:
         except Exception:
             port = AI_DEFAULT_PORT
             ctx = 12
-        try:
-            model = requests.get('http://127.0.0.1:%d/v1/models' % port, timeout=5).json()['data'][0]['id']
-        except Exception:
-            model = None
         sys_msg = (self.AI_TOOL_DESC +
                    '\n注意：当前对话已附加一张浏览器截图（你可以看图）。'
                    '用户想让软件抓取/下载图片或调整抓取策略时，必须调用工具执行，不要教用户手动操作。')
@@ -1182,14 +1485,11 @@ class ScraplingGrabberGUI:
         for _ in range(5):
             try:
                 body = {'messages': messages, 'max_tokens': 1024, 'temperature': 0.3}
-                if model:
-                    body['model'] = model
-                r = requests.post('http://127.0.0.1:%d/v1/chat/completions' % port,
-                                  json=body, timeout=300)
-                if r.status_code != 200:
-                    final = '(HTTP %d)' % r.status_code
+                ok, resp = self._ai_completion(body, timeout=300)
+                if not ok:
+                    final = '(调用失败)'
                     break
-                content = (r.json()['choices'][0]['message'].get('content') or '').strip()
+                content = (resp['choices'][0]['message'].get('content') or '').strip()
             except Exception as e:
                 final = '(调用失败: %s)' % e
                 break
@@ -1234,24 +1534,82 @@ class ScraplingGrabberGUI:
         else:
             self._ai_assistant_chat(text)
 
-    def _ai_call_text(self, prompt_text, max_tokens=300, timeout=120):
-        """通用文本调用本地模型，返回模型输出字符串（失败返回空串）"""
+    def _ai_completion(self, body, timeout=300):
+        """统一 AI 请求路由：local（内置llama-server）/ ollama / api（云端OpenAI兼容）。
+
+        body: 请求体（含 messages / max_tokens / temperature 等；api 与 ollama 模式自动补 model）
+        返回 (ok, json_dict)；ok=False 时 json_dict 为 None
+        """
         import requests
-        self._ai_log_chat('req', prompt_text)
+        mode = self.ai_mode_var.get()
+        if mode == 'api':
+            base = self.ai_api_base_var.get().strip().rstrip('/')
+            if not base:
+                return False, None
+            if base.endswith('/chat/completions'):
+                url = base
+            elif base.endswith('/v1'):
+                url = base + '/chat/completions'
+            else:
+                url = base + '/v1/chat/completions'
+            body = dict(body)
+            # 视觉请求（含 image_url）自动用 VLM 模型，其余用 LLM
+            has_img = any(
+                (isinstance(c, list) and any(
+                    isinstance(x, dict) and x.get('type') == 'image_url' for x in c))
+                for c in [m.get('content') for m in body.get('messages', [])])
+            model = ((self.ai_api_vlm_var if has_img else self.ai_api_model_var).get().strip()
+                     or (getattr(self, '_ai_api_models', [None])[0]
+                         if getattr(self, '_ai_api_models', []) else '')
+                     or 'gpt-4o-mini')
+            body.setdefault('model', model)
+            if self.ai_api_no_thinking_var.get():
+                body.setdefault('thinking', {'type': 'disabled'})
+            if self.ai_api_adv_var.get():
+                body.setdefault('temperature', float(self.ai_api_temperature_var.get()))
+                body.setdefault('max_tokens', int(self.ai_api_max_tokens_var.get()))
+            headers = {'Authorization': 'Bearer ' + self.ai_api_key_var.get().strip(),
+                       'Content-Type': 'application/json'}
+            try:
+                r = requests.post(url, json=body, headers=headers, timeout=timeout)
+                if r.status_code != 200:
+                    self._last_ai_error = 'HTTP %s: %s' % (r.status_code, r.text[:200])
+                    return False, None
+                self._last_ai_error = None
+                return True, r.json()
+            except Exception as e:
+                self._last_ai_error = str(e)[:200]
+                return False, None
+            except Exception:
+                return False, None
+        # local / ollama：本地 OpenAI 兼容端点（Ollama 原生兼容 /v1）
         try:
             port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
-            r = requests.post(
-                'http://127.0.0.1:%d/v1/chat/completions' % port,
-                json={'messages': [{'role': 'user', 'content': prompt_text}],
-                      'max_tokens': max_tokens, 'temperature': 0.1},
-                timeout=timeout)
-            if r.status_code == 200:
-                content = (r.json()['choices'][0]['message'].get('content') or '').strip()
-                self._ai_log_chat('resp', content or '(空回复)')
-                return content
-            self._ai_log_chat('resp', '(HTTP %d)' % r.status_code)
-        except Exception as e:
-            self._ai_log_chat('resp', '(调用失败: %s)' % e)
+        except Exception:
+            port = AI_DEFAULT_PORT
+        url = 'http://127.0.0.1:%d/v1/chat/completions' % port
+        if mode == 'ollama' and self.ai_model_var.get().strip():
+            body = dict(body)
+            body.setdefault('model', self.ai_model_var.get().strip())
+        try:
+            r = requests.post(url, json=body, timeout=timeout)
+            if r.status_code != 200:
+                return False, None
+            return True, r.json()
+        except Exception:
+            return False, None
+
+    def _ai_call_text(self, prompt_text, max_tokens=300, timeout=120):
+        """通用文本调用 AI（按接入方式路由），返回模型输出字符串（失败返回空串）"""
+        self._ai_log_chat('req', prompt_text)
+        ok, resp = self._ai_completion(
+            {'messages': [{'role': 'user', 'content': prompt_text}],
+             'max_tokens': max_tokens, 'temperature': 0.1}, timeout=timeout)
+        if ok:
+            content = (resp['choices'][0]['message'].get('content') or '').strip()
+            self._ai_log_chat('resp', content or '(空回复)')
+            return content
+        self._ai_log_chat('resp', '(调用失败)')
         return ''
 
     def _ai_analyze_patterns(self, samples, target_desc):
@@ -1485,20 +1843,30 @@ class ScraplingGrabberGUI:
         self.ai_chat_text = tk.Text(ai_tab, wrap='word', font=('Consolas', 9))
         ai_scroll = ttk.Scrollbar(ai_tab, command=self.ai_chat_text.yview)
         self.ai_chat_text.configure(yscrollcommand=ai_scroll.set)
-        ai_scroll.pack(side='right', fill='y')
-        self.ai_chat_text.pack(side='left', fill='both', expand=True)
+        self.ai_chat_text.tag_configure('ts', font=('Microsoft YaHei UI', 8), foreground='#999999')
+        self.ai_chat_text.tag_configure('req_bubble', background='#e3f2fd', lmargin1=70, lmargin2=70, rmargin=10,
+                                        spacing1=3, spacing3=3)
+        self.ai_chat_text.tag_configure('resp_bubble', background='#e8f5e9', lmargin1=10, lmargin2=10, rmargin=70,
+                                        spacing1=3, spacing3=3)
+        self.ai_chat_text.tag_configure('tool', foreground='#b45309')
         self.ai_chat_text.tag_configure('req', foreground='#1a56db')
         self.ai_chat_text.tag_configure('resp', foreground='#0d7a3d')
-        self.ai_chat_text.tag_configure('tool', foreground='#b45309')
-        self.ai_chat_text.tag_configure('sep', foreground='#bbbbbb')
-        # 对话输入框
+        # 对话输入栏（放窗口底部，豆包式：输入框 + 下方按钮行）
         ai_input_frame = ttk.Frame(ai_tab)
-        ai_input_frame.pack(fill='x', pady=3, padx=4)
+        ai_input_frame.pack(side='bottom', fill='x', pady=3, padx=4)
         self.ai_chat_input = ttk.Entry(ai_input_frame)
-        self.ai_chat_input.pack(side='left', fill='x', expand=True, padx=(0, 4))
+        self.ai_chat_input.pack(side='top', fill='x')
         self.ai_chat_input.bind('<Return>', lambda e: self._ai_chat_send())
-        ttk.Button(ai_input_frame, text='截图给AI', width=8, command=self._ai_add_shot).pack(side='left', padx=(0, 4))
-        ttk.Button(ai_input_frame, text='发送', width=6, command=self._ai_chat_send).pack(side='left')
+        ai_btn_row = ttk.Frame(ai_input_frame)
+        ai_btn_row.pack(side='top', fill='x', pady=(3, 0))
+        ttk.Button(ai_btn_row, text='截图给AI', width=8, command=self._ai_add_shot).pack(side='left', padx=(0, 4))
+        ttk.Button(ai_btn_row, text='粘贴', width=6, command=self._ai_paste_shot).pack(side='left', padx=(0, 4))
+        ttk.Button(ai_btn_row, text='选区', width=6, command=self._ai_region_shot).pack(side='left', padx=(0, 4))
+        ttk.Button(ai_btn_row, text='清空', width=6, command=self._ai_clear_chat).pack(side='left', padx=(0, 4))
+        ttk.Button(ai_btn_row, text='发送', width=6, command=self._ai_chat_send).pack(side='right')
+        # Text 最后 pack 吃剩余空间（先 pack 底栏，避免被 expand 挤到右下角）
+        ai_scroll.pack(side='right', fill='y')
+        self.ai_chat_text.pack(side='left', fill='both', expand=True)
         self._ai_chat_history = []
         self._ai_pending_image = None
 
@@ -1537,6 +1905,10 @@ class ScraplingGrabberGUI:
         self.force_rescan_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(dir_frame, text='强制重扫', variable=self.force_rescan_var).pack(side='left', padx=5)
 
+        # 磁吸窗按钮（放在保存目录行右侧空白）
+        ttk.Button(dir_frame, text='AI对话', width=10, command=self._toggle_ai_float_window).pack(side='left', padx=(10, 4))
+        ttk.Button(dir_frame, text='游戏修改', width=10, command=self._toggle_game_mod_window).pack(side='left')
+
         # 选项行
         opt_frame = ttk.Frame(top_frame)
         opt_frame.pack(fill='x', pady=2)
@@ -1572,9 +1944,6 @@ class ScraplingGrabberGUI:
         render_combo = ttk.Combobox(opt_frame, textvariable=self.render_mode_var, width=12, state='readonly')
         render_combo['values'] = ('直连模式', '浏览器渲染', '浏览器模式(CDP)')
         render_combo.pack(side='left', padx=(2, 10))
-        # 磁吸窗按钮（利用本行右侧空白）
-        ttk.Button(opt_frame, text='AI对话', width=10, command=self._toggle_ai_float_window).pack(side='left', padx=(0, 4))
-        ttk.Button(opt_frame, text='游戏修改', width=10, command=self._toggle_game_mod_window).pack(side='left')
 
         # AI 操作行（模型路径等配置在设置窗口）
         ai_opt = ttk.Frame(top_frame)
@@ -1598,12 +1967,6 @@ class ScraplingGrabberGUI:
         self.ai_status_var = tk.StringVar(value=self._ai_state)
         ttk.Label(ai_opt, textvariable=self.ai_status_var, foreground='#888').pack(side='left')
 
-        # 磁吸窗按钮行（独立一行，避免和AI选项挤在一起溢出）
-        win_btn = ttk.Frame(top_frame)
-        win_btn.pack(fill='x', pady=1)
-        ttk.Button(win_btn, text='AI对话', width=10, command=self._toggle_ai_float_window).pack(side='left', padx=(0, 4))
-        ttk.Button(win_btn, text='游戏修改', width=10, command=self._toggle_game_mod_window).pack(side='left')
-
         # AI 模型/服务路径变量（控件在设置窗口）
         self.ai_model_var = tk.StringVar()
         self.ai_mmproj_var = tk.StringVar()
@@ -1611,6 +1974,20 @@ class ScraplingGrabberGUI:
         self.ai_port_var = tk.IntVar(value=AI_DEFAULT_PORT)
         # AI 对话上下文条数（设置窗口）
         self.ai_chat_ctx_var = tk.IntVar(value=12)
+        # AI 接入方式：local（内置本地）/ ollama / api（云端API）
+        self.ai_mode_var = tk.StringVar(value='local')
+        self.ai_provider_var = tk.StringVar(value='自定义')
+        self.ai_api_base_var = tk.StringVar(value='')
+        self.ai_provider_var = tk.StringVar(value='自定义')
+        self.ai_api_key_var = tk.StringVar(value='')
+        self.ai_api_model_var = tk.StringVar(value='')
+        self.ai_api_vlm_var = tk.StringVar(value='')
+        # API 高级项（模型列表、开关、参数）
+        self._ai_api_models = []
+        self.ai_api_no_thinking_var = tk.BooleanVar(value=False)
+        self.ai_api_adv_var = tk.BooleanVar(value=False)
+        self.ai_api_temperature_var = tk.DoubleVar(value=0.3)
+        self.ai_api_max_tokens_var = tk.IntVar(value=1024)
 
         # 按钮行
         btn_frame = ttk.Frame(top_frame)
@@ -2082,7 +2459,7 @@ class ScraplingGrabberGUI:
         win = tk.Toplevel(self.root)
         self.settings_win = win
         win.title('设置')
-        win.geometry('780x400')
+        win.geometry('780x580')
         win.resizable(False, False)
         win.transient(self.root)
         win.grab_set()
@@ -2106,29 +2483,506 @@ class ScraplingGrabberGUI:
         ttk.Button(r2, text='清理', width=6, command=self._clear_screenshots_manual).pack(side='left', padx=(4, 0))
 
         # ===== AI 模型与服务 =====
-        ai = ttk.LabelFrame(win, text='AI 模型与服务（本地 Qwen）')
+        ai = ttk.LabelFrame(win, text='AI 模型与服务（内置本地 / Ollama / 云端API 三选一）')
         ai.pack(fill='x', padx=8, pady=6)
-        r4 = ttk.Frame(ai)
-        r4.pack(fill='x', padx=6, pady=3)
+        r3 = ttk.Frame(ai)
+        r3.pack(fill='x', padx=6, pady=3)
+        ttk.Label(r3, text='AI方式:').pack(side='left')
+        ai_mode_combo = ttk.Combobox(r3, textvariable=self.ai_mode_var, width=16, state='readonly')
+        ai_mode_combo['values'] = ('local', 'ollama', 'api')
+        ai_mode_combo.pack(side='left', padx=2)
+        ai_mode_combo.bind('<<ComboboxSelected>>', lambda e: self._ai_mode_changed())
+
+        # 本地内置（llama-server）配置组
+        self.ai_local_frame = ttk.Frame(ai)
+        self.ai_local_frame.pack(fill='x', padx=6, pady=3)
+        r4 = ttk.Frame(self.ai_local_frame)
+        r4.pack(fill='x', pady=2)
         ttk.Label(r4, text='主模型:').pack(side='left')
-        ttk.Entry(r4, textvariable=self.ai_model_var, width=48).pack(side='left', padx=2)
+        ttk.Entry(r4, textvariable=self.ai_model_var, width=44).pack(side='left', padx=2)
         ttk.Button(r4, text='浏览', width=5, command=lambda: self._browse_ai_file('ai_model_var')).pack(side='left')
-        r5 = ttk.Frame(ai)
-        r5.pack(fill='x', padx=6, pady=2)
+        r5 = ttk.Frame(self.ai_local_frame)
+        r5.pack(fill='x', pady=2)
         ttk.Label(r5, text='视觉模块:').pack(side='left')
-        ttk.Entry(r5, textvariable=self.ai_mmproj_var, width=48).pack(side='left', padx=2)
+        ttk.Entry(r5, textvariable=self.ai_mmproj_var, width=44).pack(side='left', padx=2)
         ttk.Button(r5, text='浏览', width=5, command=lambda: self._browse_ai_file('ai_mmproj_var')).pack(side='left')
-        r6 = ttk.Frame(ai)
-        r6.pack(fill='x', padx=6, pady=2)
+        r6 = ttk.Frame(self.ai_local_frame)
+        r6.pack(fill='x', pady=2)
         ttk.Label(r6, text='服务程序:').pack(side='left')
-        ttk.Entry(r6, textvariable=self.ai_server_var, width=54).pack(side='left', padx=2)
+        ttk.Entry(r6, textvariable=self.ai_server_var, width=50).pack(side='left', padx=2)
         ttk.Button(r6, text='浏览', width=5, command=lambda: self._browse_ai_file('ai_server_var')).pack(side='left')
+
+        # Ollama 配置组（模型名 + 端口）
+        self.ai_ollama_frame = ttk.Frame(ai)
+        self.ai_ollama_frame.pack(fill='x', padx=6, pady=3)
+        r7 = ttk.Frame(self.ai_ollama_frame)
+        r7.pack(fill='x', pady=2)
+        ttk.Label(r7, text='模型名:').pack(side='left')
+        ttk.Entry(r7, textvariable=self.ai_model_var, width=44).pack(side='left', padx=2)
+        ttk.Label(r7, text='端口:').pack(side='left', padx=(12, 2))
+        ttk.Spinbox(r7, from_=1024, to=65535, textvariable=self.ai_port_var, width=7).pack(side='left')
+        ttk.Label(r7, text='(默认11434)').pack(side='left', padx=4)
+
+        # 云端API 配置组（地址/Key/模型列表/开关）
+        self.ai_api_frame = ttk.Frame(ai)
+        self.ai_api_frame.pack(fill='x', padx=6, pady=3)
+        r8 = ttk.Frame(self.ai_api_frame)
+        r8.pack(fill='x', pady=2)
+        ttk.Label(r8, text='服务商:').pack(side='left')
+        self.ai_provider_btn = ttk.Button(r8, textvariable=self.ai_provider_var, width=16,
+                                          command=self._ai_choose_provider)
+        self.ai_provider_btn.pack(side='left', padx=2)
+        ttk.Label(r8, text='API地址:').pack(side='left', padx=(10, 2))
+        ttk.Entry(r8, textvariable=self.ai_api_base_var, width=36).pack(side='left', padx=2)
+        r9 = ttk.Frame(self.ai_api_frame)
+        r9.pack(fill='x', pady=2)
+        ttk.Label(r9, text='API Key:').pack(side='left')
+        self.ai_api_key_entry = ttk.Entry(r9, textvariable=self.ai_api_key_var, width=44, show='*')
+        self.ai_api_key_entry.pack(side='left', padx=2)
+        ttk.Button(r9, text='显示', width=4, command=self._ai_toggle_key_show).pack(side='left')
+        r9b = ttk.Frame(self.ai_api_frame)
+        r9b.pack(fill='x', pady=2)
+        ttk.Checkbutton(r9b, text='关闭思维链', variable=self.ai_api_no_thinking_var).pack(side='left', padx=(0, 16))
+        ttk.Checkbutton(r9b, text='启用高级参数', variable=self.ai_api_adv_var,
+                        command=self._ai_adv_toggle).pack(side='left')
+        # 高级参数行（默认隐藏）
+        self.ai_adv_row = ttk.Frame(self.ai_api_frame)
+        ttk.Label(self.ai_adv_row, text='温度:').pack(side='left')
+        ttk.Spinbox(self.ai_adv_row, from_=0.0, to=2.0, increment=0.1,
+                    textvariable=self.ai_api_temperature_var, width=5).pack(side='left', padx=2)
+        ttk.Label(self.ai_adv_row, text='最大tokens:').pack(side='left', padx=(12, 2))
+        ttk.Spinbox(self.ai_adv_row, from_=64, to=8192,
+                    textvariable=self.ai_api_max_tokens_var, width=7).pack(side='left')
+        # 模型选择：LLM（对话/分析）+ VLM（看图识别），自动从 API 拉取
+        r10 = ttk.Frame(self.ai_api_frame)
+        r10.pack(fill='x', pady=2)
+        ttk.Label(r10, text='LLM模型:').pack(side='left')
+        self.ai_model_combo = ttk.Combobox(r10, textvariable=self.ai_api_model_var, width=26)
+        self.ai_model_combo.pack(side='left', padx=2)
+        ttk.Label(r10, text='VLM模型:').pack(side='left', padx=(14, 2))
+        self.ai_vlm_combo = ttk.Combobox(r10, textvariable=self.ai_api_vlm_var, width=26)
+        self.ai_vlm_combo.pack(side='left', padx=2)
+        r10b = ttk.Frame(self.ai_api_frame)
+        r10b.pack(fill='x', pady=2)
+        ttk.Button(r10b, text='获取模型', width=10, command=self._ai_fetch_models).pack(side='left')
+        ttk.Button(r10b, text='手动添加', width=10, command=self._ai_add_model).pack(side='left', padx=(4, 0))
+        ttk.Button(r10b, text='测试连接', width=10, command=self._ai_test_api).pack(side='left', padx=(4, 0))
+        self.ai_fetch_status_var = tk.StringVar(value='')
+        ttk.Label(r10b, textvariable=self.ai_fetch_status_var, foreground='#c00').pack(side='left', padx=6)
+        self._refresh_api_models()
+        if self.ai_api_adv_var.get():
+            self.ai_adv_row.pack(fill='x', pady=2)
+
+        # 公共：对话上下文
         r6b = ttk.Frame(ai)
         r6b.pack(fill='x', padx=6, pady=2)
         ttk.Label(r6b, text='端口:').pack(side='left')
         ttk.Spinbox(r6b, from_=1024, to=65535, textvariable=self.ai_port_var, width=7).pack(side='left', padx=2)
         ttk.Label(r6b, text='对话上下文(条):').pack(side='left', padx=(16, 2))
         ttk.Spinbox(r6b, from_=1, to=100, textvariable=self.ai_chat_ctx_var, width=6).pack(side='left')
+        self._ai_mode_changed()
+
+        # ===== 关于与更新 =====
+        about = ttk.LabelFrame(win, text='关于与更新')
+        about.pack(fill='x', padx=8, pady=6)
+        r11 = ttk.Frame(about)
+        r11.pack(fill='x', padx=6, pady=2)
+        ttk.Label(r11, text='软件版本:').pack(side='left')
+        ttk.Label(r11, text=APP_VERSION).pack(side='left', padx=2)
+        ttk.Label(r11, text='    核心引擎(Scrapling):').pack(side='left')
+        self.core_ver_var = tk.StringVar(value=self._get_scrapling_ver())
+        ttk.Label(r11, textvariable=self.core_ver_var).pack(side='left', padx=2)
+        ttk.Label(r11, text='    Python:').pack(side='left')
+        ttk.Label(r11, text=sys.version.split()[0]).pack(side='left', padx=2)
+        r12 = ttk.Frame(about)
+        r12.pack(fill='x', padx=6, pady=2)
+        ttk.Button(r12, text='检查更新', width=10, command=self._check_core_update).pack(side='left')
+        self.core_update_status_var = tk.StringVar(value='')
+        ttk.Label(r12, textvariable=self.core_update_status_var, foreground='#c00').pack(side='left', padx=6)
+        ttk.Label(r12, text='（检查核心引擎是否出新版，有则一键升级+重打包）', foreground='#888').pack(side='left', padx=6)
+
+    def _ai_provider_changed(self, e=None):
+        """服务商预设：选中后自动填入 API 地址"""
+        url = AI_PROVIDERS.get(self.ai_provider_var.get(), '')
+        if url:
+            self.ai_api_base_var.set(url)
+
+    def _save_provider_state(self, name=None):
+        """把当前 Key/LLM/VLM/模型列表 存入指定服务商配置（切走前调用）"""
+        name = name or self.ai_provider_var.get()
+        if not getattr(self, '_ai_providers_cfg', None):
+            self._ai_providers_cfg = {}
+        self._ai_providers_cfg[name] = {
+            'key': self.ai_api_key_var.get().strip(),
+            'llm': self.ai_api_model_var.get().strip(),
+            'vlm': self.ai_api_vlm_var.get().strip(),
+            'models': list(getattr(self, '_ai_api_models', [])),
+        }
+
+    def _load_provider_state(self, name):
+        """切换服务商后加载其 Key/模型配置"""
+        pcfg = getattr(self, '_ai_providers_cfg', {}).get(name) or {}
+        self.ai_api_key_var.set(pcfg.get('key', ''))
+        self.ai_api_model_var.set(pcfg.get('llm', ''))
+        self.ai_api_vlm_var.set(pcfg.get('vlm', ''))
+        self._ai_api_models = list(pcfg.get('models') or [])
+        self._refresh_api_models()
+
+    def _ai_choose_provider(self):
+        """弹出服务商选择窗口：搜索+列表，选中自动填入API地址"""
+        win = tk.Toplevel(self.settings_win)
+        win.title('选择服务商')
+        win.geometry('340x440')
+        win.transient(self.settings_win)
+        win.grab_set()
+        win.resizable(False, False)
+        search = ttk.Entry(win)
+        search.pack(fill='x', padx=8, pady=(8, 4))
+        search.insert(0, '搜索模型平台...')
+        search.bind('<FocusIn>', lambda e: search.selection_range(0, 'end'))
+        frame = ttk.Frame(win)
+        frame.pack(fill='both', expand=True, padx=8, pady=4)
+        lb = tk.Listbox(frame, font=('Microsoft YaHei UI', 10), activestyle='dotbox')
+        sb = ttk.Scrollbar(frame, orient='vertical', command=lb.yview)
+        lb.config(yscrollcommand=sb.set)
+        lb.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        names = list(AI_PROVIDERS.keys())
+
+        def refresh(_=None):
+            kw = search.get().strip().lower()
+            if kw == '搜索模型平台...':
+                kw = ''
+            lb.delete(0, 'end')
+            for n in names:
+                if not kw or kw in n.lower() or kw in AI_PROVIDERS[n].lower():
+                    lb.insert('end', n)
+            cur = self.ai_provider_var.get()
+            if cur in names:
+                try:
+                    lb.selection_set(names.index(cur))
+                    lb.see(names.index(cur))
+                except Exception:
+                    pass
+
+        def pick(_=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            name = lb.get(sel[0])
+            if name == self.ai_provider_var.get():
+                win.destroy()
+                return
+            # 保存当前服务商配置 → 切换 → 加载新服务商配置
+            self._save_provider_state()
+            url = AI_PROVIDERS.get(name, '')
+            self.ai_provider_var.set(name)
+            if url:
+                self.ai_api_base_var.set(url)
+            self._load_provider_state(name)
+            win.destroy()
+
+        def fill(_=None):
+            refresh()
+            pick()
+
+        refresh()
+        search.bind('<KeyRelease>', refresh)
+        lb.bind('<<ListboxSelect>>', fill)
+        lb.bind('<Double-Button-1>', pick)
+        win.bind('<Escape>', lambda e: win.destroy())
+        win.bind('<Return>', fill)
+
+    def _ai_toggle_key_show(self):
+        """API Key 显示/掩码切换"""
+        e = self.ai_api_key_entry
+        if e is not None:
+            e.config(show='' if e.cget('show') == '*' else '*')
+
+    def _ai_adv_toggle(self):
+        """高级参数行展开/收起"""
+        if self.ai_api_adv_var.get():
+            self.ai_adv_row.pack(fill='x', pady=2)
+        else:
+            self.ai_adv_row.pack_forget()
+
+    def _ai_fetch_models(self):
+        """从 API 自动拉取可用模型列表（GET /models）"""
+        base = self.ai_api_base_var.get().strip().rstrip('/')
+        key = self.ai_api_key_var.get().strip()
+        if not base or not key:
+            messagebox.showwarning('获取模型', '请先填写 API地址 和 API Key', parent=self.settings_win)
+            return
+        # 规范化 /models 地址：去掉 /chat/completions 尾巴；保持 /v1 或 /paas/v4
+        if base.endswith('/chat/completions'):
+            base = base[:base.rfind('/chat/completions')]
+        url = base + '/models'
+        self.ai_fetch_status_var.set('获取中...')
+        threading.Thread(target=self._ai_fetch_models_worker, args=(url, key), daemon=True).start()
+
+    def _ai_fetch_models_worker(self, url, key):
+        """后台线程：GET /models 拉模型列表"""
+        import urllib.request
+        import json as _json
+        try:
+            req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + key,
+                                                       'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                d = _json.loads(r.read())
+            ids = [str(x.get('id')) for x in d.get('data', []) if x.get('id')]
+            ids = sorted(set(ids))
+            if not ids:
+                self.root.after(0, lambda: (self.ai_fetch_status_var.set(''),
+                                            messagebox.showinfo('获取模型', '接口返回空模型列表',
+                                                                parent=self.settings_win)))
+                return
+            cur = self.ai_api_model_var.get().strip()
+            cur_v = self.ai_api_vlm_var.get().strip()
+            if cur not in ids:
+                self.ai_api_model_var.set(ids[0])
+            if cur_v not in ids:
+                # 优先挑带视觉关键词的模型作 VLM 默认，否则取 LLM 之后的第一个
+                vis = [x for x in ids if any(k in x.lower() for k in ('v', 'vision', 'vl', 'glm-4v'))]
+                self.ai_api_vlm_var.set(vis[0] if vis else ids[min(1, len(ids) - 1)])
+            self._ai_api_models = ids
+            self.root.after(0, lambda: (self.ai_fetch_status_var.set(''),
+                                        self._refresh_api_models(),
+                                        messagebox.showinfo('获取模型',
+                                                            '获取到 %d 个模型，已刷新列表\n%s'
+                                                            % (len(ids), '、'.join(ids[:15]) + ('…' if len(ids) > 15 else '')),
+                                                            parent=self.settings_win)))
+        except Exception as e:
+            self.root.after(0, lambda: (self.ai_fetch_status_var.set(''),
+                                        messagebox.showerror('获取模型', '获取失败：%s\n\n'
+                                                             '检查 API地址/Key 是否正确、服务是否支持 /models 接口；'
+                                                             '不支持时可点「手动添加」。' % e,
+                                                             parent=self.settings_win)))
+
+    def _ai_add_model(self):
+        """手动添加模型（服务不支持 /models 接口时兜底）"""
+        from tkinter import simpledialog
+        name = simpledialog.askstring('手动添加', '输入模型名（如 glm-4.7-flash、qwen-max）:',
+                                      parent=self.settings_win)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        models = list(getattr(self, '_ai_api_models', []))
+        if name not in models:
+            models.append(name)
+        if not self.ai_api_model_var.get().strip():
+            self.ai_api_model_var.set(name)
+        self._ai_api_models = models
+        self._refresh_api_models()
+
+    def _refresh_api_models(self):
+        """刷新 LLM/VLM 下拉列表"""
+        if not hasattr(self, 'ai_model_combo'):
+            return
+        models = list(getattr(self, '_ai_api_models', []))
+        cur = self.ai_api_model_var.get().strip()
+        cur_v = self.ai_api_vlm_var.get().strip()
+        if not models and (cur or cur_v):
+            models = [cur] if cur else [cur_v]
+        self.ai_model_combo['values'] = tuple(models)
+        self.ai_vlm_combo['values'] = tuple(models)
+        if cur not in models and models:
+            self.ai_api_model_var.set(models[0])
+        if cur_v not in models and models:
+            vis = [x for x in models if any(k in x.lower() for k in ('v', 'vision', 'vl', 'glm-4v'))]
+            self.ai_api_vlm_var.set(vis[0] if vis else models[min(1, len(models) - 1)])
+
+    def _ai_test_api(self):
+        """测试 API 连通性：用当前 LLM 模型发最小请求"""
+        base = self.ai_api_base_var.get().strip()
+        key = self.ai_api_key_var.get().strip()
+        model = self.ai_api_model_var.get().strip()
+        if not base or not key or not model:
+            messagebox.showwarning('测试连接', '请先填写 API地址、API Key 和 LLM模型',
+                                   parent=self.settings_win)
+            return
+        self.ai_fetch_status_var.set('测试中...')
+        threading.Thread(target=self._ai_test_api_worker, daemon=True).start()
+
+    def _ai_test_api_worker(self):
+        """后台线程：发最小请求并返回详细结果"""
+        import requests
+        import time
+        base = self.ai_api_base_var.get().strip().rstrip('/')
+        key = self.ai_api_key_var.get().strip()
+        model = self.ai_api_model_var.get().strip()
+        if base.endswith('/chat/completions'):
+            url = base
+        elif base.endswith('/v1'):
+            url = base + '/chat/completions'
+        else:
+            url = base + '/v1/chat/completions'
+        start = time.time()
+        try:
+            r = requests.post(url,
+                              json={'model': model,
+                                    'messages': [{'role': 'user', 'content': '你好，请只回复：连接成功'}],
+                                    'max_tokens': 16, 'temperature': 0},
+                              headers={'Authorization': 'Bearer ' + key}, timeout=30)
+            cost = time.time() - start
+            if r.status_code == 200:
+                content = (r.json()['choices'][0]['message'].get('content') or '').strip()
+                self.root.after(0, lambda: (self.ai_fetch_status_var.set(''),
+                                            messagebox.showinfo('测试连接',
+                                                                '✓ 连接成功（%.1f秒）\n模型回复：%s'
+                                                                % (cost, content or '(空)'),
+                                                                parent=self.settings_win)))
+            else:
+                err = (r.text or '')[:200].replace('\n', ' ')
+                self.root.after(0, lambda: (self.ai_fetch_status_var.set(''),
+                                            messagebox.showerror('测试连接',
+                                                                '✗ 请求失败 HTTP %d\n%s\n\n'
+                                                                '检查：Key是否正确、模型名是否存在' % (r.status_code, err),
+                                                                parent=self.settings_win)))
+        except Exception as e:
+            self.root.after(0, lambda: (self.ai_fetch_status_var.set(''),
+                                        messagebox.showerror('测试连接',
+                                                            '✗ 连接失败：%s\n\n'
+                                                            '检查：地址是否可访问（可能需要代理）' % e,
+                                                            parent=self.settings_win)))
+
+    def _ai_mode_changed(self):
+        """AI 方式切换：显示对应配置组"""
+        mode = self.ai_mode_var.get()
+        for f, m in ((getattr(self, 'ai_local_frame', None), 'local'),
+                     (getattr(self, 'ai_ollama_frame', None), 'ollama'),
+                     (getattr(self, 'ai_api_frame', None), 'api')):
+            if f is not None:
+                if mode == m:
+                    f.pack(fill='x', padx=6, pady=3)
+                else:
+                    f.pack_forget()
+
+    # ===== 关于与更新 =====
+    @staticmethod
+    def _get_scrapling_ver():
+        try:
+            import scrapling
+            return getattr(scrapling, '__version__', '未知')
+        except Exception:
+            return '未知'
+
+    def _check_core_update(self):
+        """检查核心引擎（Scrapling库）是否有新版本"""
+        self.core_update_status_var.set('检查中...')
+        threading.Thread(target=self._core_check_worker, daemon=True).start()
+
+    def _core_check_worker(self):
+        """后台线程：查 PyPI 最新版并对比本地"""
+        import urllib.request
+        import json as _json
+        try:
+            req = urllib.request.Request('https://pypi.org/pypi/scrapling/json',
+                                         headers={'User-Agent': 'Mozilla/5.0'})
+            d = _json.load(urllib.request.urlopen(req, timeout=12))
+            latest = d['info']['version']
+        except Exception as e:
+            self.root.after(0, lambda: (self.core_update_status_var.set(''),
+                                        messagebox.showinfo('检查更新',
+                                                            '检查失败：无法访问 PyPI 网络（%s）' % e,
+                                                            parent=self.settings_win)))
+            return
+        local = self._get_scrapling_ver()
+
+        def done():
+            self.core_update_status_var.set('')
+            if ver_gt(latest, local):
+                r = messagebox.askyesno(
+                    '发现新版本',
+                    '核心引擎 Scrapling 有新版本：\n当前 %s  →  最新 %s\n\n'
+                    '是否立即更新？\n（自动升级库并重新打包 exe，约3分钟，'
+                    '期间软件会退出后自动重启，需在开发机源码目录运行）' % (local, latest),
+                    parent=self.settings_win)
+                if r:
+                    self._run_core_update()
+            else:
+                messagebox.showinfo('检查更新', '核心引擎已是最新版本（%s）' % local,
+                                    parent=self.settings_win)
+        self.root.after(0, done)
+
+    def _find_source_file(self):
+        """定位源码文件（开发机）：当前目录或 exe 的上级目录"""
+        import os
+        for c in (os.path.join(os.getcwd(), 'scrapling_grabber_gui.py'),
+                  os.path.join(os.path.dirname(os.path.dirname(sys.executable)),
+                               'scrapling_grabber_gui.py')):
+            if os.path.exists(c):
+                return c
+        return None
+
+    def _run_core_update(self):
+        """一键更新：升级库 → 杀旧进程 → 重打包 → 覆盖L盘 → 自动重启"""
+        src = self._find_source_file()
+        if not src:
+            messagebox.showwarning(
+                '一键更新',
+                '当前是打包版运行环境，无法自动更新。\n'
+                '请到开发机源码目录（含 scrapling_grabber_gui.py 的文件夹）'
+                '打开本软件后再点检查更新。',
+                parent=self.settings_win)
+            return
+        self.core_update_status_var.set('更新中(1/3)：升级核心库...')
+        threading.Thread(target=self._core_update_worker, args=(src,), daemon=True).start()
+
+    def _core_update_worker(self, src):
+        """后台线程：执行一键更新流程"""
+        import os
+        import subprocess
+        import shutil
+        import time
+        base = os.path.dirname(src)
+        exe_name = 'Scrapling图片爬虫_GUI_%s.exe' % APP_VERSION
+        dist_exe = os.path.join(base, 'dist', exe_name)
+
+        def upd(text):
+            self.root.after(0, lambda: self.core_update_status_var.set(text))
+
+        def fail(msg):
+            upd('更新失败')
+            self.root.after(0, lambda: messagebox.showerror(
+                '一键更新', msg, parent=self.settings_win))
+        try:
+            # 1. 升级核心库
+            upd('更新中(1/3)：升级核心库...')
+            r = subprocess.run([sys.executable, '-m', 'pip', 'install', '-U', 'scrapling'],
+                               cwd=base, capture_output=True, timeout=300, text=True)
+            if r.returncode != 0:
+                fail('pip 升级失败：\n%s' % ((r.stderr or r.stdout)[-500:]))
+                return
+            # 2. 杀旧进程（避免 exe 占用）
+            subprocess.run(['powershell', '-Command',
+                            "Get-Process -Name '*Scrapling*' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"],
+                           cwd=base, timeout=30)
+            time.sleep(2)
+            # 3. 重新打包
+            upd('更新中(2/3)：重新打包exe（约2-3分钟）...')
+            b = subprocess.run([sys.executable, '-m', 'PyInstaller', '--clean', '--onefile',
+                                '--windowed', '--collect-all', 'scrapling',
+                                '--name', exe_name[:-4], 'scrapling_grabber_gui.py'],
+                               cwd=base, capture_output=True, timeout=900, text=True)
+            if not os.path.exists(dist_exe):
+                fail('重新打包失败：\n%s' % ((b.stderr or b.stdout)[-500:]))
+                return
+            # 4. 覆盖 L 盘存档
+            upd('更新中(3/3)：同步L盘存档...')
+            try:
+                l_dst = r'L:\工作流\小工具\Scrapling图片爬虫\v2.12.27'
+                if os.path.isdir(l_dst):
+                    shutil.copy2(dist_exe, os.path.join(l_dst, exe_name))
+                    shutil.copy2(src, os.path.join(l_dst, 'scrapling_grabber_gui.py'))
+            except Exception:
+                pass
+            # 5. 自动重启
+            upd('更新完成，重启中...')
+            subprocess.Popen([dist_exe], cwd=base)
+            self.root.after(800, lambda: (self.core_update_status_var.set('完成'),
+                                          self._close_settings()))
+        except Exception as e:
+            fail('更新出错：%s' % e)
 
     def _toggle_game_mod_window(self):
         """点一下：EC窗口贴合主窗口右侧显示；再点：隐藏"""
@@ -2158,21 +3012,18 @@ class ScraplingGrabberGUI:
     def _on_root_configure(self, e):
         """主窗口移动/缩放：贴合状态的修改器/AI窗实时跟随（用winfo查询，不依赖e.x_root——Windows上它为0）"""
         try:
-            if not (getattr(self, 'game_win', None) and self.game_win.winfo_exists()
+            if (getattr(self, 'game_win', None) and self.game_win.winfo_exists()
                     and self.game_win.state() == 'normal' and getattr(self, '_ec_docked', False)):
-                pass
-            else:
                 cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
-                if cur != getattr(self, '_last_root_pos', None):
-                    self._last_root_pos = cur
+                if cur != getattr(self, '_last_root_pos_game', None):
+                    self._last_root_pos_game = cur
                     self._snap_game_win()
-            if not (getattr(self, 'ai_float_win', None) and self.ai_float_win.winfo_exists()
+            if (getattr(self, 'ai_float_win', None) and self.ai_float_win.winfo_exists()
                     and self.ai_float_win.state() == 'normal' and getattr(self, '_ai_float_docked', False)):
-                return
-            cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
-            if cur != getattr(self, '_last_root_pos', None):
-                self._last_root_pos = cur
-                self._snap_ai_float_win()
+                cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
+                if cur != getattr(self, '_last_root_pos_ai', None):
+                    self._last_root_pos_ai = cur
+                    self._snap_ai_float_win()
         except Exception:
             pass
 
@@ -2182,14 +3033,14 @@ class ScraplingGrabberGUI:
             if (getattr(self, 'game_win', None) and self.game_win.winfo_exists()
                     and self.game_win.state() == 'normal' and getattr(self, '_ec_docked', False)):
                 cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
-                if cur != getattr(self, '_last_root_pos', None):
-                    self._last_root_pos = cur
+                if cur != getattr(self, '_last_root_pos_game', None):
+                    self._last_root_pos_game = cur
                     self._snap_game_win()
             if (getattr(self, 'ai_float_win', None) and self.ai_float_win.winfo_exists()
                     and self.ai_float_win.state() == 'normal' and getattr(self, '_ai_float_docked', False)):
                 cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
-                if cur != getattr(self, '_last_root_pos', None):
-                    self._last_root_pos = cur
+                if cur != getattr(self, '_last_root_pos_ai', None):
+                    self._last_root_pos_ai = cur
                     self._snap_ai_float_win()
         except Exception:
             pass
@@ -2299,6 +3150,8 @@ class ScraplingGrabberGUI:
             return
         self._create_ai_float_win()
         self._snap_ai_float_win()
+        # 兜底：Windows 首次映射可能覆盖 geometry，延迟再贴一次
+        self.ai_float_win.after(120, self._snap_ai_float_win)
 
     def _snap_ai_float_win(self):
         """AI对话窗磁吸主窗口右边缘（高度与主窗口同长）"""
@@ -2318,35 +3171,56 @@ class ScraplingGrabberGUI:
         win = tk.Toplevel(self.root)
         self.ai_float_win = win
         win.title('AI对话')
-        win.geometry('360x600+0+0')
-        win.transient(self.root)
+        win.geometry('420x600+0+0')
+        # 不用 transient：Windows 会把 transient 窗口强制定位到父窗口中央，干扰磁吸
         self._ai_float_docked = False
         self._ai_float_last_xy = None
+
+        # 顶部辅助栏：粘贴/选区/清空（底部只留输入+截图给AI+发送）
+        topbar = ttk.Frame(win)
+        topbar.pack(side='top', fill='x', padx=6, pady=(4, 0))
+        ttk.Label(topbar, text='AI对话').pack(side='left')
+        ttk.Button(topbar, text='清空', width=5, command=self._ai_clear_chat).pack(side='right', padx=1)
+        ttk.Button(topbar, text='选区', width=5, command=self._ai_region_shot).pack(side='right', padx=1)
+        ttk.Button(topbar, text='粘贴', width=5, command=self._ai_paste_shot).pack(side='right', padx=1)
+
+        # 底部输入栏先 pack（Text 后 pack 吃剩余，避免被 expand 挤掉）
+        bottom = ttk.Frame(win)
+        bottom.pack(side='bottom', fill='x', padx=6, pady=6)
+        self.ai_float_input = ttk.Entry(bottom)
+        self.ai_float_input.pack(side='left', fill='x', expand=True)
+        self.ai_float_input.bind('<Return>', lambda e: self._ai_chat_send_from(self.ai_float_input))
+        ttk.Button(bottom, text='截图给AI', width=8,
+                   command=self._ai_add_shot).pack(side='left', padx=(4, 0))
+        ttk.Button(bottom, text='发送', width=6,
+                   command=lambda: self._ai_chat_send_from(self.ai_float_input)).pack(side='left', padx=(4, 0))
 
         txt = tk.Text(win, wrap='word', font=('Consolas', 9))
         ai_scroll = ttk.Scrollbar(win, command=txt.yview)
         txt.configure(yscrollcommand=ai_scroll.set)
         txt.pack(side='left', fill='both', expand=True)
         ai_scroll.pack(side='right', fill='y')
+        txt.tag_configure('ts', font=('Microsoft YaHei UI', 8), foreground='#999999')
+        txt.tag_configure('req_bubble', background='#e3f2fd', lmargin1=70, lmargin2=70, rmargin=10,
+                          spacing1=3, spacing3=3)
+        txt.tag_configure('resp_bubble', background='#e8f5e9', lmargin1=10, lmargin2=10, rmargin=70,
+                          spacing1=3, spacing3=3)
+        txt.tag_configure('tool', foreground='#b45309')
         txt.tag_configure('req', foreground='#1a56db')
         txt.tag_configure('resp', foreground='#0d7a3d')
-        txt.tag_configure('tool', foreground='#b45309')
         txt.tag_configure('sep', foreground='#bbbbbb')
         self.ai_float_text = txt
-
-        bottom = ttk.Frame(win)
-        bottom.pack(side='bottom', fill='x', padx=6, pady=6)
-        self.ai_float_input = ttk.Entry(bottom)
-        self.ai_float_input.pack(side='left', fill='x', expand=True)
-        self.ai_float_input.bind('<Return>', lambda e: self._ai_chat_send_from(self.ai_float_input))
-        ttk.Button(bottom, text='发送', width=6,
-                   command=lambda: self._ai_chat_send_from(self.ai_float_input)).pack(side='left', padx=(4, 0))
-        ttk.Button(bottom, text='截图', width=6, command=self._ai_add_shot).pack(side='left', padx=(4, 0))
-        ttk.Button(bottom, text='清空', width=6, command=self._ai_clear_chat).pack(side='left', padx=(4, 0))
 
         win.protocol('WM_DELETE_WINDOW', self._ai_float_close)
         # 独立拖动/缩放：松手靠近主窗口自动吸回
         win.bind('<Configure>', self._on_ai_float_configure)
+        # 主窗口移动跟随：Configure实时（winfo查询）+ 轮询兜底（与游戏修改窗共用）
+        if not getattr(self, '_root_cfg_bound', False):
+            self.root.bind('<Configure>', self._on_root_configure)
+            self._root_cfg_bound = True
+        if not getattr(self, '_snap_poll_started', False):
+            self.root.after(150, self._poll_game_snap)
+            self._snap_poll_started = True
         # 把页签已有对话同步过来
         try:
             txt.insert('1.0', self.ai_chat_text.get('1.0', 'end'))
@@ -4032,17 +4906,15 @@ class ScraplingGrabberGUI:
                     '若页面截图里能看到大量图片，strategy填scroll并给合理的scroll_times(2-8)。'
                     % (url[:60], img_count, clue))
         try:
-            model = _json.loads(_ur.urlopen('http://127.0.0.1:%s/v1/models' % self.ai_port_var.get(), timeout=5).read())['data'][0]['id']
-            body = {'model': model,
-                    'messages': [{'role': 'user', 'content': [
+            body = {'messages': [{'role': 'user', 'content': [
                         {'type': 'text', 'text': question},
                         {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + jpg_b64}},
                     ]}],
                     'max_tokens': 300, 'temperature': 0.1}
-            req = _ur.Request('http://127.0.0.1:%s/v1/chat/completions' % self.ai_port_var.get(),
-                              data=_json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
-            with _ur.urlopen(req, timeout=240) as r:
-                out = _json.loads(r.read())
+            ok, out = self._ai_completion(body, timeout=240)
+            if not ok:
+                self._log('AI策略分析调用失败')
+                return None
             text = out['choices'][0]['message']['content'].strip()
         except Exception as e:
             self._log('AI策略分析调用失败: %s' % e)
