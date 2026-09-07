@@ -1572,6 +1572,9 @@ class ScraplingGrabberGUI:
         render_combo = ttk.Combobox(opt_frame, textvariable=self.render_mode_var, width=12, state='readonly')
         render_combo['values'] = ('直连模式', '浏览器渲染', '浏览器模式(CDP)')
         render_combo.pack(side='left', padx=(2, 10))
+        # 磁吸窗按钮（利用本行右侧空白）
+        ttk.Button(opt_frame, text='AI对话', width=10, command=self._toggle_ai_float_window).pack(side='left', padx=(0, 4))
+        ttk.Button(opt_frame, text='游戏修改', width=10, command=self._toggle_game_mod_window).pack(side='left')
 
         # AI 操作行（模型路径等配置在设置窗口）
         ai_opt = ttk.Frame(top_frame)
