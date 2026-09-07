@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.23'
+APP_VERSION = 'v2.12.24'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -1079,6 +1079,35 @@ class ScraplingGrabberGUI:
             js = 'window.__ecLock&&(clearInterval(window.__ecLock),window.__ecLock=null);true;'
         return self._ai_execute_js(js, timeout=8)
 
+    def _ai_ec_reload(self, segs):
+        """EC恢复：按保存的变量路径回读当前值（页面刷新后变量重建，路径一般仍有效）"""
+        import json as _json
+        import websocket as _ws
+        js = ('(function(){var prev=%(p)s;var out=[];'
+              'for(var i=0;i<prev.length;i++){try{'
+              'var seg=prev[i];var cur=window;'
+              'for(var j=1;j<seg.length;j++){cur=cur[seg[j]];}'
+              'if(typeof cur==="number"){out.push({s:seg,v:cur});}'
+              '}catch(e){}}return out.slice(0,500);})()'
+              % {'p': _json.dumps(segs)})
+        try:
+            pages = _json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json/list', timeout=5).read())
+            pages = [t for t in pages if t.get('type') == 'page']
+            if not pages:
+                return None
+            active = next((t for t in pages if t.get('active')), pages[0])
+            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=15)
+            ws.send(_json.dumps({'id': 1, 'method': 'Runtime.evaluate', 'params': {
+                'expression': js, 'returnByValue': True}}))
+            resp = _json.loads(ws.recv())
+            ws.close()
+            val = resp.get('result', {}).get('result', {}).get('value')
+            if not isinstance(val, list):
+                return []
+            return [(h.get('s', []), h.get('v')) for h in val]
+        except Exception:
+            return None
+
     def _ai_add_shot(self):
         """「截图给AI」：截取当前浏览器页面加入对话，发送时随问题一起让AI看图"""
         if not (self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)):
@@ -1527,7 +1556,7 @@ class ScraplingGrabberGUI:
         self.ai_toggle_btn.pack(side='left', padx=6)
         self.ai_status_var = tk.StringVar(value=self._ai_state)
         ttk.Label(ai_opt, textvariable=self.ai_status_var, foreground='#888').pack(side='left')
-        ttk.Button(ai_opt, text='游戏修改(EC)', width=12, command=self._open_game_mod_window).pack(side='left', padx=(10, 0))
+        ttk.Button(ai_opt, text='游戏修改', width=10, command=self._toggle_game_mod_window).pack(side='left', padx=(10, 0))
 
         # AI 模型/服务路径变量（控件在设置窗口）
         self.ai_model_var = tk.StringVar()
@@ -2047,7 +2076,30 @@ class ScraplingGrabberGUI:
         ttk.Label(r6b, text='对话上下文(条):').pack(side='left', padx=(16, 2))
         ttk.Spinbox(r6b, from_=1, to=100, textvariable=self.ai_chat_ctx_var, width=6).pack(side='left')
 
-    def _open_game_mod_window(self):
+    def _toggle_game_mod_window(self):
+        """点一下：EC窗口贴合主窗口右侧显示；再点：隐藏"""
+        if getattr(self, 'game_win', None) is not None and self.game_win.winfo_exists():
+            if self.game_win.state() == 'normal':
+                self.game_win.withdraw()
+                return
+            self.game_win.deiconify()
+            self._snap_game_win()
+            return
+        self._create_game_win()
+        self._snap_game_win()
+
+    def _snap_game_win(self):
+        """EC窗口贴合主窗口右侧（跟随主窗口位置）"""
+        try:
+            self.root.update_idletasks()
+            rx = self.root.winfo_x()
+            ry = self.root.winfo_y()
+            rw = self.root.winfo_width()
+            self.game_win.geometry('720x480+%d+%d' % (rx + rw + 4, ry))
+        except Exception:
+            pass
+
+    def _create_game_win(self):
         """EC 模式窗口：网页游戏数值 搜索→过滤→修改/锁定（Cheat Engine 风格）"""
         if getattr(self, 'game_win', None) is not None and self.game_win.winfo_exists():
             self.game_win.lift()
@@ -2055,7 +2107,7 @@ class ScraplingGrabberGUI:
             return
         win = tk.Toplevel(self.root)
         self.game_win = win
-        win.title('游戏数值修改（EC模式）')
+        win.title('游戏数值修改')
         win.geometry('720x480')
         win.transient(self.root)
 
@@ -2097,14 +2149,20 @@ class ScraplingGrabberGUI:
         self.ec_lock_var = tk.StringVar(value='未锁定')
         ttk.Label(bot, textvariable=self.ec_lock_var, foreground='#c0392b').pack(side='left', padx=10)
         win.protocol('WM_DELETE_WINDOW', self._ec_close)
+        # 打开时自动恢复上次扫描结果与锁定
+        self.root.after(400, self._ec_restore_state)
 
     def _ec_close(self):
+        """X 关闭 = 隐藏（贴合窗口复用）；锁定保持运行，重开自动恢复"""
         try:
             if self.ec_lock_info:
-                self._ai_ec_lock(self.ec_lock_info[0], self.ec_lock_info[1], False)
+                self.ec_lock_var.set('已锁定（隐藏中，仍生效）')
         except Exception:
             pass
-        self.game_win.destroy()
+        try:
+            self.game_win.withdraw()
+        except Exception:
+            pass
 
     def _ec_clear(self):
         self.ec_scan_state = None
@@ -2112,6 +2170,45 @@ class ScraplingGrabberGUI:
         for i in self.ec_tree.get_children():
             self.ec_tree.delete(i)
         self.ec_count_var.set('已清除')
+        self.cfg.pop('ec_scan_paths', None)
+        self.cfg.pop('ec_lock', None)
+        save_config(self.cfg)
+
+    def _ec_save_state(self):
+        """保存扫描路径+锁定项到配置（重开/刷新后自动恢复，免重新搜索）"""
+        try:
+            if self.ec_scan_state:
+                self.cfg['ec_scan_paths'] = [list(s) for s in self.ec_scan_state[:500]]
+            else:
+                self.cfg.pop('ec_scan_paths', None)
+            if self.ec_lock_info:
+                self.cfg['ec_lock'] = {'segs': list(self.ec_lock_info[0]), 'value': self.ec_lock_info[1]}
+            else:
+                self.cfg.pop('ec_lock', None)
+            save_config(self.cfg)
+        except Exception:
+            pass
+
+    def _ec_restore_state(self):
+        """恢复上次扫描结果：回读路径当前值 + 自动恢复锁定"""
+        paths = self.cfg.get('ec_scan_paths')
+        lock = self.cfg.get('ec_lock')
+        if paths:
+            hits = self._ai_ec_reload([list(p) for p in paths])
+            if hits:
+                self.ec_scan_state = [s for s, v in hits]
+                self._ec_fill(hits)
+            elif hits is not None:
+                self.ec_count_var.set('已恢复，但路径全部失效（页面可能已变），请重新扫描')
+        if lock:
+            segs = list(lock.get('segs', []))
+            value = lock.get('value', 0)
+            try:
+                self._ai_ec_lock(segs, value, True)
+                self.ec_lock_info = (segs, value)
+                self.ec_lock_var.set('已恢复锁定 %s = %s' % ('.'.join(segs), value))
+            except Exception:
+                pass
 
     def _ec_fill(self, hits):
         for i in self.ec_tree.get_children():
@@ -2148,6 +2245,7 @@ class ScraplingGrabberGUI:
                 return
             self.ec_scan_state = [s for s, v in hits]
             self._ec_fill(hits)
+        self._ec_save_state()
 
     def _ec_first_scan(self):
         self._ec_do_scan(True)
@@ -2196,6 +2294,7 @@ class ScraplingGrabberGUI:
             self._ai_ec_lock([], 0, False)
             self.ec_lock_info = None
             self.ec_lock_var.set('未锁定')
+        self._ec_save_state()
 
     def _close_settings(self):
         """关闭设置窗口并保存设置"""
@@ -4150,6 +4249,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
