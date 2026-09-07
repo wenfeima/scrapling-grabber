@@ -1,4 +1,12 @@
-# Scrapling 图片爬虫 - 开发交接笔记（v2.12.25）
+# Scrapling 图片爬虫 - 开发交接笔记（v2.12.26）
+
+## v2.12.26 完善（游戏修改窗口：磁吸跟随修复 + 进度文件挪位）
+- **磁吸跟随修复**：Windows 拖动窗口时 Tk `<Configure>` 的 e.x_root 为 0/无效 → 改用 `winfo_x()/winfo_y()` 实时查询坐标（Configure 事件触发时跟随）+ 150ms 轮询兜底（`_on_root_configure` + `_poll_game_snap`）
+- **贴合状态**：`_ec_docked` 标志——点按钮贴边=True；拖走超过边缘100px=False（自由）；松手在100px内自动吸回
+- **高度跟随主窗口**：`_snap_game_win` 高度=主窗口高度（min 300），宽度 320
+- **进度文件挪位**：`scrapling_progress.json` → `%LOCALAPPDATA%\WebGrabber\progress\progress_{目录hash}.json`（用户经常清空保存目录，进度不能再放里面）
+- 拖动小窗放大列宽自适应（`_on_game_win_configure` path列=宽-95）
+- 按钮/窗口名去掉"EC"
 
 ## v2.12.25 完善（游戏修改：磁吸+窄窗+resize 自适应）
 - **磁吸**：窗口贴主窗口右边缘无缝隙（`_snap_game_win` 320x470，x=rx+rw+0）；主窗口移动/缩放时跟随（`_on_root_configure`，只绑一次）
