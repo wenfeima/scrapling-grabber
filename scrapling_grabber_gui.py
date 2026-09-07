@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.18'
+APP_VERSION = 'v2.12.19'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -1777,19 +1777,21 @@ class ScraplingGrabberGUI:
             self._log('打开截图目录失败: %s' % e)
 
     def _clear_screenshots_manual(self):
-        """手动清理临时截图（保留最近200张）"""
+        """手动清理临时截图：全部清空（自动保留200张是防累积，手动按钮直接清空）"""
         shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
-        before = 0
+        removed = 0
         if os.path.isdir(shot_dir):
-            before = len([f for f in os.listdir(shot_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
-        self._clean_screenshots(200)
-        after = 0
-        if os.path.isdir(shot_dir):
-            after = len([f for f in os.listdir(shot_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
-        if before > after:
-            self._log('已清理临时截图: %d 张 → %d 张' % (before, after))
+            for f in os.listdir(shot_dir):
+                if f.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    try:
+                        os.remove(os.path.join(shot_dir, f))
+                        removed += 1
+                    except Exception:
+                        pass
+        if removed:
+            self._log('已手动清理临时截图: 删除 %d 张' % removed)
         else:
-            self._log('临时截图无需清理（当前 %d 张，上限200张）' % before)
+            self._log('临时截图目录为空，无需清理')
 
     def _open_settings(self):
         """打开设置窗口：保存目录/线程/超时/最小图 + AI 模型与服务配置"""
@@ -3800,6 +3802,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
