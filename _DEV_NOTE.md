@@ -1,4 +1,11 @@
-# Scrapling 图片爬虫 - 开发交接笔记（v2.12.11）
+# Scrapling 图片爬虫 - 开发交接笔记（v2.12.12）
+
+## v2.12.12 新功能（AI 看图调整抓取策略）
+- **需求**：浏览器打开页面正常显示，但规则提取不到/太少图片——让 AI 看图判断加载方式并自动调整
+- **新增**：`_ai_analyze_page_strategy`（截图当前页 + DOM图片线索 → 视觉模型 → JSON策略：has_images/strategy/scroll_times/note）+ `_scroll_debug_browser`（CDP滚动N轮）+ `_fetch_current_tab_html` + `_collect_image_clues` + `_ai_adjust_extract`（执行策略重新提取）
+- **接入**：单页模式提取 <3 张且 AI 服务运行中 → 自动启动 AI 看图 → 按策略滚动/重新提取
+- **实测通过**：xchina photo 页 DOM 线索 20img+20背景+30懒加载 → 模型输出 {"has_images":true,"strategy":"scroll","scroll_times":5} 耗时 18.9s
+- **全站模式**：已有文本规律分析（_ai_analyze_patterns + 缓存），两种 AI 路径互补
 
 ## v2.12.11 修复（浏览器模式抓取触发 CF 1005 封禁）
 - **现象**：内置浏览器手动打开 xchina 正常，点抓取就 Cloudflare Error 1005（ASN 36352 被封 = 用户全局代理机房出口）
