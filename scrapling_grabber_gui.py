@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.10.1'
+APP_VERSION = 'v2.11.0'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -81,6 +81,25 @@ AI_PROMPT_PROMPT = ('这是网页抓取的一张图片。请完成两项任务�
                     'beach, ocean, sunlight, backlight, 85mm, f1.8, bokeh, detailed skin, looking at viewer')
 # 启用提示词时模型输出的最大 token 数
 AI_PROMPT_MAX_TOKENS = 800
+
+# AI 辅助分析：从页面 URL 样本中找出目标链接规律（规则抓不到时使用）
+AI_ANALYZE_PROMPT = ('我是网页抓取工具，规则识别不到目标链接，需要你帮忙从 URL 样本中找出规律。\n'
+                     '下面是页面中提取到的 URL 样本（每行一个），其中一部分是目标链接，其余是导航/装饰链接。\n'
+                     '目标类型：{target_desc}\n'
+                     '请找出能匹配目标链接的正则表达式（Python re 风格，只写表达式本身）。\n'
+                     '注意：数字ID的长度可能变化，优先用 + 或 * 而不是固定的 {n} 数量。\n'
+                     '输出严格按以下两行（没有就写"无"）：\n'
+                     '链接正则: <正则表达式>\n'
+                     '特征描述: <一句话说明目标链接的特征>\n'
+                     '要求：正则必须能匹配样本中的目标链接，且尽量不匹配导航/装饰链接。\n'
+                     'URL样本：\n{urls}')
+
+# AI 下载前预筛：仅依据 URL 判断正文图/装饰图（文本模式，速度快）
+AI_PRESCREEN_PROMPT = ('以下每行是一个图片URL（来自网页抓取）。请逐行判断：'
+                       '它是帖子"正文图"（写真、摄影、插画等帖子内容）还是"装饰"'
+                       '（logo、图标、头像、按钮、表情、横幅、广告）。只依据URL的路径和文件名特征判断。\n'
+                       '逐行输出，每行只写两个字：下  或  跳过\n'
+                       'URL列表：\n{urls}')
 
 # 配置文件路径
 CONFIG_FILE = os.path.join(os.path.expanduser('~'), '.scrapling_grabber_config.json')
@@ -205,11 +224,13 @@ class ScraplingGrabberGUI:
         self.ai_filter_var.set(self.cfg.get('ai_filter', False))
         self.ai_prompt_var.set(self.cfg.get('ai_prompt', False))
         self.ai_auto_stop_var.set(self.cfg.get('ai_auto_stop', False))
+        self.ai_prescreen_var.set(self.cfg.get('ai_prescreen', False))
         self.ai_preset_var.set(preset)
         self.ai_model_var.set(self.cfg.get('ai_model', ''))
         self.ai_mmproj_var.set(self.cfg.get('ai_mmproj', ''))
         self.ai_server_var.set(self.cfg.get('ai_server', AI_SERVER_DEFAULT))
         self.ai_port_var.set(self.cfg.get('ai_port', AI_DEFAULT_PORT))
+        self.ai_chat_ctx_var.set(self.cfg.get('ai_chat_ctx', 12))
         self._ai_apply_preset()
 
     def _save_settings(self):
@@ -229,11 +250,13 @@ class ScraplingGrabberGUI:
             'ai_filter': self.ai_filter_var.get(),
             'ai_prompt': self.ai_prompt_var.get(),
             'ai_auto_stop': self.ai_auto_stop_var.get(),
+            'ai_prescreen': self.ai_prescreen_var.get(),
             'ai_preset': self.ai_preset_var.get(),
             'ai_model': self.ai_model_var.get().strip(),
             'ai_mmproj': self.ai_mmproj_var.get().strip(),
             'ai_server': self.ai_server_var.get().strip(),
             'ai_port': self.ai_port_var.get(),
+            'ai_chat_ctx': self.ai_chat_ctx_var.get(),
         })
         save_config(self.cfg)
 
@@ -380,6 +403,7 @@ class ScraplingGrabberGUI:
             port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
             prompt_text = AI_PROMPT_PROMPT if use_prompt else AI_JUDGE_PROMPT
             max_tokens = AI_PROMPT_MAX_TOKENS if use_prompt else 128
+            self._ai_log_chat('req', '[图片判断] %s\n%s' % (os.path.basename(img_path), prompt_text))
             r = requests.post(
                 'http://127.0.0.1:%d/v1/chat/completions' % port,
                 json={'messages': [{'role': 'user', 'content': [
@@ -389,6 +413,7 @@ class ScraplingGrabberGUI:
                 timeout=300)
             if r.status_code == 200:
                 content = (r.json()['choices'][0]['message'].get('content') or '').strip()
+                self._ai_log_chat('resp', content or '(空回复)')
                 if use_prompt:
                     result = self._ai_parse_prompt(content)
                 elif '无关' in content:
@@ -435,6 +460,173 @@ class ScraplingGrabberGUI:
             elif '正文' in content:
                 cat = '正文'
         return {'cat': cat, 'cn': cn, 'en': en}
+
+    def _ai_log_chat(self, role, content):
+        """记录一次 AI 对话到「AI对话」页签：req=发给模型的请求，resp=模型回复"""
+        try:
+            ts = time.strftime('%H:%M:%S')
+            if role == 'req':
+                self.ai_chat_text.insert('end', '[%s] → 模型:\n' % ts, 'req')
+            else:
+                self.ai_chat_text.insert('end', '[%s] ← 模型:\n' % ts, 'resp')
+            self.ai_chat_text.insert('end', (content or '') + '\n', role)
+            self.ai_chat_text.insert('end', '-' * 70 + '\n', 'sep')
+            self.ai_chat_text.see('end')
+        except Exception:
+            pass
+
+    def _ai_clear_chat(self):
+        """清空 AI 对话记录"""
+        try:
+            self.ai_chat_text.delete('1.0', 'end')
+        except Exception:
+            pass
+        self._ai_chat_history = []
+
+    def _ai_chat_send(self):
+        """AI 对话：发送用户消息并显示模型回复（带最近上下文）"""
+        text = self.ai_chat_input.get().strip()
+        if not text:
+            return
+        if not (self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)):
+            self._log('AI对话: AI服务未运行，请先点击「启动AI服务」')
+            return
+        self.ai_chat_input.delete(0, 'end')
+        self._ai_log_chat('req', text)
+        self._ai_chat_history.append({'role': 'user', 'content': text})
+        import requests
+        try:
+            port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
+            ctx = int(self.ai_chat_ctx_var.get() or 12)
+            messages = self._ai_chat_history[-ctx:]  # 上下文条数可设置（设置窗口）
+            r = requests.post(
+                'http://127.0.0.1:%d/v1/chat/completions' % port,
+                json={'messages': messages, 'max_tokens': 1024, 'temperature': 0.7},
+                timeout=300)
+            if r.status_code == 200:
+                content = (r.json()['choices'][0]['message'].get('content') or '').strip()
+                self._ai_log_chat('resp', content or '(空回复)')
+                self._ai_chat_history.append({'role': 'assistant', 'content': content})
+            else:
+                self._ai_log_chat('resp', '(HTTP %d)' % r.status_code)
+        except Exception as e:
+            self._ai_log_chat('resp', '(调用失败: %s)' % e)
+
+    def _ai_call_text(self, prompt_text, max_tokens=300, timeout=120):
+        """通用文本调用本地模型，返回模型输出字符串（失败返回空串）"""
+        import requests
+        self._ai_log_chat('req', prompt_text)
+        try:
+            port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
+            r = requests.post(
+                'http://127.0.0.1:%d/v1/chat/completions' % port,
+                json={'messages': [{'role': 'user', 'content': prompt_text}],
+                      'max_tokens': max_tokens, 'temperature': 0.1},
+                timeout=timeout)
+            if r.status_code == 200:
+                content = (r.json()['choices'][0]['message'].get('content') or '').strip()
+                self._ai_log_chat('resp', content or '(空回复)')
+                return content
+            self._ai_log_chat('resp', '(HTTP %d)' % r.status_code)
+        except Exception as e:
+            self._ai_log_chat('resp', '(调用失败: %s)' % e)
+        return ''
+
+    def _ai_analyze_patterns(self, samples, target_desc):
+        """让模型分析 URL 样本，返回 {'regex':..., 'desc':..., 'hits':n}；失败返回 None"""
+        if not samples:
+            return None
+        seen = set()
+        uniq = []
+        for s in samples:
+            s = (s or '').strip()
+            if s and s not in seen:
+                seen.add(s)
+                uniq.append(s)
+            if len(uniq) >= 120:
+                break
+        if not uniq:
+            return None
+        import re as _re
+        text = AI_ANALYZE_PROMPT.replace('{target_desc}', target_desc).replace('{urls}', '\n'.join(uniq))
+        out = self._ai_call_text(text, max_tokens=200, timeout=300)
+        if not out:
+            return None
+        regex = ''
+        desc = ''
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith('链接正则'):
+                regex = line.split(':', 1)[1].strip() if ':' in line else ''
+            elif line.startswith('特征描述'):
+                desc = line.split(':', 1)[1].strip() if ':' in line else ''
+        if not regex or regex == '无':
+            return None
+        try:
+            _re.compile(regex)
+        except Exception:
+            return None
+        hit = [s for s in uniq if _re.search(regex, s)]
+        if not hit:
+            # 泛化：把固定长度 {n} 换成 + 再试（模型常猜错位数）
+            gen = _re.sub(r'\{(\d+)\}', '+', regex)
+            if gen != regex:
+                try:
+                    _re.compile(gen)
+                    hit2 = [s for s in uniq if _re.search(gen, s)]
+                    if hit2:
+                        regex = gen
+                        hit = hit2
+                except Exception:
+                    pass
+        # 命中 0 也接受：正则合法即可，最终以实际提取结果为准
+        return {'regex': regex, 'desc': desc, 'hits': len(hit)}
+
+    def _get_site_patterns(self, domain):
+        """取站点缓存的 AI 分析规律（按域名）"""
+        return (self.cfg.get('ai_patterns') or {}).get(domain)
+
+    def _save_site_patterns(self, domain, patterns):
+        """保存站点 AI 分析规律到配置（按域名，跨会话复用）"""
+        self.cfg.setdefault('ai_patterns', {})[domain] = patterns
+        save_config(self.cfg)
+
+    def _ai_prescreen_urls(self, img_urls):
+        """下载前 AI 预筛：装饰特征直接剔除，明显正文直接保留，规则拿不准的才调模型"""
+        if not img_urls:
+            return img_urls
+        GOOD_HINTS = ['/photo', '/upload', '/images/', '/img', '/pic', '/202', '/20', '/file', '/i/', '/data/']
+        BAD_HINTS = ['smiley', '/common/', 'avatar', 'logo', 'icon', 'button', 'banner', 'emoji']
+        keep = []
+        suspicious = []
+        for u in img_urls:
+            uu = u.lower()
+            if any(d in uu for d in BAD_HINTS):
+                self._log('  预筛剔除[装饰特征]: %s' % u[:70])
+                continue  # 规则明确是装饰 → 直接不下
+            if any(g in uu for g in GOOD_HINTS):
+                keep.append(u)  # 规则明确是正文 → 直接下，不耗算力
+            else:
+                suspicious.append(u)  # 规则拿不准 → 交给 AI
+        if not suspicious:
+            return img_urls
+        self._log('下载前AI预筛: %d 张规则拿不准，调用模型判断...' % len(suspicious))
+        ai_keep = set()
+        BATCH = 30
+        for i in range(0, len(suspicious), BATCH):
+            batch = suspicious[i:i + BATCH]
+            text = AI_PRESCREEN_PROMPT.replace('{urls}', '\n'.join(batch))
+            out = self._ai_call_text(text, max_tokens=len(batch) * 4 + 20, timeout=300)
+            lines = [l.strip() for l in (out or '').splitlines() if l.strip()]
+            for idx, url in enumerate(batch):
+                verdict = lines[idx] if idx < len(lines) else ''
+                if '跳过' in verdict:
+                    self._log('  预筛剔除[AI判定装饰]: %s' % url[:70])
+                    continue
+                ai_keep.add(url)  # 模型没给判定行的默认保留（宁多下不误杀）
+        kept = keep + [u for u in suspicious if u in ai_keep]
+        self._log('下载前AI预筛完成: 保留 %d，剔除 %d' % (len(kept), len(img_urls) - len(kept)))
+        return kept
 
     def _ai_filter_images(self, save_dir, task_id=None):
         """对已下载图片做 AI 过滤：删除无关图，可选生成提示词 txt，返回删除数量"""
@@ -551,6 +743,30 @@ class ScraplingGrabberGUI:
         self.browser_hint = ttk.Label(self.browser_frame, text='点击「启动调试浏览器」按钮，浏览器将自动嵌入到这里', font=('Arial', 12))
         self.browser_hint.pack(expand=True)
 
+        # AI 对话页签（可直接与本地模型对话 + 自动记录每次 AI 调用）
+        ai_tab = ttk.Frame(self.content_notebook)
+        self.content_notebook.add(ai_tab, text='AI对话')
+        ai_top = ttk.Frame(ai_tab)
+        ai_top.pack(fill='x', pady=2, padx=4)
+        ttk.Button(ai_top, text='清除', width=6, command=self._ai_clear_chat).pack(side='left')
+        ttk.Label(ai_top, text='（蓝色=发给模型的请求，绿色=模型回复；下方输入框可直接与本地模型对话）', foreground='#999').pack(side='left', padx=8)
+        self.ai_chat_text = tk.Text(ai_tab, wrap='word', font=('Consolas', 9))
+        ai_scroll = ttk.Scrollbar(ai_tab, command=self.ai_chat_text.yview)
+        self.ai_chat_text.configure(yscrollcommand=ai_scroll.set)
+        ai_scroll.pack(side='right', fill='y')
+        self.ai_chat_text.pack(side='left', fill='both', expand=True)
+        self.ai_chat_text.tag_configure('req', foreground='#1a56db')
+        self.ai_chat_text.tag_configure('resp', foreground='#0d7a3d')
+        self.ai_chat_text.tag_configure('sep', foreground='#bbbbbb')
+        # 对话输入框
+        ai_input_frame = ttk.Frame(ai_tab)
+        ai_input_frame.pack(fill='x', pady=3, padx=4)
+        self.ai_chat_input = ttk.Entry(ai_input_frame)
+        self.ai_chat_input.pack(side='left', fill='x', expand=True, padx=(0, 4))
+        self.ai_chat_input.bind('<Return>', lambda e: self._ai_chat_send())
+        ttk.Button(ai_input_frame, text='发送', width=6, command=self._ai_chat_send).pack(side='left')
+        self._ai_chat_history = []
+
         # ===== 顶部设置区域 =====
         # top_frame已经在上面定义了
 
@@ -631,6 +847,8 @@ class ScraplingGrabberGUI:
         ttk.Checkbutton(ai_opt, text='AI生成提示词', variable=self.ai_prompt_var).pack(side='left', padx=(8, 0))
         self.ai_auto_stop_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(ai_opt, text='抓取完自动停止', variable=self.ai_auto_stop_var).pack(side='left', padx=(8, 0))
+        self.ai_prescreen_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ai_opt, text='下载前AI预筛', variable=self.ai_prescreen_var).pack(side='left', padx=(8, 0))
         ttk.Label(ai_opt, text='模型:').pack(side='left', padx=(10, 2))
         self.ai_preset_var = tk.StringVar(value='内置4B（6G显存）')
         preset_combo = ttk.Combobox(ai_opt, textvariable=self.ai_preset_var, width=24, state='readonly')
@@ -647,6 +865,8 @@ class ScraplingGrabberGUI:
         self.ai_mmproj_var = tk.StringVar()
         self.ai_server_var = tk.StringVar(value=AI_SERVER_DEFAULT)
         self.ai_port_var = tk.IntVar(value=AI_DEFAULT_PORT)
+        # AI 对话上下文条数（设置窗口）
+        self.ai_chat_ctx_var = tk.IntVar(value=12)
 
         # 按钮行
         btn_frame = ttk.Frame(top_frame)
@@ -1075,6 +1295,8 @@ class ScraplingGrabberGUI:
         ttk.Button(r6, text='浏览', width=5, command=lambda: self._browse_ai_file('ai_server_var')).pack(side='left')
         ttk.Label(r6, text='端口:').pack(side='left', padx=(10, 2))
         ttk.Spinbox(r6, from_=1024, to=65535, textvariable=self.ai_port_var, width=6).pack(side='left')
+        ttk.Label(r6, text='对话上下文(条):').pack(side='left', padx=(10, 2))
+        ttk.Spinbox(r6, from_=1, to=100, textvariable=self.ai_chat_ctx_var, width=5).pack(side='left')
 
         # 底部按钮
         btn_row = ttk.Frame(win)
@@ -2039,8 +2261,44 @@ class ScraplingGrabberGUI:
             post_links = self._extract_post_links(page, current_url)
             self._log('第 %d 页识别到 %d 个帖子链接（累计 %d 个）' % (page_num, len(post_links), len(all_post_links) + len(post_links)))
             if len(post_links) == 0:
-                self._log('警告：当前页没有识别到任何帖子链接，可能是网站结构不匹配')
-                break
+                # ===== AI 辅助分析（规则抓不到时） =====
+                from urllib.parse import urlparse as _up, urljoin as _uj
+                domain = _up(current_url).netloc.replace('www.', '')
+                patterns = self._get_site_patterns(domain)
+                if patterns and patterns.get('link_regex'):
+                    import re as _re
+                    try:
+                        found = [_uj(current_url, m) for m in _re.findall(patterns['link_regex'], html) if m]
+                        post_links = list(dict.fromkeys(found))
+                        self._log('AI缓存规律命中: 提取到 %d 个帖子链接' % len(post_links))
+                    except Exception as e:
+                        self._log('AI缓存规律应用失败: %s' % e)
+                if len(post_links) == 0 and (self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)):
+                    self._log('规则识别失败，调用本地模型分析帖子链接规律（首次较慢，之后自动用缓存）...')
+                    samples = []
+                    try:
+                        for a in page.css('a'):
+                            h = a.attrib.get('href', '') or ''
+                            if h and not h.startswith('javascript:') and not h.startswith('#'):
+                                samples.append(_uj(current_url, h))
+                    except Exception:
+                        pass
+                    result = self._ai_analyze_patterns(samples, '帖子/详情页链接（包含数字ID或特定路径的详情页）')
+                    if result:
+                        self._log('模型分析规律: %s（样本命中 %d 个）' % (result['regex'], result['hits']))
+                        self._save_site_patterns(domain, {'link_regex': result['regex']})
+                        import re as _re
+                        try:
+                            found = [_uj(current_url, m) for m in _re.findall(result['regex'], html) if m]
+                            post_links = list(dict.fromkeys(found))
+                            self._log('按模型规律提取到 %d 个帖子链接' % len(post_links))
+                        except Exception as e:
+                            self._log('按模型规律提取失败: %s' % e)
+                    else:
+                        self._log('模型未能分析出有效规律（可稍后重试）')
+                if len(post_links) == 0:
+                    self._log('警告：当前页没有识别到任何帖子链接，可能是网站结构不匹配')
+                    break
 
             # 将当前页的帖子链接添加到总列表
             all_post_links.extend(post_links)
@@ -2170,6 +2428,39 @@ class ScraplingGrabberGUI:
 
                 # 提取图片并下载
                 img_urls = self._extract_images_from_page(post_page, post_url, post_html)
+                if not img_urls:
+                    # ===== AI 辅助分析（规则提取不到图片时） =====
+                    from urllib.parse import urlparse as _up2, urljoin as _uj2
+                    import re as _re2
+                    domain2 = _up2(post_url).netloc.replace('www.', '')
+                    patterns2 = self._get_site_patterns(domain2)
+                    if patterns2 and patterns2.get('img_regex'):
+                        try:
+                            found = [_uj2(post_url, m) for m in _re2.findall(patterns2['img_regex'], post_html) if m]
+                            img_urls = list(dict.fromkeys(found))
+                            self._log('  AI缓存规律命中: 提取到 %d 张图片' % len(img_urls))
+                        except Exception as e:
+                            self._log('  AI缓存规律应用失败: %s' % e)
+                    if not img_urls and (self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)):
+                        self._log('  规则提取不到图片，调用本地模型分析图片链接规律（首次较慢，之后自动用缓存）...')
+                        samples = []
+                        try:
+                            for m in _re2.findall(r'["\']((?:https?:)?//[^"\']+\.(?:jpg|jpeg|png|webp|gif|avif)(?:\?[^"\']*)?)["\']', post_html, _re2.IGNORECASE):
+                                samples.append(_uj2(post_url, m))
+                        except Exception:
+                            pass
+                        result2 = self._ai_analyze_patterns(samples, '图片链接（图片文件URL，通常是带图片扩展名的直链）')
+                        if result2:
+                            self._log('  模型分析规律: %s（样本命中 %d 个）' % (result2['regex'], result2['hits']))
+                            self._save_site_patterns(domain2, {'img_regex': result2['regex']})
+                            try:
+                                found = [_uj2(post_url, m) for m in _re2.findall(result2['regex'], post_html) if m]
+                                img_urls = list(dict.fromkeys(found))
+                                self._log('  按模型规律提取到 %d 张图片' % len(img_urls))
+                            except Exception as e:
+                                self._log('  按模型规律提取失败: %s' % e)
+                        else:
+                            self._log('  模型未能分析出有效图片规律（可稍后重试）')
                 self._log('  提取到 %d 张图片' % len(img_urls))
                 self._update_task(task_id, progress='0/%d' % len(img_urls))
 
@@ -2317,6 +2608,15 @@ class ScraplingGrabberGUI:
         """下载图片列表，返回 (成功数, 失败数, 跳过数)"""
         # 统一过滤无效URL（about:blank、模板残留等）
         img_urls = [u for u in img_urls if u and not u.startswith('about:') and '{{' not in u and '}}' not in u]
+        # 下载前 AI 预筛（可选）：只对规则拿不准的 URL 调模型，拿得准的不消耗算力
+        if getattr(self, 'ai_prescreen_var', None) is not None and self.ai_prescreen_var.get():
+            if self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None):
+                try:
+                    img_urls = self._ai_prescreen_urls(img_urls)
+                except Exception as e:
+                    self._log('下载前AI预筛出错（忽略，继续下载）: %s' % e)
+            else:
+                self._log('下载前AI预筛: AI服务未运行，跳过预筛')
         import requests
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
