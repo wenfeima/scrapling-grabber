@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.6'
+APP_VERSION = 'v2.12.7'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -2437,21 +2437,23 @@ class ScraplingGrabberGUI:
             SetParent = ctypes.windll.user32.SetParent
             SetParent(found_hwnd, host_hwnd)
 
-            # 调整浏览器窗口大小（多次调整确保生效）
-            MoveWindow = ctypes.windll.user32.MoveWindow
+            # 先切到浏览器页签并刷新布局，确保宿主窗口拿到真实尺寸
+            self.content_notebook.select(2)
             self.browser_frame.update_idletasks()
             self.browser_frame.update()
+
+            # 调整浏览器窗口大小（多次调整+尺寸抖动，强制 Chrome 重新布局渲染）
+            MoveWindow = ctypes.windll.user32.MoveWindow
             width = self.browser_frame.winfo_width()
             height = self.browser_frame.winfo_height()
-            # 第一次调整
             MoveWindow(found_hwnd, 0, 0, width, height, True)
-            # 延迟第二次调整，确保嵌入后大小正确
-            self.root.after(100, lambda: self._resize_browser())
-            self.root.after(500, lambda: self._resize_browser())
+            # 延迟多次执行抖动调整，修复嵌入后图标/图层不绘制的问题
+            self.root.after(150, lambda: self._resize_browser(jitter=True))
+            self.root.after(500, lambda: self._resize_browser(jitter=True))
+            self.root.after(1500, lambda: self._resize_browser(jitter=True))
 
             self._log('浏览器已嵌入到「浏览器」页签')
             self.browser_hint.pack_forget()  # 隐藏提示标签
-            self.content_notebook.select(2)  # 切换到浏览器页签
 
             # 绑定窗口大小变化事件
             self.browser_frame.bind('<Configure>', self._on_browser_resize)
@@ -2459,18 +2461,25 @@ class ScraplingGrabberGUI:
         except Exception as e:
             self._log('嵌入浏览器失败: %s' % e)
 
-    def _resize_browser(self):
-        """调整浏览器窗口大小以适应宿主窗口"""
+    def _resize_browser(self, jitter=False):
+        """调整浏览器窗口大小以适应宿主窗口；jitter=True 时做尺寸抖动强制 Chrome 重排渲染"""
         if self.browser_hwnd:
             try:
                 import ctypes
                 MoveWindow = ctypes.windll.user32.MoveWindow
+                RedrawWindow = ctypes.windll.user32.RedrawWindow
                 self.browser_frame.update_idletasks()
                 self.browser_frame.update()
                 width = self.browser_frame.winfo_width()
                 height = self.browser_frame.winfo_height()
                 if width > 0 and height > 0:
                     MoveWindow(self.browser_hwnd, 0, 0, width, height, True)
+                    if jitter:
+                        # 先移小1px再恢复：制造真实WM_SIZE变化，强制Chrome重新布局（修复嵌入后图标/图层不绘制）
+                        MoveWindow(self.browser_hwnd, 0, 0, width, max(1, height - 1), True)
+                        MoveWindow(self.browser_hwnd, 0, 0, width, height, True)
+                    # 强制立即重绘
+                    RedrawWindow(self.browser_hwnd, None, None, 0x0001 | 0x0100)  # RDW_INVALIDATE | RDW_UPDATENOW
             except Exception:
                 pass
 
@@ -3266,6 +3275,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
