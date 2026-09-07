@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.5'
+APP_VERSION = 'v2.12.6'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -1583,6 +1583,8 @@ class ScraplingGrabberGUI:
                     '--disable-session-crashed-bubble',
                     '--disable-gpu',
                     '--disable-gpu-compositing',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding',
                     '--user-data-dir=' + user_data_dir,
                 ])
                 self._log('已独立窗口启动 Chrome（9222端口），可登录/装插件')
@@ -1605,6 +1607,8 @@ class ScraplingGrabberGUI:
                     '--disable-session-crashed-bubble',
                     '--disable-gpu',
                     '--disable-gpu-compositing',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding',
                     '--user-data-dir=' + user_data_dir,
                 ])
                 self._log('已独立窗口启动 Edge（9222端口），可登录/装插件')
@@ -2328,6 +2332,8 @@ class ScraplingGrabberGUI:
             '--disable-session-crashed-bubble',
             '--disable-gpu',
                     '--disable-gpu-compositing',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding',
             '--user-data-dir=%s' % user_data_dir,
         ]
 
@@ -3260,6 +3266,8 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
 
 
 
