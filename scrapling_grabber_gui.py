@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.9'
+APP_VERSION = 'v2.12.10'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -2453,8 +2453,10 @@ class ScraplingGrabberGUI:
             self.root.after(1800, lambda: self._resize_browser(jitter=True))
             # 嵌入完成后隐藏-显示强制全量重绘（等效且强于手动拖动，favicon/图标必出）
             self.root.after(2500, self._force_browser_redraw)
+            # 激进重排：极小尺寸强制重排+连续10次调整+枚举子窗口同步（v2.2.6 验证过的方案）
+            self.root.after(3000, self._aggressive_resize)
             # 嵌入完成后自动刷新页面一次，强制完整重绘（图标/快捷方式必出）
-            self.root.after(3500, self._browser_reload_once)
+            self.root.after(4000, self._browser_reload_once)
 
             self._log('浏览器已嵌入到「浏览器」页签')
             self.browser_hint.pack_forget()  # 隐藏提示标签
@@ -2486,6 +2488,45 @@ class ScraplingGrabberGUI:
                     RedrawWindow(self.browser_hwnd, None, None, 0x0001 | 0x0100)  # RDW_INVALIDATE | RDW_UPDATENOW
             except Exception:
                 pass
+
+    def _aggressive_resize(self):
+        """激进重排：极小尺寸强制重排 → 连续10次调整 → 第5次后枚举子窗口同步（v2.2.6 验证方案）"""
+        try:
+            import ctypes
+            import time
+            from ctypes import wintypes
+            MoveWindow = ctypes.windll.user32.MoveWindow
+            EnumChildWindows = ctypes.windll.user32.EnumChildWindows
+            EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            hwnd = self.browser_hwnd
+            if not hwnd:
+                return
+            w = self.browser_frame.winfo_width()
+            h = self.browser_frame.winfo_height()
+            if w <= 0 or h <= 0:
+                w, h = 900, 600
+
+            def cb(hwnd_child, lp):
+                try:
+                    MoveWindow(hwnd_child, 0, 0, w, h, True)
+                except Exception:
+                    pass
+                return True
+
+            for i in range(10):
+                if i == 0:
+                    # 极小尺寸强制 Chrome 完整重排
+                    MoveWindow(hwnd, 0, 0, max(100, w // 3), max(100, h // 3), True)
+                else:
+                    MoveWindow(hwnd, 0, 0, w, h, True)
+                if i >= 5:
+                    # 第5次后枚举所有子窗口（Chrome 内层渲染窗口）同步调整
+                    EnumChildWindows(hwnd, EnumProc(cb), 0)
+                self.root.update_idletasks()
+                time.sleep(0.05)
+            self._log('激进重排完成（极小尺寸+10次调整+子窗口同步）')
+        except Exception:
+            pass
 
     def _force_browser_redraw(self):
         """隐藏再显示浏览器窗口，强制 Windows 全量重绘（修复嵌入后图标/favicon 不绘制）"""
@@ -3322,6 +3363,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
