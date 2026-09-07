@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.25'
+APP_VERSION = 'v2.12.26'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -1768,9 +1768,17 @@ class ScraplingGrabberGUI:
             self._log('保存目录不存在: %s' % save_dir)
 
     def _get_progress_file(self, save_dir):
-        """获取进度文件路径"""
+        """进度文件放在软件数据目录（保存目录外），清空保存目录不影响断点续传"""
         import os
-        return os.path.join(save_dir, 'scrapling_progress.json')
+        import hashlib
+        base = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')),
+                            'WebGrabber', 'progress')
+        try:
+            os.makedirs(base, exist_ok=True)
+        except Exception:
+            base = save_dir
+        key = hashlib.md5((save_dir or 'default').encode('utf-8')).hexdigest()[:12]
+        return os.path.join(base, 'progress_%s.json' % key)
 
     def _load_progress(self, save_dir):
         """加载抓取进度，返回已完成的帖子URL集合"""
@@ -2089,28 +2097,43 @@ class ScraplingGrabberGUI:
         self._snap_game_win()
 
     def _snap_game_win(self):
-        """游戏修改窗口磁吸主窗口右边缘（贴合无缝隙）"""
+        """游戏修改窗口磁吸主窗口右边缘（贴合无缝隙，高度与主窗口同长）"""
         try:
             self.root.update_idletasks()
             rx = self.root.winfo_x()
             ry = self.root.winfo_y()
             rw = self.root.winfo_width()
-            self.game_win.geometry('320x470+%d+%d' % (rx + rw, ry))
+            rh = max(300, self.root.winfo_height())
+            self.game_win.geometry('320x%d+%d+%d' % (rh, rx + rw, ry))
+            self._ec_docked = True
         except Exception:
             pass
 
     def _on_root_configure(self, e):
-        """主窗口移动/缩放时，游戏修改窗口跟随磁吸"""
+        """主窗口移动/缩放：贴合状态的修改器实时跟随（用winfo查询，不依赖e.x_root——Windows上它为0）"""
         try:
             if not (getattr(self, 'game_win', None) and self.game_win.winfo_exists()
-                    and self.game_win.state() == 'normal'):
+                    and self.game_win.state() == 'normal' and getattr(self, '_ec_docked', False)):
                 return
-            cur = (e.x_root, e.y_root, e.width)
+            cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
             if cur != getattr(self, '_last_root_pos', None):
                 self._last_root_pos = cur
                 self._snap_game_win()
         except Exception:
             pass
+
+    def _poll_game_snap(self):
+        """轮询兜底：Configure未触发时（如拖动中），贴合状态也跟随"""
+        try:
+            if (getattr(self, 'game_win', None) and self.game_win.winfo_exists()
+                    and self.game_win.state() == 'normal' and getattr(self, '_ec_docked', False)):
+                cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
+                if cur != getattr(self, '_last_root_pos', None):
+                    self._last_root_pos = cur
+                    self._snap_game_win()
+        except Exception:
+            pass
+        self.root.after(150, self._poll_game_snap)
 
     def _create_game_win(self):
         """EC 模式窗口：网页游戏数值 搜索→过滤→修改/锁定（Cheat Engine 风格）"""
@@ -2121,11 +2144,12 @@ class ScraplingGrabberGUI:
         win = tk.Toplevel(self.root)
         self.game_win = win
         win.title('游戏数值修改')
-        win.geometry('320x470')
+        win.geometry('320x600+0+0')
         win.transient(self.root)
 
         self.ec_scan_state = None   # 上次命中路径列表 [(segs,...)]
         self.ec_lock_info = None    # (segs, value) 当前锁定项
+        self._ec_docked = False     # 是否贴合主窗口（拖走变False，松手靠近吸回）
         import tkinter.ttk as _ttk
         import tkinter.messagebox as _mb
 
@@ -2165,23 +2189,41 @@ class ScraplingGrabberGUI:
         self.ec_lock_var = tk.StringVar(value='未锁定')
         ttk.Label(bot, textvariable=self.ec_lock_var, foreground='#c0392b').pack(side='left', padx=6)
         win.protocol('WM_DELETE_WINDOW', self._ec_close)
-        # 主窗口移动时跟随磁吸（只绑一次）
+        # 主窗口移动跟随：Configure实时（winfo查询）+ 轮询兜底
         if not getattr(self, '_root_cfg_bound', False):
             self.root.bind('<Configure>', self._on_root_configure)
             self._root_cfg_bound = True
-        # 独立拖动放大时列宽自适应
-        win.bind('<Configure>', self._on_game_win_resize)
+        if not getattr(self, '_snap_poll_started', False):
+            self.root.after(150, self._poll_game_snap)
+            self._snap_poll_started = True
+        # 独立拖动/缩放：列宽自适应 + 松手靠近主窗口自动吸回
+        win.bind('<Configure>', self._on_game_win_configure)
         # 打开时自动恢复上次扫描结果与锁定
         self.root.after(400, self._ec_restore_state)
 
-    def _on_game_win_resize(self, e):
-        """窗口独立拖动放大/缩小时，路径列跟随宽度伸展"""
+    def _on_game_win_configure(self, e):
+        """窗口独立拖动/缩放：放大时路径列伸展；松手在边缘100px内自动吸回；拖远自由"""
         try:
             if e.widget != self.game_win:
                 return
+            gw = self.game_win
             w = e.width
             if w > 150:
                 self.ec_tree.column('path', width=max(120, w - 95))
+            # 位置变化时才判断
+            gx, gy = gw.winfo_x(), gw.winfo_y()
+            last = getattr(self, '_ec_last_xy', None)
+            if last == (gx, gy):
+                return
+            self._ec_last_xy = (gx, gy)
+            if gw.state() != 'normal':
+                return
+            rx, ry, rw = self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width()
+            rh = self.root.winfo_height()
+            if abs(gx - (rx + rw)) <= 100 and gy + gw.winfo_height() > ry and gy < ry + rh:
+                self._snap_game_win()
+            else:
+                self._ec_docked = False
         except Exception:
             pass
 
@@ -4282,6 +4324,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
