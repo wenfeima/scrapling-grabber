@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.1'
+APP_VERSION = 'v2.12.2'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -498,8 +498,15 @@ class ScraplingGrabberGUI:
         '  [工具:set_filter {"smart_filter":true, "min_size":20}]\n'
         '  [工具:get_settings {}]\n'
         '  [工具:open_save_dir {}]\n'
+        '  [工具:get_browser_info {}]\n'
+        '工具使用场景：\n'
+        '- 用户想抓取/下载某个页面或网站的图片（如"抓取这个页面""这个站""这个页面图片抓取""下载图片"）→ 用 start_crawl；用户消息里可能只有网址没有"抓取"两个字，那也是在请求抓取\n'
+        '- 用户问抓取进度/状态/剩多少 → 用 get_status\n'
+        '- 用户问保存目录/配置/当前设置 → 用 get_settings\n'
+        '- 用户问浏览器当前打开了什么页面/几张图/页面状态（如"浏览器上有几张图""现在看的是什么页"）→ 用 get_browser_info\n'
+        '- 用户明确要求设置过滤（开启/关闭智能过滤、最小图片大小KB）→ 才用 set_filter，否则不要调用它\n'
         '规则：\n'
-        '1. start_crawl 必须提供 url，用户没说网址就先问他；\n'
+        '1. start_crawl 的 url 可以省略：用户说"这个页面/这个站/当前页"或之前已经给过网址时，直接调用 start_crawl（url 可传空 {}），执行器会自动用当前网址；只有完全不知道网址时才先问用户；\n'
         '2. 参数值必须是完整可用的值，例如路径用完整路径，不能省略；\n'
         '3. 工具执行后你会收到 [工具结果]，根据结果给用户简短中文回复；\n'
         '4. 不需要调用工具时直接正常回复用户；\n'
@@ -551,7 +558,9 @@ class ScraplingGrabberGUI:
             if name == 'start_crawl':
                 url = str(args.get('url') or '').strip()
                 if not url:
-                    url = self._ai_extract_url(self._ai_last_user_text())  # 参数兜底：从用户消息提取
+                    url = self._ai_extract_url(self._ai_last_user_text())  # 参数兜底1：从用户消息提取
+                if not url:
+                    url = self.url_var.get().strip()  # 参数兜底2：用当前网址（用户说"这个页面"时）
                 if not url:
                     return False, '缺少网址参数 url，请重新调用 [工具:start_crawl {"url":"https://www.example.com/"}]，或先询问用户网址'
                 if self.is_running:
@@ -639,13 +648,18 @@ class ScraplingGrabberGUI:
                                 ms = int(m.group(1))
                             except Exception:
                                 ms = None
+                changed = False
                 if sm is not None:
                     self.smart_filter_var.set(bool(sm))
+                    changed = True
                 if ms is not None:
                     try:
                         self.min_size_var.set(int(ms))
+                        changed = True
                     except Exception:
                         pass
+                if not changed:
+                    return False, '没有检测到需要设置的过滤项。请明确要设置的参数，例如："开启智能过滤"、"关闭智能过滤"、"最小图片大小 30KB"（工具格式 [工具:set_filter {"smart_filter":true,"min_size":30}]）'
                 self._save_settings()
                 return True, '过滤设置已更新（智能过滤:%s 最小大小:%sKB）' % (
                     self.smart_filter_var.get(), self.min_size_var.get())
@@ -659,9 +673,54 @@ class ScraplingGrabberGUI:
             if name == 'open_save_dir':
                 self._open_save_dir()
                 return True, '已打开保存目录'
+            if name == 'get_browser_info':
+                info = self._ai_browser_info()
+                if info is None:
+                    return True, '调试浏览器未运行（9222端口无响应），请先在"浏览器模式"下启动调试浏览器'
+                return True, info
             return False, '未知工具: %s' % name
         except Exception as e:
             return False, '工具执行出错: %s' % e
+
+    def _ai_browser_info(self):
+        """查询调试浏览器当前状态：标签页列表 + 当前页图片数（供 get_browser_info 工具）"""
+        import urllib.request as _ur
+        import json as _json
+        try:
+            with _ur.urlopen('http://127.0.0.1:9222/json/list', timeout=3) as r:
+                tabs = _json.loads(r.read())
+        except Exception:
+            return None
+        pages = [t for t in tabs if t.get('type') == 'page']
+        if not pages:
+            return '调试浏览器运行中，但没有打开的网页标签'
+        active = next((t for t in pages if t.get('active')), pages[0])
+        lines = ['调试浏览器运行中，共 %d 个标签页' % len(pages)]
+        for i, t in enumerate(pages[:8], 1):
+            title = (t.get('title') or '').strip() or '(无标题)'
+            lines.append('%d. %s | %s' % (i, title[:30], t.get('url', '')[:80]))
+        if len(pages) > 8:
+            lines.append('... 等共 %d 个' % len(pages))
+        # 当前页图片数（CDP Runtime.evaluate）
+        img_count = None
+        try:
+            import websocket as _ws
+            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=5)
+            ws.send(_json.dumps({'id': 1, 'method': 'Runtime.evaluate',
+                                 'params': {'expression': 'document.querySelectorAll("img").length',
+                                            'returnByValue': True}}))
+            resp = _json.loads(ws.recv())
+            ws.close()
+            val = resp.get('result', {}).get('result', {}).get('value')
+            if isinstance(val, int):
+                img_count = val
+        except Exception:
+            pass
+        if img_count is not None:
+            lines.append('当前页(%s): %d 张图片' % (active.get('url', '')[:60], img_count))
+        else:
+            lines.append('当前页: %s' % active.get('url', ''))
+        return '\n'.join(lines)
 
     def _ai_tool_status(self):
         """任务状态统计（供 get_status 工具）"""
