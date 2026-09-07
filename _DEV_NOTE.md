@@ -1,10 +1,25 @@
-# Scrapling 图片爬虫 - 开发交接笔记（v2.12.2）
+# Scrapling 图片爬虫 - 开发交接笔记（v2.12.5）
+
+## v2.12.5 修复（内嵌浏览器图标/图层缺失，彻底解决）
+- **现象**：内嵌浏览器（SetParent 嵌入 Tkinter）页面主体能显示，但部分 UI 元素渲染缺失——地址栏右侧图标空白、快捷方式图标只剩"推"/叉号
+- **根因**：Chrome 被 SetParent 嵌入另一进程窗口后，GPU 合成（compositing）失效导致部分图层不绘制；v2.12.4 的 --disable-gpu 单独不够
+- **修复**：启动参数再补 `--disable-gpu-compositing`（强制软件合成），与 --disable-gpu 组合（Chrome/Edge/独立窗口 3 处启动路径）——SetParent 嵌入 Chrome 的成熟方案
+
+## v2.12.4 修复（浏览器黑屏/渲染故障）
+- **现象**：内置调试浏览器偶发整个页面主体变深灰/黑屏，只残留书签栏和快捷方式文字（间歇性，CDP 截图证实网页内容未渲染，浏览器 UI 正常）
+- **根因**：Chrome 远程调试模式下 GPU 硬件加速渲染偶发崩溃（合成进程故障）
+- **修复**：调试浏览器启动参数加 `--disable-gpu`（爬虫浏览器不需要硬件加速，CPU 渲染稳定）；Chrome/Edge 两条启动路径 + 独立窗口路径共 3 处
+- **保留**：书签/快捷方式为用户登录 Google 账号后同步，属正常使用（未加 --disable-sync）
+
+## v2.12.3 新增（AI 可见）
+1. **新增 get_browser_view 工具**：AI 现在能"看见"页面！CDP 截当前页 → 压缩 → 喂给本地视觉模型（同一 llama-server，mmproj 已加载，不用第二个模型）→ 模型描述页面内容/布局。问"看看这个页面""这个站怎么样""页面上有什么"直接答（实测准确描述测试页：标题/卡片/甚至识别出是占位符）
+2. 截图自动保存 `~/AppData/Local/WebGrabber/screenshots/`，视觉推理约 20-30 秒
 
 ## v2.12.2 新增（AI 助手更智能）
-1. **新增 get_browser_info 工具**：模型现在能看到浏览器！CDP 直查 9222——标签页列表（标题+URL）+ 当前页图片数（Runtime.evaluate 统计 img 标签）。用户问"浏览器上有几张图""现在看的是什么页"可直接回答（实测 xchina 页准确返回 22 张图）
-2. **set_filter 兜底收紧**：用户没明确说开/关智能过滤、没给 KB 值时，不再假装"已更新"（原来会拿当前值报成功，误导用户），改为返回"请明确过滤设置"并给示例
-3. **start_crawl 智能补位**：用户说"这个页面/这个站/当前页"时，模型直接调 start_crawl（url 可空），执行器自动用当前网址（对话里提取 → url_var 兜底两级）；工具描述加了场景引导（抓取→start_crawl、查浏览器→get_browser_info、设过滤→set_filter）
-4. 实测两个场景修复：问"浏览器上有几张图"→ 模型答"22 张"；说"这个页面图片抓取"→ 自动抓当前页
+1. **get_browser_info 工具**：CDP 直查 9222——标签页列表（标题+URL）+ 当前页图片数（Runtime.evaluate 统计 img 标签）。问"浏览器上有几张图""现在看的是什么页"可直接答（实测 xchina 页准确返回 22 张图）
+2. **set_filter 兜底收紧**：没明确说开/关智能过滤、没给 KB 值时，不再假装"已更新"，返回"请明确过滤设置"并给示例
+3. **start_crawl 智能补位**：说"这个页面/这个站/当前页"时模型直接调 start_crawl（url 可空），执行器自动用当前网址（对话提取 → url_var 两级兜底）；工具描述加场景引导
+4. 实测：问"浏览器上有几张图"→ 答"22 张"；说"这个页面图片抓取"→ 自动抓当前页
 
 ## v2.12.1 修复（内置浏览器）
 1. **"Chrome 未正确关闭/要恢复页面吗？"**：启动调试浏览器前自动清理 debug_profile 会话残留（Last Session/Last Tabs/Current Session/Current Tabs + Default/Session + Default/Snapshots），启动参数加 `--disable-session-crashed-bubble`，不再弹恢复条、不再恢复一堆旧标签（内嵌和独立窗口两处启动都改了）
