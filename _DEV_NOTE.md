@@ -1,0 +1,40 @@
+# Scrapling 图片爬虫 - 开发交接笔记（v2.12.0）
+
+> 2026-09-07 台式机（mawen, 4070 12G）完成 v2.12.0：AI 助手模式（对话里提要求，模型直接操作软件）。
+
+## v2.12.0 新增（AI 助手模式，第一版可用）
+1. **AI 助手模式**：AI 对话页签可直接提要求操作软件，如"帮我抓取这个站""现在什么状态""把保存目录改到 L:/tu"
+2. **11 个工具**：start_crawl / stop_crawl / pause_crawl / resume_crawl / retry_failed / get_status / get_task_list / set_save_dir / set_filter / get_settings / open_save_dir
+3. **协议**：模型输出 `[工具:名称 参数JSON]`，最多 5 轮工具循环，执行结果回喂给模型总结
+4. **参数兜底**：Qwen 3.5 4B 常丢 JSON 参数 → 执行器自动从用户消息提取 URL / 路径 / 模式 / 线程数 / 过滤值（模型只做意图识别）
+5. **连续失败保护**：同一工具同样错误连续 2 次自动中断，防止死循环
+6. **UI**：工具调用/结果显示为橙色，对话页签提示文字更新
+
+## 实测验证（真实模型 + 真实抓取）
+- 协议测试 5 项全过：提要求→工具调用 ✓ 状态→get_status ✓ 纯聊天不调工具 ✓ 多轮回喂总结 ✓ 缺网址会询问 ✓
+- 端到端：向 AI 说"帮我抓取 https://www.tuiimg.com/meinv/，单页，线程4" → 模型调 start_crawl → 真实下载 22 张图片 ✓
+
+## 修复的 v2.11.0 遗留 bug
+- `_crawl_single_page` 引用未定义的 stat_total/stat_done/stat_success/stat_fail（旧版统计变量残留）→ 单页模式抓取必崩溃，已删除残留引用，AI 过滤提示改走日志
+
+## 模型/服务环境（不变）
+- 模型：`L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-4B-Q4_K_M.gguf` + `Qwen3.5-4B-mmproj-BF16.gguf`
+- llama-server：`L:\工作流\千问无审查模型配置\llama-b9297-bin-win-cuda-12.4-x64\llama-server.exe`
+- 启动参数：`-ngl 999 -c 8192 --parallel 1 --image-min-tokens 1024 --cache-ram 0 --reasoning off --host 127.0.0.1 --port 8080`
+
+## 开发/打包环境（台式机）
+- 台式机无独立 Python，沙箱 Python 3.14.7（含 scrapling 0.4.15）；打包仍用笔记本 py -3.10（PyInstaller --onefile --windowed --collect-all scrapling）
+- 若需台式机本地打包：先验证 PyInstaller 对 Python 3.14 + scrapling 0.4.15 的兼容性
+
+## 下一步规划
+- 工具扩充（用户提需求再定）：AI 筛选过滤触发、生成提示词批量、分析页面结构工具等
+- AI 对话页签体验打磨：流式输出、工具执行进度、设置窗口"助手模式"开关
+- 远期（已定）：套壳浏览器（登录 API/Cookie/Token 提取）、网页游戏修改器（与爬虫共用 CDP 通道）
+
+## 关键代码位置（scrapling_grabber_gui.py）
+- AI_TOOL_DESC：助手工具说明（发给模型）
+- _ai_parse_tool_call / _ai_extract_url / _ai_extract_path / _ai_last_user_text：协议解析+参数兜底
+- _ai_execute_tool：工具执行器（安全白名单 + 参数校验）
+- _ai_assistant_chat：多轮工具循环（5轮上限 + 连续失败保护）
+- _ai_tool_status / _ai_tool_task_list：get_status / get_task_list 实现
+- AI 对话页签：底部 notebook 第 4 个 tab（tool tag 橙色显示）
