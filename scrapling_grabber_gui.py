@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.24'
+APP_VERSION = 'v2.12.25'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -2089,13 +2089,26 @@ class ScraplingGrabberGUI:
         self._snap_game_win()
 
     def _snap_game_win(self):
-        """EC窗口贴合主窗口右侧（跟随主窗口位置）"""
+        """游戏修改窗口磁吸主窗口右边缘（贴合无缝隙）"""
         try:
             self.root.update_idletasks()
             rx = self.root.winfo_x()
             ry = self.root.winfo_y()
             rw = self.root.winfo_width()
-            self.game_win.geometry('720x480+%d+%d' % (rx + rw + 4, ry))
+            self.game_win.geometry('320x470+%d+%d' % (rx + rw, ry))
+        except Exception:
+            pass
+
+    def _on_root_configure(self, e):
+        """主窗口移动/缩放时，游戏修改窗口跟随磁吸"""
+        try:
+            if not (getattr(self, 'game_win', None) and self.game_win.winfo_exists()
+                    and self.game_win.state() == 'normal'):
+                return
+            cur = (e.x_root, e.y_root, e.width)
+            if cur != getattr(self, '_last_root_pos', None):
+                self._last_root_pos = cur
+                self._snap_game_win()
         except Exception:
             pass
 
@@ -2108,7 +2121,7 @@ class ScraplingGrabberGUI:
         win = tk.Toplevel(self.root)
         self.game_win = win
         win.title('游戏数值修改')
-        win.geometry('720x480')
+        win.geometry('320x470')
         win.transient(self.root)
 
         self.ec_scan_state = None   # 上次命中路径列表 [(segs,...)]
@@ -2116,41 +2129,61 @@ class ScraplingGrabberGUI:
         import tkinter.ttk as _ttk
         import tkinter.messagebox as _mb
 
+        # 顶部：数值 + 扫描按钮（两行紧凑排版）
         top = ttk.Frame(win)
-        top.pack(fill='x', padx=8, pady=6)
+        top.pack(fill='x', padx=6, pady=6)
         ttk.Label(top, text='数值:').pack(side='left')
         self.ec_value_var = tk.StringVar(value='100')
-        ttk.Entry(top, textvariable=self.ec_value_var, width=14).pack(side='left', padx=4)
-        ttk.Button(top, text='首次扫描', width=10, command=self._ec_first_scan).pack(side='left', padx=2)
-        ttk.Button(top, text='再次扫描', width=10, command=self._ec_next_scan).pack(side='left', padx=2)
-        ttk.Button(top, text='清除', width=8, command=self._ec_clear).pack(side='left', padx=2)
+        ttk.Entry(top, textvariable=self.ec_value_var, width=9).pack(side='left', padx=3)
+        ttk.Button(top, text='首次扫描', width=7, command=self._ec_first_scan).pack(side='left', padx=1)
+        ttk.Button(top, text='再次扫描', width=7, command=self._ec_next_scan).pack(side='left', padx=1)
+        top2 = ttk.Frame(win)
+        top2.pack(fill='x', padx=6, pady=(0, 4))
+        ttk.Button(top2, text='清除结果', width=7, command=self._ec_clear).pack(side='left')
         self.ec_count_var = tk.StringVar(value='尚未扫描')
-        ttk.Label(top, textvariable=self.ec_count_var, foreground='#888').pack(side='left', padx=8)
+        ttk.Label(top2, textvariable=self.ec_count_var, foreground='#888').pack(side='left', padx=8)
 
         mid = ttk.Frame(win)
-        mid.pack(fill='both', expand=True, padx=8)
+        mid.pack(fill='both', expand=True, padx=6)
         cols = ('path', 'value')
-        self.ec_tree = ttk.Treeview(mid, columns=cols, show='headings', height=14)
+        self.ec_tree = ttk.Treeview(mid, columns=cols, show='headings', height=15)
         self.ec_tree.heading('path', text='变量路径')
         self.ec_tree.heading('value', text='当前值')
-        self.ec_tree.column('path', width=480)
-        self.ec_tree.column('value', width=100, anchor='center')
+        self.ec_tree.column('path', width=210)
+        self.ec_tree.column('value', width=70, anchor='center')
         self.ec_tree.pack(fill='both', expand=True)
         self.ec_tree.bind('<Double-1>', lambda e: self._ec_edit_selected())
 
         bot = ttk.Frame(win)
-        bot.pack(fill='x', padx=8, pady=6)
+        bot.pack(fill='x', padx=6, pady=6)
         ttk.Label(bot, text='新值:').pack(side='left')
         self.ec_newval_var = tk.StringVar(value='999999')
-        ttk.Entry(bot, textvariable=self.ec_newval_var, width=14).pack(side='left', padx=4)
-        ttk.Button(bot, text='修改选中', width=10, command=self._ec_edit_selected).pack(side='left', padx=2)
-        ttk.Button(bot, text='锁定', width=8, command=lambda: self._ec_lock(True)).pack(side='left', padx=2)
-        ttk.Button(bot, text='解锁', width=8, command=lambda: self._ec_lock(False)).pack(side='left', padx=2)
+        ttk.Entry(bot, textvariable=self.ec_newval_var, width=9).pack(side='left', padx=3)
+        ttk.Button(bot, text='修改', width=5, command=self._ec_edit_selected).pack(side='left', padx=1)
+        ttk.Button(bot, text='锁定', width=5, command=lambda: self._ec_lock(True)).pack(side='left', padx=1)
+        ttk.Button(bot, text='解锁', width=5, command=lambda: self._ec_lock(False)).pack(side='left', padx=1)
         self.ec_lock_var = tk.StringVar(value='未锁定')
-        ttk.Label(bot, textvariable=self.ec_lock_var, foreground='#c0392b').pack(side='left', padx=10)
+        ttk.Label(bot, textvariable=self.ec_lock_var, foreground='#c0392b').pack(side='left', padx=6)
         win.protocol('WM_DELETE_WINDOW', self._ec_close)
+        # 主窗口移动时跟随磁吸（只绑一次）
+        if not getattr(self, '_root_cfg_bound', False):
+            self.root.bind('<Configure>', self._on_root_configure)
+            self._root_cfg_bound = True
+        # 独立拖动放大时列宽自适应
+        win.bind('<Configure>', self._on_game_win_resize)
         # 打开时自动恢复上次扫描结果与锁定
         self.root.after(400, self._ec_restore_state)
+
+    def _on_game_win_resize(self, e):
+        """窗口独立拖动放大/缩小时，路径列跟随宽度伸展"""
+        try:
+            if e.widget != self.game_win:
+                return
+            w = e.width
+            if w > 150:
+                self.ec_tree.column('path', width=max(120, w - 95))
+        except Exception:
+            pass
 
     def _ec_close(self):
         """X 关闭 = 隐藏（贴合窗口复用）；锁定保持运行，重开自动恢复"""
@@ -4249,6 +4282,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
