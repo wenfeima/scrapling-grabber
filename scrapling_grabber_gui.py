@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.11.0'
+APP_VERSION = 'v2.12.0'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -483,8 +483,271 @@ class ScraplingGrabberGUI:
             pass
         self._ai_chat_history = []
 
+    # ===== AI 助手模式：工具调用 =====
+    AI_TOOL_DESC = (
+        '你是「Scrapling 图片爬虫」的AI助手，能通过调用工具帮用户完成抓取操作。\n'
+        '可用工具（严格用这个格式输出，一次只调用一个，参数必须带上）：\n'
+        '  [工具:start_crawl {"url":"https://www.example.com/", "mode":"全站", "threads":8}]\n'
+        '  [工具:stop_crawl {}]\n'
+        '  [工具:pause_crawl {}]\n'
+        '  [工具:resume_crawl {}]\n'
+        '  [工具:retry_failed {}]\n'
+        '  [工具:get_status {}]\n'
+        '  [工具:get_task_list {"limit":10}]\n'
+        '  [工具:set_save_dir {"path":"L:/tu"}]\n'
+        '  [工具:set_filter {"smart_filter":true, "min_size":20}]\n'
+        '  [工具:get_settings {}]\n'
+        '  [工具:open_save_dir {}]\n'
+        '规则：\n'
+        '1. start_crawl 必须提供 url，用户没说网址就先问他；\n'
+        '2. 参数值必须是完整可用的值，例如路径用完整路径，不能省略；\n'
+        '3. 工具执行后你会收到 [工具结果]，根据结果给用户简短中文回复；\n'
+        '4. 不需要调用工具时直接正常回复用户；\n'
+        '5. 只调用上面列出的工具，不要输出其他格式。'
+    )
+
+    @staticmethod
+    def _ai_parse_tool_call(text):
+        """解析模型输出的工具调用 [工具:名称 参数JSON]，返回 (name, args) 或 None"""
+        import re as _re
+        m = _re.search(r'\[工具:([\w_]+)\s*(?:\s+(\{.*?\}))?\]', text, _re.S)
+        if not m:
+            return None
+        name = m.group(1).strip()
+        args = {}
+        if m.group(2):
+            try:
+                args = json.loads(m.group(2))
+            except Exception:
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+        return name, args
+
+    def _ai_last_user_text(self):
+        """取最近一条用户消息（工具参数兜底提取用）"""
+        for m in reversed(self._ai_chat_history):
+            if m.get('role') == 'user':
+                return m.get('content', '')
+        return ''
+
+    @staticmethod
+    def _ai_extract_url(text):
+        """从文本提取第一个网址"""
+        import re as _re
+        m = _re.search(r'https?://[^\s，。；;""\']+', text)
+        return m.group(0) if m else ''
+
+    @staticmethod
+    def _ai_extract_path(text):
+        """从文本提取第一个盘符路径（Windows 或正斜杠写法）"""
+        import re as _re
+        m = _re.search(r'[A-Za-z]:[\\/][^\s，。；;""\']+', text)
+        return m.group(0) if m else ''
+
+    def _ai_execute_tool(self, name, args):
+        """执行工具调用，返回 (ok, 结果文本)"""
+        try:
+            if name == 'start_crawl':
+                url = str(args.get('url') or '').strip()
+                if not url:
+                    url = self._ai_extract_url(self._ai_last_user_text())  # 参数兜底：从用户消息提取
+                if not url:
+                    return False, '缺少网址参数 url，请重新调用 [工具:start_crawl {"url":"https://www.example.com/"}]，或先询问用户网址'
+                if self.is_running:
+                    return False, '当前已有抓取任务在运行，请先停止或等待完成'
+                save_dir = str(args.get('save_dir') or '').strip() or self.dir_var.get().strip()
+                mode = str(args.get('mode') or '').strip()
+                threads = args.get('threads')
+                if mode not in ('单页', '全站'):
+                    txt = self._ai_last_user_text()  # 参数兜底：从用户消息提取模式/线程
+                    import re as _re
+                    if _re.search(r'单页|只抓(这|当前|一)?页|就?这页', txt):
+                        mode = '单页'
+                    elif _re.search(r'全站|全部|整站|所有页', txt):
+                        mode = '全站'
+                    else:
+                        mode = self.grab_mode_var.get()
+                    if threads is None:
+                        m = _re.search(r'线程[数]?[=:：]?\s*(\d+)', txt) or _re.search(r'(\d+)\s*(个)?线程', txt)
+                        if m:
+                            try:
+                                threads = int(m.group(1))
+                            except Exception:
+                                threads = None
+                self.url_var.set(url)
+                if save_dir:
+                    self.dir_var.set(save_dir)
+                if mode in ('单页', '全站'):
+                    self.grab_mode_var.set(mode)
+                if threads is not None:
+                    try:
+                        self.threads_var.set(max(1, min(32, int(threads))))
+                    except Exception:
+                        pass
+                self._save_settings()
+                self._start_crawl()
+                return True, '已开始抓取 %s（模式:%s）' % (url, mode)
+            if name == 'stop_crawl':
+                self._stop_crawl()
+                return True, '已请求停止抓取'
+            if name == 'pause_crawl':
+                if not self.pause_flag.is_set() and self.is_running:
+                    self._toggle_pause()
+                    return True, '已暂停抓取'
+                return False, '当前没有可暂停的运行任务'
+            if name == 'resume_crawl':
+                if self.pause_flag.is_set():
+                    self._toggle_pause()
+                    return True, '已继续抓取'
+                return False, '当前没有处于暂停状态的任务'
+            if name == 'retry_failed':
+                self._retry_failed()
+                return True, '已触发重试失败任务'
+            if name == 'get_status':
+                return True, self._ai_tool_status()
+            if name == 'get_task_list':
+                return True, self._ai_tool_task_list(int(args.get('limit') or 10))
+            if name == 'set_save_dir':
+                path = str(args.get('path') or '').strip()
+                if not path:
+                    path = self._ai_extract_path(self._ai_last_user_text())  # 参数兜底：从用户消息提取
+                if not path:
+                    return False, '缺少路径参数 path，请重新调用 [工具:set_save_dir {"path":"L:/tu"}] 带上完整路径'
+                try:
+                    os.makedirs(path, exist_ok=True)
+                except Exception as e:
+                    return False, '保存目录不可用: %s' % e
+                self.dir_var.set(path)
+                self._save_settings()
+                return True, '保存目录已设置为 %s' % path
+            if name == 'set_filter':
+                sm = args.get('smart_filter')
+                ms = args.get('min_size')
+                if sm is None or ms is None:
+                    txt = self._ai_last_user_text()  # 参数兜底：从用户消息解析
+                    import re as _re
+                    if sm is None:
+                        if _re.search(r'关(掉|闭)?|关闭|去掉', txt):
+                            sm = False
+                        elif _re.search(r'开(启|着)?|打开|启用', txt):
+                            sm = True
+                    if ms is None:
+                        m = _re.search(r'(\d+)\s*KB?', txt)
+                        if m:
+                            try:
+                                ms = int(m.group(1))
+                            except Exception:
+                                ms = None
+                if sm is not None:
+                    self.smart_filter_var.set(bool(sm))
+                if ms is not None:
+                    try:
+                        self.min_size_var.set(int(ms))
+                    except Exception:
+                        pass
+                self._save_settings()
+                return True, '过滤设置已更新（智能过滤:%s 最小大小:%sKB）' % (
+                    self.smart_filter_var.get(), self.min_size_var.get())
+            if name == 'get_settings':
+                return True, (
+                    '网址:%s | 保存目录:%s | 模式:%s | 线程:%s | 智能过滤:%s | '
+                    '最小大小:%sKB | 抓取状态:%s' % (
+                        self.url_var.get(), self.dir_var.get(), self.grab_mode_var.get(),
+                        self.threads_var.get(), self.smart_filter_var.get(),
+                        self.min_size_var.get(), '运行中' if self.is_running else '空闲'))
+            if name == 'open_save_dir':
+                self._open_save_dir()
+                return True, '已打开保存目录'
+            return False, '未知工具: %s' % name
+        except Exception as e:
+            return False, '工具执行出错: %s' % e
+
+    def _ai_tool_status(self):
+        """任务状态统计（供 get_status 工具）"""
+        total = success = fail = waiting = downloading = 0
+        for item in self.task_tree.get_children():
+            vals = self.task_tree.item(item, 'values')
+            if len(vals) > 4:
+                total += 1
+                status = vals[4]
+                if status in ('完成', '成功'):
+                    success += 1
+                elif status in ('失败', '部分失败'):
+                    fail += 1
+                elif status == '等待':
+                    waiting += 1
+                elif '下载中' in status or '抓取中' in status:
+                    downloading += 1
+        return '抓取状态:%s | 任务总数:%d 成功:%d 失败:%d 等待:%d 下载中:%d' % (
+            '运行中' if self.is_running else '空闲', total, success, fail, waiting, downloading)
+
+    def _ai_tool_task_list(self, limit=10):
+        """最近任务列表（供 get_task_list 工具）"""
+        rows = []
+        for item in self.task_tree.get_children():
+            vals = self.task_tree.item(item, 'values')
+            if len(vals) > 4:
+                rows.append('  %s | %s | %s' % (vals[0], vals[1], vals[4]))
+            if len(rows) >= limit:
+                break
+        if not rows:
+            return '当前没有任务记录'
+        return '最近任务：\n' + '\n'.join(rows)
+
+    def _ai_assistant_chat(self, user_text):
+        """AI 助手模式：多轮工具调用循环（最多5轮），返回模型最终回复"""
+        self._ai_log_chat('req', user_text)
+        self._ai_chat_history.append({'role': 'user', 'content': user_text})
+        import requests
+        import json
+        try:
+            port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
+            ctx = int(self.ai_chat_ctx_var.get() or 12)
+        except Exception:
+            port = AI_DEFAULT_PORT
+            ctx = 12
+        messages = [{'role': 'system', 'content': self.AI_TOOL_DESC}]
+        messages.extend(self._ai_chat_history[-ctx:])
+        final = ''
+        last_fail = None   # 连续失败保护：(name, error) 相同连续2次则中断
+        for _ in range(5):
+            try:
+                r = requests.post(
+                    'http://127.0.0.1:%d/v1/chat/completions' % port,
+                    json={'messages': messages, 'max_tokens': 1024, 'temperature': 0.3},
+                    timeout=300)
+                if r.status_code != 200:
+                    final = '(HTTP %d)' % r.status_code
+                    break
+                content = (r.json()['choices'][0]['message'].get('content') or '').strip()
+            except Exception as e:
+                final = '(调用失败: %s)' % e
+                break
+            tc = self._ai_parse_tool_call(content)
+            if not tc:
+                final = content
+                break
+            name, args = tc
+            self._ai_log_chat('tool', '[工具调用] %s %s' % (name, json.dumps(args, ensure_ascii=False)))
+            ok, result = self._ai_execute_tool(name, args)
+            self._ai_log_chat('tool', '[工具结果] %s' % result)
+            if not ok and last_fail == (name, result):
+                final = '工具 %s 连续执行失败（%s），已停止尝试，请向用户说明情况并请其确认参数。' % (name, result)
+                self._ai_log_chat('tool', final)
+                self._ai_chat_history.append({'role': 'assistant', 'content': content})
+                break
+            last_fail = (name, result) if not ok else None
+            messages.append({'role': 'assistant', 'content': content})
+            messages.append({'role': 'user', 'content': '[工具结果] %s' % result})
+            self._ai_chat_history.append({'role': 'assistant', 'content': content})
+            self._ai_chat_history.append({'role': 'user', 'content': '[工具结果] %s' % result})
+        if final:
+            self._ai_log_chat('resp', final or '(空回复)')
+            self._ai_chat_history.append({'role': 'assistant', 'content': final})
+
     def _ai_chat_send(self):
-        """AI 对话：发送用户消息并显示模型回复（带最近上下文）"""
+        """AI 对话（助手模式）：发送用户消息，模型可调用工具操作软件"""
         text = self.ai_chat_input.get().strip()
         if not text:
             return
@@ -492,25 +755,7 @@ class ScraplingGrabberGUI:
             self._log('AI对话: AI服务未运行，请先点击「启动AI服务」')
             return
         self.ai_chat_input.delete(0, 'end')
-        self._ai_log_chat('req', text)
-        self._ai_chat_history.append({'role': 'user', 'content': text})
-        import requests
-        try:
-            port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
-            ctx = int(self.ai_chat_ctx_var.get() or 12)
-            messages = self._ai_chat_history[-ctx:]  # 上下文条数可设置（设置窗口）
-            r = requests.post(
-                'http://127.0.0.1:%d/v1/chat/completions' % port,
-                json={'messages': messages, 'max_tokens': 1024, 'temperature': 0.7},
-                timeout=300)
-            if r.status_code == 200:
-                content = (r.json()['choices'][0]['message'].get('content') or '').strip()
-                self._ai_log_chat('resp', content or '(空回复)')
-                self._ai_chat_history.append({'role': 'assistant', 'content': content})
-            else:
-                self._ai_log_chat('resp', '(HTTP %d)' % r.status_code)
-        except Exception as e:
-            self._ai_log_chat('resp', '(调用失败: %s)' % e)
+        self._ai_assistant_chat(text)
 
     def _ai_call_text(self, prompt_text, max_tokens=300, timeout=120):
         """通用文本调用本地模型，返回模型输出字符串（失败返回空串）"""
@@ -749,7 +994,7 @@ class ScraplingGrabberGUI:
         ai_top = ttk.Frame(ai_tab)
         ai_top.pack(fill='x', pady=2, padx=4)
         ttk.Button(ai_top, text='清除', width=6, command=self._ai_clear_chat).pack(side='left')
-        ttk.Label(ai_top, text='（蓝色=发给模型的请求，绿色=模型回复；下方输入框可直接与本地模型对话）', foreground='#999').pack(side='left', padx=8)
+        ttk.Label(ai_top, text='（蓝=发给模型，绿=模型回复，橙=工具执行；可直接提要求操作软件，如"抓取这个站"）', foreground='#999').pack(side='left', padx=8)
         self.ai_chat_text = tk.Text(ai_tab, wrap='word', font=('Consolas', 9))
         ai_scroll = ttk.Scrollbar(ai_tab, command=self.ai_chat_text.yview)
         self.ai_chat_text.configure(yscrollcommand=ai_scroll.set)
@@ -757,6 +1002,7 @@ class ScraplingGrabberGUI:
         self.ai_chat_text.pack(side='left', fill='both', expand=True)
         self.ai_chat_text.tag_configure('req', foreground='#1a56db')
         self.ai_chat_text.tag_configure('resp', foreground='#0d7a3d')
+        self.ai_chat_text.tag_configure('tool', foreground='#b45309')
         self.ai_chat_text.tag_configure('sep', foreground='#bbbbbb')
         # 对话输入框
         ai_input_frame = ttk.Frame(ai_tab)
@@ -2797,13 +3043,7 @@ class ScraplingGrabberGUI:
         if self.ai_filter_var.get():
             removed = self._ai_filter_images(save_dir, task_id)
             if removed:
-                self.stat_done.set('已下载: %d/%d（AI过滤删除 %d）' % (success, len(img_urls), removed))
-
-        # 更新统计信息
-        self.stat_total.set('图片总数: %d' % len(img_urls))
-        self.stat_done.set('已下载: %d/%d' % (success, len(img_urls)))
-        self.stat_success.set('成功: %d' % success)
-        self.stat_fail.set('失败: %d' % fail)
+                self._log('AI过滤删除 %d 张无关图' % removed)
 
         if task_id:
             if fail == 0:
