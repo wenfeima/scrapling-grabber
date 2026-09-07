@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.15'
+APP_VERSION = 'v2.12.16'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -1762,6 +1762,30 @@ class ScraplingGrabberGUI:
         if directory:
             self.dir_var.set(directory)
 
+    def _open_screenshots_dir(self):
+        """打开临时截图目录"""
+        shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
+        try:
+            os.makedirs(shot_dir, exist_ok=True)
+            os.startfile(shot_dir)
+        except Exception as e:
+            self._log('打开截图目录失败: %s' % e)
+
+    def _clear_screenshots_manual(self):
+        """手动清理临时截图（保留最近200张）"""
+        shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
+        before = 0
+        if os.path.isdir(shot_dir):
+            before = len([f for f in os.listdir(shot_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+        self._clean_screenshots(200)
+        after = 0
+        if os.path.isdir(shot_dir):
+            after = len([f for f in os.listdir(shot_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+        if before > after:
+            self._log('已清理临时截图: %d 张 → %d 张' % (before, after))
+        else:
+            self._log('临时截图无需清理（当前 %d 张，上限200张）' % before)
+
     def _open_settings(self):
         """打开设置窗口：保存目录/线程/超时/最小图 + AI 模型与服务配置"""
         if self.settings_win is not None and self.settings_win.winfo_exists():
@@ -1771,7 +1795,7 @@ class ScraplingGrabberGUI:
         win = tk.Toplevel(self.root)
         self.settings_win = win
         win.title('设置')
-        win.geometry('640x320')
+        win.geometry('780x400')
         win.resizable(False, False)
         win.transient(self.root)
         win.grab_set()
@@ -1785,6 +1809,22 @@ class ScraplingGrabberGUI:
         ttk.Label(r1, text='保存目录:').pack(side='left')
         ttk.Entry(r1, textvariable=self.dir_var, width=48).pack(side='left', padx=2)
         ttk.Button(r1, text='浏览', width=5, command=self._browse_dir).pack(side='left')
+        r2 = ttk.Frame(gen)
+        r2.pack(fill='x', padx=6, pady=3)
+        ttk.Label(r2, text='临时截图:').pack(side='left')
+        shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
+        shot_var = tk.StringVar(value=shot_dir)
+        ttk.Entry(r2, textvariable=shot_var, width=46, state='readonly').pack(side='left', padx=2)
+        ttk.Button(r2, text='打开', width=5, command=self._open_screenshots_dir).pack(side='left')
+        ttk.Button(r2, text='清理', width=6, command=self._clear_screenshots_manual).pack(side='left', padx=(4, 0))
+        r1b = ttk.Frame(gen)
+        r1b.pack(fill='x', padx=6, pady=3)
+        ttk.Label(r1b, text='临时截图:').pack(side='left')
+        shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
+        self.shot_dir_var = tk.StringVar(value=shot_dir)
+        ttk.Entry(r1b, textvariable=self.shot_dir_var, width=38, state='readonly').pack(side='left', padx=2)
+        ttk.Button(r1b, text='打开', width=5, command=self._open_shot_dir).pack(side='left', padx=2)
+        ttk.Button(r1b, text='清理', width=6, command=self._clean_shots_now).pack(side='left')
 
         # ===== AI 模型与服务 =====
         ai = ttk.LabelFrame(win, text='AI 模型与服务（本地 Qwen）')
@@ -1802,12 +1842,14 @@ class ScraplingGrabberGUI:
         r6 = ttk.Frame(ai)
         r6.pack(fill='x', padx=6, pady=2)
         ttk.Label(r6, text='服务程序:').pack(side='left')
-        ttk.Entry(r6, textvariable=self.ai_server_var, width=42).pack(side='left', padx=2)
+        ttk.Entry(r6, textvariable=self.ai_server_var, width=54).pack(side='left', padx=2)
         ttk.Button(r6, text='浏览', width=5, command=lambda: self._browse_ai_file('ai_server_var')).pack(side='left')
-        ttk.Label(r6, text='端口:').pack(side='left', padx=(10, 2))
-        ttk.Spinbox(r6, from_=1024, to=65535, textvariable=self.ai_port_var, width=6).pack(side='left')
-        ttk.Label(r6, text='对话上下文(条):').pack(side='left', padx=(10, 2))
-        ttk.Spinbox(r6, from_=1, to=100, textvariable=self.ai_chat_ctx_var, width=5).pack(side='left')
+        r6b = ttk.Frame(ai)
+        r6b.pack(fill='x', padx=6, pady=2)
+        ttk.Label(r6b, text='端口:').pack(side='left')
+        ttk.Spinbox(r6b, from_=1024, to=65535, textvariable=self.ai_port_var, width=7).pack(side='left', padx=2)
+        ttk.Label(r6b, text='对话上下文(条):').pack(side='left', padx=(16, 2))
+        ttk.Spinbox(r6b, from_=1, to=100, textvariable=self.ai_chat_ctx_var, width=6).pack(side='left')
 
         # 底部按钮
         btn_row = ttk.Frame(win)
@@ -3766,6 +3808,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
