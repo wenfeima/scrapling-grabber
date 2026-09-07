@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.13'
+APP_VERSION = 'v2.12.15'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -500,12 +500,14 @@ class ScraplingGrabberGUI:
         '  [工具:open_save_dir {}]\n'
         '  [工具:get_browser_info {}]\n'
         '  [工具:get_browser_view {"prompt":"关于页面你想问什么，可选"}]\n'
+        '  [工具:ai_adjust_crawl {"url":"目标页面网址，可选，默认浏览器当前页"}]\n'
         '工具使用场景：\n'
         '- 用户想抓取/下载某个页面或网站的图片（如"抓取这个页面""这个站""这个页面图片抓取""下载图片"）→ 用 start_crawl；用户消息里可能只有网址没有"抓取"两个字，那也是在请求抓取\n'
         '- 用户问抓取进度/状态/剩多少 → 用 get_status\n'
         '- 用户问保存目录/配置/当前设置 → 用 get_settings\n'
         '- 用户问浏览器当前打开了什么页面/几张图/页面状态（如"浏览器上有几张图""现在看的是什么页"）→ 用 get_browser_info\n'
         '- 用户想让你看页面内容/画面（如"看看这个页面""这个站怎么样""页面上有什么""帮我看看现在这页"）→ 用 get_browser_view，会截屏并用视觉模型理解页面\n'
+        '- 用户说页面明明有图但抓取不到/抓不到图片/提取太少/帮我调整抓取策略/怎么才能抓到（如"这个页面有图抓不到""帮我调整抓取策略""图片怎么抓不下来"）→ 用 ai_adjust_crawl，会自动截图分析页面图片加载方式（懒加载/属性/点击），滚动触发并重新提取，返回图片数量变化\n'
         '- 用户明确要求设置过滤（开启/关闭智能过滤、最小图片大小KB）→ 才用 set_filter，否则不要调用它\n'
         '规则：\n'
         '1. start_crawl 的 url 可以省略：用户说"这个页面/这个站/当前页"或之前已经给过网址时，直接调用 start_crawl（url 可传空 {}），执行器会自动用当前网址；只有完全不知道网址时才先问用户；\n'
@@ -682,6 +684,8 @@ class ScraplingGrabberGUI:
                 return True, info
             if name == 'get_browser_view':
                 return self._ai_browser_view(str(args.get('prompt') or '').strip())
+            if name == 'ai_adjust_crawl':
+                return True, self._ai_adjust_crawl_tool(str(args.get('url') or '').strip())
             return False, '未知工具: %s' % name
         except Exception as e:
             return False, '工具执行出错: %s' % e
@@ -768,6 +772,7 @@ class ScraplingGrabberGUI:
             shot_path = os.path.join(shot_dir, 'view_%s.jpg' % _time.strftime('%Y%m%d_%H%M%S'))
             with open(shot_path, 'wb') as f:
                 f.write(buf.getvalue())
+            self._clean_screenshots(200)
         except Exception as e:
             return False, '图片处理失败: %s' % e
         # 3. 视觉模型理解
@@ -873,6 +878,29 @@ class ScraplingGrabberGUI:
             self._ai_log_chat('resp', final or '(空回复)')
             self._ai_chat_history.append({'role': 'assistant', 'content': final})
 
+    def _clean_screenshots(self, max_keep=200):
+        """清理截图目录：只保留最近 max_keep 张，超出的按时间删除最旧（自动调用，防无限累积）"""
+        try:
+            shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
+            if not os.path.isdir(shot_dir):
+                return
+            files = [os.path.join(shot_dir, f) for f in os.listdir(shot_dir)
+                     if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+            if len(files) <= max_keep:
+                return
+            files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            removed = 0
+            for old in files[max_keep:]:
+                try:
+                    os.remove(old)
+                    removed += 1
+                except Exception:
+                    pass
+            if removed:
+                self._log('截图目录已自动清理: 保留最近 %d 张，删除 %d 张旧截图' % (max_keep, removed))
+        except Exception:
+            pass
+
     def _ai_capture_shot(self):
         """CDP截取调试浏览器当前页 → JPEG压缩 → 返回 (base64, 保存路径)；失败返回 None"""
         import urllib.request as _ur
@@ -906,6 +934,7 @@ class ScraplingGrabberGUI:
             shot_path = os.path.join(shot_dir, 'chat_%s.jpg' % _time.strftime('%Y%m%d_%H%M%S'))
             with open(shot_path, 'wb') as f:
                 f.write(buf.getvalue())
+            self._clean_screenshots(200)
             return b64, shot_path
         except Exception:
             return None
@@ -3352,6 +3381,70 @@ class ScraplingGrabberGUI:
         self._log('AI调整后图片数未增加（%d 张），按当前结果继续' % len(img_urls))
         return img_urls
 
+    def _ai_browser_url(self):
+        """取调试浏览器当前活跃标签 URL"""
+        import urllib.request as _ur
+        import json as _json
+        try:
+            with _ur.urlopen('http://127.0.0.1:9222/json/list', timeout=3) as r:
+                tabs = _json.loads(r.read())
+            pages = [t for t in tabs if t.get('type') == 'page']
+            if not pages:
+                return ''
+            active = next((t for t in pages if t.get('active')), pages[0])
+            return active.get('url', '')
+        except Exception:
+            return ''
+
+    def _ai_adjust_crawl_tool(self, url=''):
+        """ai_adjust_crawl 工具：AI 看图分析当前浏览器页加载方式 → 滚动触发 → 重新提取 → 汇报结果"""
+        # 优先以浏览器当前页为目标（用户说"这个页面"即浏览器里打开的页，截图分析的就是它）
+        browser_url = self._ai_browser_url()
+        if browser_url:
+            target = browser_url
+        else:
+            target = url.strip() or self.url_var.get().strip()
+        html = self._fetch_current_tab_html()
+        if not html:
+            return '调试浏览器未运行或没有打开页面，请先在「浏览器模式」启动调试浏览器并打开目标页面'
+        # 初始提取
+        try:
+            from scrapling import Selector
+            init_imgs = self._extract_images_from_page(Selector(html), target or '当前页', html)
+        except Exception:
+            init_imgs = []
+        # AI 看图分析
+        strategy = self._ai_analyze_page_strategy(html, len(init_imgs), target or '当前页')
+        if not strategy:
+            return 'AI策略分析失败（截图或视觉模型不可用），当前已提取 %d 张图片' % len(init_imgs)
+        lines = ['AI看图分析: %s' % (strategy.get('note', '') or '（无说明）')]
+        if strategy.get('has_images') is False:
+            lines.append('AI判断页面无可下载图片')
+            return '\n'.join(lines)
+        # 执行滚动策略
+        if strategy.get('strategy') == 'scroll':
+            try:
+                times = max(1, min(int(strategy.get('scroll_times', 3)), 8))
+            except Exception:
+                times = 3
+            self._log('AI工具: 按策略滚动 %d 轮触发懒加载' % times)
+            self._scroll_debug_browser(times)
+            new_html = self._fetch_current_tab_html()
+            if new_html and len(new_html) > len(html):
+                html = new_html
+        # 重新提取
+        try:
+            from scrapling import Selector
+            new_imgs = self._extract_images_from_page(Selector(html), target or '当前页', html)
+        except Exception:
+            new_imgs = init_imgs
+        lines.append('调整前 %d 张 → 调整后 %d 张' % (len(init_imgs), len(new_imgs)))
+        if len(new_imgs) > len(init_imgs):
+            lines.append('已按AI策略调整并重新提取，图片数增加，可继续用 start_crawl 抓取下载')
+        else:
+            lines.append('图片数未增加，可能需要登录/点击展开，或该页无法用当前方式获取')
+        return '\n'.join(lines)
+
     def _extract_images_from_page(self, page, url, html):
         """从页面提取图片链接"""
         import re
@@ -3668,6 +3761,8 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
 
 
 
