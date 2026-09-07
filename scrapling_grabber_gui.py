@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.8'
+APP_VERSION = 'v2.12.9'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -2451,8 +2451,10 @@ class ScraplingGrabberGUI:
             self.root.after(150, lambda: self._resize_browser(jitter=True))
             self.root.after(600, lambda: self._resize_browser(jitter=True))
             self.root.after(1800, lambda: self._resize_browser(jitter=True))
+            # 嵌入完成后隐藏-显示强制全量重绘（等效且强于手动拖动，favicon/图标必出）
+            self.root.after(2500, self._force_browser_redraw)
             # 嵌入完成后自动刷新页面一次，强制完整重绘（图标/快捷方式必出）
-            self.root.after(2500, self._browser_reload_once)
+            self.root.after(3500, self._browser_reload_once)
 
             self._log('浏览器已嵌入到「浏览器」页签')
             self.browser_hint.pack_forget()  # 隐藏提示标签
@@ -2477,13 +2479,35 @@ class ScraplingGrabberGUI:
                 if width > 0 and height > 0:
                     MoveWindow(self.browser_hwnd, 0, 0, width, height, True)
                     if jitter:
-                        # 先明显缩小60px（真实尺寸变化），延迟后再恢复——等效"拖动窗口"，强制Chrome重排渲染
-                        MoveWindow(self.browser_hwnd, 0, 0, width, max(1, height - 60), True)
-                        self.root.after(120, lambda: MoveWindow(self.browser_hwnd, 0, 0, width, height, True))
+                        # 先明显缩小120px（真实尺寸变化，慢速间隔），延迟后再恢复——等效"拖动窗口"，强制Chrome重排渲染
+                        MoveWindow(self.browser_hwnd, 0, 0, width, max(1, height - 120), True)
+                        self.root.after(500, lambda: MoveWindow(self.browser_hwnd, 0, 0, width, height, True))
                     # 强制立即重绘
                     RedrawWindow(self.browser_hwnd, None, None, 0x0001 | 0x0100)  # RDW_INVALIDATE | RDW_UPDATENOW
             except Exception:
                 pass
+
+    def _force_browser_redraw(self):
+        """隐藏再显示浏览器窗口，强制 Windows 全量重绘（修复嵌入后图标/favicon 不绘制）"""
+        try:
+            import ctypes
+            ShowWindow = ctypes.windll.user32.ShowWindow
+            if self.browser_hwnd:
+                ShowWindow(self.browser_hwnd, 0)  # SW_HIDE
+                self.root.after(400, lambda: self._show_browser_after_hide())
+        except Exception:
+            pass
+
+    def _show_browser_after_hide(self):
+        try:
+            import ctypes
+            ShowWindow = ctypes.windll.user32.ShowWindow
+            if self.browser_hwnd:
+                ShowWindow(self.browser_hwnd, 5)  # SW_SHOW
+                self._resize_browser(jitter=True)
+                self._log('已强制重绘嵌入的浏览器窗口')
+        except Exception:
+            pass
 
     def _browser_reload_once(self):
         """嵌入后自动刷新调试浏览器页面一次，强制完整重绘（修复图标/快捷方式不显示）"""
@@ -3298,6 +3322,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
