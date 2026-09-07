@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.17'
+APP_VERSION = 'v2.12.18'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -271,8 +271,11 @@ class ScraplingGrabberGUI:
             self.ai_mmproj_var.set(v)
 
     def _browse_ai_file(self, var_name):
-        """浏览选择模型/服务文件"""
-        path = filedialog.askopenfilename(title='选择文件', filetypes=[('模型/程序', '*.gguf *.exe'), ('所有文件', '*.*')])
+        """浏览选择模型/服务文件（初始目录=当前值所在目录）"""
+        cur = getattr(self, var_name).get().strip()
+        init = os.path.dirname(cur) if cur and os.path.isdir(os.path.dirname(cur)) else None
+        path = filedialog.askopenfilename(title='选择文件', initialdir=init,
+                                          filetypes=[('模型/程序', '*.gguf *.exe'), ('所有文件', '*.*')])
         if path:
             getattr(self, var_name).set(path)
 
@@ -1757,8 +1760,10 @@ class ScraplingGrabberGUI:
         self.url_combo['values'] = all_urls
 
     def _browse_dir(self):
-        """浏览保存目录"""
-        directory = filedialog.askdirectory(title='选择保存目录')
+        """浏览保存目录（初始目录=当前值）"""
+        cur = self.dir_var.get().strip()
+        init = cur if cur and os.path.isdir(cur) else None
+        directory = filedialog.askdirectory(title='选择保存目录', initialdir=init)
         if directory:
             self.dir_var.set(directory)
 
@@ -1813,8 +1818,8 @@ class ScraplingGrabberGUI:
         r2.pack(fill='x', padx=6, pady=3)
         ttk.Label(r2, text='临时截图:').pack(side='left')
         shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
-        shot_var = tk.StringVar(value=shot_dir)
-        ttk.Entry(r2, textvariable=shot_var, width=46, state='readonly').pack(side='left', padx=2)
+        self.shot_dir_var = tk.StringVar(value=shot_dir)
+        ttk.Entry(r2, textvariable=self.shot_dir_var, width=46, state='readonly').pack(side='left', padx=2)
         ttk.Button(r2, text='打开', width=5, command=self._open_screenshots_dir).pack(side='left')
         ttk.Button(r2, text='清理', width=6, command=self._clear_screenshots_manual).pack(side='left', padx=(4, 0))
 
@@ -1842,11 +1847,6 @@ class ScraplingGrabberGUI:
         ttk.Spinbox(r6b, from_=1024, to=65535, textvariable=self.ai_port_var, width=7).pack(side='left', padx=2)
         ttk.Label(r6b, text='对话上下文(条):').pack(side='left', padx=(16, 2))
         ttk.Spinbox(r6b, from_=1, to=100, textvariable=self.ai_chat_ctx_var, width=6).pack(side='left')
-
-        # 底部按钮
-        btn_row = ttk.Frame(win)
-        btn_row.pack(fill='x', pady=8)
-        ttk.Button(btn_row, text='关闭', command=self._close_settings).pack(side='right', padx=10)
 
     def _close_settings(self):
         """关闭设置窗口并保存设置"""
@@ -3800,6 +3800,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
