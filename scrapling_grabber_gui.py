@@ -3756,6 +3756,11 @@ class ScraplingGrabberGUI:
 def main():
     root = tk.Tk()
     app = ScraplingGrabberGUI(root)
+    # 启动时自动清理一次截图目录（保留最近200张），防历史累积
+    try:
+        app._clean_screenshots(200)
+    except Exception:
+        pass
     root.mainloop()
 
 
