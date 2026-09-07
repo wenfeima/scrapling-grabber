@@ -1,4 +1,9 @@
-# Scrapling 图片爬虫 - 开发交接笔记（v2.12.21）
+# Scrapling 图片爬虫 - 开发交接笔记（v2.12.22）
+
+## v2.12.22 修复（Chrome 每次启动弹"要恢复页面吗"）
+- **根因**：调试浏览器 Popen 启动后进程引用丢失，软件退出时只杀 AI 进程、没关调试浏览器 → 浏览器残留被判定"未正确关闭"，下次启动弹恢复气泡
+- **修复1**：`_on_closing` 退出时用 PowerShell `CloseMainWindow()`（WM_CLOSE）优雅关闭 9222+debug_profile 的 chrome/msedge 进程 → 正常关闭标记，不再弹
+- **修复2**：三处启动参数补 `--disable-features=InfiniteSessionRestore`（配合已有 --disable-session-crashed-bubble 双保险）
 
 ## v2.12.21 修复（最大化后无法还原）
 - **现象**：点最大化后点还原/拖拽没反应（用户怀疑跑大模型时 UI 被拖住；也是 Tk 在 Windows 的已知问题）
