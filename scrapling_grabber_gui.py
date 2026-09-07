@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.0'
+APP_VERSION = 'v2.12.1'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -1415,6 +1415,7 @@ class ScraplingGrabberGUI:
         """独立窗口打开浏览器（用于登录/装插件）"""
         import subprocess
         import os
+        import shutil
 
         # 先清理残留进程，确保9222端口能正常监听
         self._kill_stale_debug_browser()
@@ -1423,6 +1424,19 @@ class ScraplingGrabberGUI:
 
         user_data_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'debug_profile')
         os.makedirs(user_data_dir, exist_ok=True)
+
+        # 清理上次异常退出留下的会话残留（避免弹"Chrome未正确关闭"恢复条）
+        try:
+            for f in ('Last Session', 'Last Tabs', 'Current Session', 'Current Tabs'):
+                p = os.path.join(user_data_dir, f)
+                if os.path.exists(p):
+                    os.remove(p)
+            for sd in (os.path.join(user_data_dir, 'Default', 'Session'),
+                       os.path.join(user_data_dir, 'Default', 'Snapshots')):
+                if os.path.exists(sd):
+                    shutil.rmtree(sd, ignore_errors=True)
+        except Exception:
+            pass
 
         # 尝试启动Chrome
         chrome_paths = [
@@ -1439,6 +1453,7 @@ class ScraplingGrabberGUI:
                     '--remote-allow-origins=*',
                     '--no-first-run',
                     '--no-default-browser-check',
+                    '--disable-session-crashed-bubble',
                     '--user-data-dir=' + user_data_dir,
                 ])
                 self._log('已独立窗口启动 Chrome（9222端口），可登录/装插件')
@@ -1458,6 +1473,7 @@ class ScraplingGrabberGUI:
                     '--remote-allow-origins=*',
                     '--no-first-run',
                     '--no-default-browser-check',
+                    '--disable-session-crashed-bubble',
                     '--user-data-dir=' + user_data_dir,
                 ])
                 self._log('已独立窗口启动 Edge（9222端口），可登录/装插件')
@@ -1566,6 +1582,19 @@ class ScraplingGrabberGUI:
         self.log_text.see('end')
         self.root.update_idletasks()
 
+    def _clean_url(self, url):
+        """清理网址：去空白 + 去掉粘贴时带进来的尾部中文（如从对话复制时带的"的图"等）"""
+        import re as _re
+        if not url:
+            return url
+        url = url.strip()
+        # 去掉末尾连续非ASCII字符（中文说明文字）
+        cleaned = _re.sub(r'[^\x00-\x7F]+$', '', url).strip().rstrip('.,，。;；:：、')
+        if cleaned and cleaned != url:
+            self._log('已自动清理网址多余文字: %s → %s' % (url, cleaned))
+            return cleaned
+        return url
+
     def _start_crawl(self):
         """开始抓取"""
         # 清空任务列表
@@ -1577,7 +1606,9 @@ class ScraplingGrabberGUI:
         # 更新任务统计
         self._update_task_stat()
         try:
-            url = self.url_var.get().strip()
+            url = self._clean_url(self.url_var.get())
+            if url:
+                self.url_var.set(url)
             if url:
                 self._save_url_history(url)
             save_dir = self.dir_var.get().strip()
@@ -2092,6 +2123,23 @@ class ScraplingGrabberGUI:
         user_data_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'debug_profile')
         os.makedirs(user_data_dir, exist_ok=True)
 
+        # 清理上次异常退出留下的会话残留（否则下次启动弹"Chrome未正确关闭/恢复页面"并恢复旧标签）
+        try:
+            for f in ('Last Session', 'Last Tabs', 'Current Session', 'Current Tabs'):
+                p = os.path.join(user_data_dir, f)
+                if os.path.exists(p):
+                    os.remove(p)
+            sess_dir = os.path.join(user_data_dir, 'Default', 'Session')
+            if os.path.exists(sess_dir):
+                shutil.rmtree(sess_dir, ignore_errors=True)
+            # 同步会话文件（Chrome 新版本会话数据可能放这里）
+            snap_dir = os.path.join(user_data_dir, 'Default', 'Snapshots')
+            if os.path.exists(snap_dir):
+                shutil.rmtree(snap_dir, ignore_errors=True)
+            self._log('已清理调试浏览器会话残留（避免恢复旧标签/崩溃提示）')
+        except Exception as e:
+            self._log('清理会话残留失败: %s' % e)
+
         # 获取用户选择的浏览器
         browser_choice = getattr(self, 'browser_choice_var', None)
         choice = browser_choice.get() if browser_choice else 'Chrome'
@@ -2146,6 +2194,7 @@ class ScraplingGrabberGUI:
             '--remote-allow-origins=*',
             '--no-first-run',
             '--no-default-browser-check',
+            '--disable-session-crashed-bubble',
             '--user-data-dir=%s' % user_data_dir,
         ]
 
