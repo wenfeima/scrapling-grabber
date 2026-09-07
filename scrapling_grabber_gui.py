@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.20'
+APP_VERSION = 'v2.12.21'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -154,12 +154,14 @@ class ScraplingGrabberGUI:
         self.root.title('Scrapling 图片爬虫 %s' % APP_VERSION)
         self.root.geometry('900x740')
         self.root.minsize(800, 550)
+        # Windows 上 Tk 最大化后还原失灵的兜底：F11 切换最大化/还原，Esc 强制恢复原尺寸
+        self.root.bind('<F11>', self._toggle_maximize)
+        self.root.bind('<Escape>', self._restore_window)
 
         self.is_running = False
         self.stop_flag = threading.Event()
         self.pause_flag = threading.Event()  # 暂停标志
         self.cfg = load_config()
-
         # AI 过滤状态
         self.ai_proc = None          # llama-server 进程
         self.ai_ok = False           # 服务是否就绪
@@ -1792,6 +1794,22 @@ class ScraplingGrabberGUI:
         # 收藏的网址放在最前面，标记★
         all_urls = ['★ ' + u for u in favorites] + [u for u in history if u not in favorites]
         self.url_combo['values'] = all_urls
+
+    def _toggle_maximize(self, event=None):
+        """F11：切换最大化/还原（Windows 上 Tk 最大化后还原失灵的兜底）"""
+        if self.root.state() == 'zoomed':
+            self.root.state('normal')
+            self.root.geometry('900x740')
+        else:
+            self.root.state('zoomed')
+        return 'break'
+
+    def _restore_window(self, event=None):
+        """Esc：从最大化强制恢复原尺寸"""
+        if self.root.state() == 'zoomed':
+            self.root.state('normal')
+            self.root.geometry('900x740')
+        return 'break'
 
     def _browse_dir(self):
         """浏览保存目录（初始目录=当前值）"""
@@ -3836,6 +3854,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
