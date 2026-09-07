@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.16'
+APP_VERSION = 'v2.12.17'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -1817,14 +1817,6 @@ class ScraplingGrabberGUI:
         ttk.Entry(r2, textvariable=shot_var, width=46, state='readonly').pack(side='left', padx=2)
         ttk.Button(r2, text='打开', width=5, command=self._open_screenshots_dir).pack(side='left')
         ttk.Button(r2, text='清理', width=6, command=self._clear_screenshots_manual).pack(side='left', padx=(4, 0))
-        r1b = ttk.Frame(gen)
-        r1b.pack(fill='x', padx=6, pady=3)
-        ttk.Label(r1b, text='临时截图:').pack(side='left')
-        shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
-        self.shot_dir_var = tk.StringVar(value=shot_dir)
-        ttk.Entry(r1b, textvariable=self.shot_dir_var, width=38, state='readonly').pack(side='left', padx=2)
-        ttk.Button(r1b, text='打开', width=5, command=self._open_shot_dir).pack(side='left', padx=2)
-        ttk.Button(r1b, text='清理', width=6, command=self._clean_shots_now).pack(side='left')
 
         # ===== AI 模型与服务 =====
         ai = ttk.LabelFrame(win, text='AI 模型与服务（本地 Qwen）')
@@ -3808,6 +3800,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
