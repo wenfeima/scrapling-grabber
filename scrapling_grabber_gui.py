@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.11'
+APP_VERSION = 'v2.12.12'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -3089,6 +3089,184 @@ class ScraplingGrabberGUI:
         # 更新任务统计
         self._update_task_stat()
 
+    def _scroll_debug_browser(self, times=3):
+        """CDP 滚动调试浏览器当前活跃标签 N 轮，触发懒加载"""
+        try:
+            import urllib.request as _ur
+            import json as _json
+            import time as _time
+            import websocket as _ws
+            with _ur.urlopen('http://127.0.0.1:9222/json/list', timeout=3) as r:
+                tabs = _json.loads(r.read())
+            pages = [t for t in tabs if t.get('type') == 'page']
+            if not pages:
+                return False
+            active = next((t for t in pages if t.get('active')), pages[0])
+            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=10)
+            n = 0
+            for _round in range(times):
+                n += 1
+                ws.send(_json.dumps({'id': n, 'method': 'Runtime.evaluate',
+                                     'params': {'expression': 'window.scrollTo(0, document.body.scrollHeight)', 'returnByValue': True}}))
+                try:
+                    _json.loads(ws.recv())
+                except Exception:
+                    pass
+                _time.sleep(1.5)
+                n += 1
+                ws.send(_json.dumps({'id': n, 'method': 'Runtime.evaluate',
+                                     'params': {'expression': 'window.scrollTo(0, document.body.scrollHeight/2)', 'returnByValue': True}}))
+                try:
+                    _json.loads(ws.recv())
+                except Exception:
+                    pass
+                _time.sleep(1)
+            ws.close()
+            return True
+        except Exception:
+            return False
+
+    def _fetch_current_tab_html(self):
+        """CDP 取调试浏览器当前活跃标签的 HTML"""
+        try:
+            import urllib.request as _ur
+            import json as _json
+            import websocket as _ws
+            with _ur.urlopen('http://127.0.0.1:9222/json/list', timeout=3) as r:
+                tabs = _json.loads(r.read())
+            pages = [t for t in tabs if t.get('type') == 'page']
+            if not pages:
+                return ''
+            active = next((t for t in pages if t.get('active')), pages[0])
+            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=10)
+            ws.send(_json.dumps({'id': 1, 'method': 'Runtime.evaluate',
+                                 'params': {'expression': 'document.documentElement.outerHTML', 'returnByValue': True}}))
+            resp = _json.loads(ws.recv())
+            ws.close()
+            return resp.get('result', {}).get('result', {}).get('value', '')
+        except Exception:
+            return ''
+
+    def _collect_image_clues(self, html):
+        """收集页面图片相关线索（供AI分析）"""
+        import re as _re
+        if not html:
+            return '无HTML'
+        n_img = len(_re.findall(r'<img\b', html, _re.I))
+        n_data_src = len(_re.findall(r'data-(?:src|original|lazy|real|url|image|pic|file|thumb|preview|large|big|full)\s*=', html, _re.I))
+        n_bg = len(_re.findall(r'background(?:-image)?\s*:\s*url\(', html, _re.I))
+        n_lazy = len(_re.findall(r'(?:loading="lazy"|lazyload|blur|placeholder)', html, _re.I))
+        n_urls = len(_re.findall(r'(?:https?:)?//[^"\']+\.(?:jpg|jpeg|png|webp|gif|avif)', html, _re.I))
+        return ('img标签%d个, data-*图片属性%d处, CSS背景图%d处, 懒加载/占位特征%d处, 页面内图片URL%d个'
+                % (n_img, n_data_src, n_bg, n_lazy, n_urls))
+
+    def _ai_analyze_page_strategy(self, html, img_count, url):
+        """AI 看图 + DOM线索 → 返回调整策略 dict（截图→视觉模型→JSON解析）"""
+        import urllib.request as _ur
+        import json as _json
+        import base64 as _b64
+        import io as _io
+        import re as _re
+        if not (self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)):
+            return None
+        # 1. 截图当前浏览器页面
+        try:
+            with _ur.urlopen('http://127.0.0.1:9222/json/list', timeout=3) as r:
+                tabs = _json.loads(r.read())
+            pages = [t for t in tabs if t.get('type') == 'page']
+            if not pages:
+                return None
+            active = next((t for t in pages if t.get('active')), pages[0])
+            import websocket as _ws
+            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=15)
+            ws.send(_json.dumps({'id': 1, 'method': 'Page.captureScreenshot', 'params': {'format': 'png'}}))
+            resp = _json.loads(ws.recv())
+            ws.close()
+            png_b64 = resp.get('result', {}).get('data')
+            if not png_b64:
+                return None
+            from PIL import Image
+            img = Image.open(_io.BytesIO(_b64.b64decode(png_b64))).convert('RGB')
+            img.thumbnail((1024, 1024))
+            buf = _io.BytesIO()
+            img.save(buf, 'JPEG', quality=85)
+            jpg_b64 = _b64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            return None
+        # 2. DOM 线索
+        clue = self._collect_image_clues(html)
+        # 3. 调视觉模型，要求输出JSON策略
+        question = ('这是爬虫软件要抓图的网站页面截图（目标: %s）。当前规则只提取到 %d 张图片。'
+                    'DOM线索: %s。请判断该页面的图片获取方式，只输出JSON（不要多余文字）：'
+                    '{"has_images": true或false, "strategy": "scroll"或"attr"或"click"或"none", '
+                    '"scroll_times": 数字, "note": "一句话中文说明"}。'
+                    'has_images=页面是否确实有值得下载的图片；strategy: scroll=图片懒加载需继续滚动出现, '
+                    'attr=图片URL藏在data-*等属性或特殊位置, click=需要点击/展开才能看到, none=页面无图或无法获取。'
+                    '若页面截图里能看到大量图片，strategy填scroll并给合理的scroll_times(2-8)。'
+                    % (url[:60], img_count, clue))
+        try:
+            model = _json.loads(_ur.urlopen('http://127.0.0.1:%s/v1/models' % self.ai_port_var.get(), timeout=5).read())['data'][0]['id']
+            body = {'model': model,
+                    'messages': [{'role': 'user', 'content': [
+                        {'type': 'text', 'text': question},
+                        {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + jpg_b64}},
+                    ]}],
+                    'max_tokens': 300, 'temperature': 0.1}
+            req = _ur.Request('http://127.0.0.1:%s/v1/chat/completions' % self.ai_port_var.get(),
+                              data=_json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
+            with _ur.urlopen(req, timeout=240) as r:
+                out = _json.loads(r.read())
+            text = out['choices'][0]['message']['content'].strip()
+        except Exception as e:
+            self._log('AI策略分析调用失败: %s' % e)
+            return None
+        # 4. 解析 JSON（容忍模型输出多余文字）
+        try:
+            m = _re.search(r'\{.*\}', text, _re.S)
+            if m:
+                d = _json.loads(m.group(0))
+                if isinstance(d, dict) and 'strategy' in d:
+                    return d
+        except Exception:
+            pass
+        self._log('AI策略输出无法解析: %s' % text[:100])
+        return None
+
+    def _ai_adjust_extract(self, url, html, img_urls):
+        """AI 看图分析加载方式 → 执行策略（滚动/重新提取）→ 返回调整后的图片列表"""
+        self._log('提取图片过少(%d张)，启动AI看图分析抓取策略...' % len(img_urls))
+        strategy = self._ai_analyze_page_strategy(html, len(img_urls), url)
+        if not strategy:
+            self._log('AI策略分析未返回有效结果，按当前结果继续')
+            return img_urls
+        note = strategy.get('note', '')
+        if note:
+            self._log('AI判断: %s' % note[:120])
+        if strategy.get('has_images') is False:
+            self._log('AI判断页面无可下载图片，停止提取')
+            return []
+        # 执行滚动策略
+        if strategy.get('strategy') == 'scroll':
+            times = int(strategy.get('scroll_times', 3))
+            times = max(1, min(times, 8))
+            self._log('AI策略: 继续滚动 %d 轮触发懒加载' % times)
+            self._scroll_debug_browser(times)
+            new_html = self._fetch_current_tab_html()
+            if new_html and len(new_html) > len(html):
+                html = new_html
+        # 重新提取
+        try:
+            from scrapling import Selector
+            page = Selector(html)
+            new_imgs = self._extract_images_from_page(page, url, html)
+        except Exception:
+            new_imgs = img_urls
+        if len(new_imgs) > len(img_urls):
+            self._log('AI调整后提取到 %d 张图片（原 %d 张）' % (len(new_imgs), len(img_urls)))
+            return new_imgs
+        self._log('AI调整后图片数未增加（%d 张），按当前结果继续' % len(img_urls))
+        return img_urls
+
     def _extract_images_from_page(self, page, url, html):
         """从页面提取图片链接"""
         import re
@@ -3347,6 +3525,11 @@ class ScraplingGrabberGUI:
         img_urls = self._extract_images_from_page(page, url, html)
         self._log('提取到 %d 张图片' % len(img_urls))
 
+        # AI 看图调整策略：提取过少且AI可用时，让AI看页面判断加载方式并重新提取
+        if len(img_urls) < 3 and (self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)) \
+                and self.render_mode_var.get() == '浏览器模式(CDP)':
+            img_urls = self._ai_adjust_extract(url, html, img_urls)
+
         if not img_urls:
             self._log('没有找到图片')
             if task_id:
@@ -3400,6 +3583,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
