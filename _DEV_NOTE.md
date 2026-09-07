@@ -1,6 +1,8 @@
-# Scrapling 图片爬虫 - 开发交接笔记（v2.12.0）
+# Scrapling 图片爬虫 - 开发交接笔记（v2.12.1）
 
-> 2026-09-07 台式机（mawen, 4070 12G）完成 v2.12.0：AI 助手模式（对话里提要求，模型直接操作软件）。
+## v2.12.1 修复（内置浏览器）
+1. **"Chrome 未正确关闭/要恢复页面吗？"**：启动调试浏览器前自动清理 debug_profile 会话残留（Last Session/Last Tabs/Current Session/Current Tabs + Default/Session + Default/Snapshots），启动参数加 `--disable-session-crashed-bubble`，不再弹恢复条、不再恢复一堆旧标签（内嵌和独立窗口两处启动都改了）
+2. **网址带中文尾巴 404**：新增 `_clean_url()`，抓取前自动去掉粘贴带进来的尾部中文（如从对话复制时带的"的图"），日志会提示清理前后的网址；纯 ASCII / 合法中文路径不受影响
 
 ## v2.12.0 新增（AI 助手模式，第一版可用）
 1. **AI 助手模式**：AI 对话页签可直接提要求操作软件，如"帮我抓取这个站""现在什么状态""把保存目录改到 L:/tu"
