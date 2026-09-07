@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.19'
+APP_VERSION = 'v2.12.20'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -517,7 +517,10 @@ class ScraplingGrabberGUI:
         '2. 参数值必须是完整可用的值，例如路径用完整路径，不能省略；\n'
         '3. 工具执行后你会收到 [工具结果]，根据结果给用户简短中文回复；\n'
         '4. 不需要调用工具时直接正常回复用户；\n'
-        '5. 只调用上面列出的工具，不要输出其他格式。'
+        '5. 只调用上面列出的工具，不要输出其他格式；\n'
+        '6. 你是软件内置助手，用户打开软件就是为了抓图。用户说"下载/抓取/下这个页面的图/大图/所有图/怎么下"就是要用软件抓图，'
+        '直接调用 start_crawl 或 ai_adjust_crawl 执行；'
+        '禁止教用户用浏览器开发者工具、安装下载插件、截图裁剪等外部方法（软件自身就能完成抓取）。'
     )
 
     @staticmethod
@@ -956,32 +959,63 @@ class ScraplingGrabberGUI:
         self._ai_log_chat('req', '[已添加截图] 浏览器截图已就绪，输入问题后点「发送」即可让AI看图回答\n（截图已保存: %s）' % path)
 
     def _ai_vision_chat(self, user_text, jpg_b64, shot_path):
-        """带截图的一次性视觉对话：截图+问题 → 模型看图回答（不进工具模式，识别结果进历史便于追问）"""
+        """带截图对话：截图+问题 → 模型看图回答，可调用工具（如 ai_adjust_crawl 调整抓取策略）"""
         import requests
         self._ai_log_chat('req', '[截图识别] %s\n（截图: %s）' % (user_text, shot_path))
         try:
             port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
+            ctx = int(self.ai_chat_ctx_var.get() or 12)
+        except Exception:
+            port = AI_DEFAULT_PORT
+            ctx = 12
+        try:
             model = requests.get('http://127.0.0.1:%d/v1/models' % port, timeout=5).json()['data'][0]['id']
-            r = requests.post(
-                'http://127.0.0.1:%d/v1/chat/completions' % port,
-                json={'model': model,
-                      'messages': [{'role': 'user', 'content': [
-                          {'type': 'text', 'text': user_text},
-                          {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + jpg_b64}},
-                      ]}],
-                      'max_tokens': 1024, 'temperature': 0.3},
-                timeout=300)
-            if r.status_code == 200:
+        except Exception:
+            model = None
+        sys_msg = (self.AI_TOOL_DESC +
+                   '\n注意：当前对话已附加一张浏览器截图（你可以看图）。'
+                   '用户想让软件抓取/下载图片或调整抓取策略时，必须调用工具执行，不要教用户手动操作。')
+        messages = [{'role': 'system', 'content': sys_msg},
+                    {'role': 'user', 'content': [
+                        {'type': 'text', 'text': user_text},
+                        {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + jpg_b64}},
+                    ]}]
+        final = ''
+        last_fail = None   # 连续失败保护
+        for _ in range(5):
+            try:
+                body = {'messages': messages, 'max_tokens': 1024, 'temperature': 0.3}
+                if model:
+                    body['model'] = model
+                r = requests.post('http://127.0.0.1:%d/v1/chat/completions' % port,
+                                  json=body, timeout=300)
+                if r.status_code != 200:
+                    final = '(HTTP %d)' % r.status_code
+                    break
                 content = (r.json()['choices'][0]['message'].get('content') or '').strip()
-                self._ai_log_chat('resp', content or '(空回复)')
-                # 识别结果进历史，便于后续文本追问
-                self._ai_chat_history.append({'role': 'user',
-                                              'content': user_text + '（基于浏览器截图，截图已保存: %s）' % shot_path})
-                self._ai_chat_history.append({'role': 'assistant', 'content': content})
-            else:
-                self._ai_log_chat('resp', '(HTTP %d)' % r.status_code)
-        except Exception as e:
-            self._ai_log_chat('resp', '(调用失败: %s)' % e)
+            except Exception as e:
+                final = '(调用失败: %s)' % e
+                break
+            tc = self._ai_parse_tool_call(content)
+            if not tc:
+                final = content
+                break
+            name, args = tc
+            self._ai_log_chat('tool', '[工具调用] %s %s' % (name, json.dumps(args, ensure_ascii=False)))
+            ok, result = self._ai_execute_tool(name, args)
+            self._ai_log_chat('tool', '[工具结果] %s' % result)
+            if not ok and last_fail == (name, result):
+                final = '工具 %s 连续执行失败（%s），已停止尝试，请向用户说明情况并请其确认参数。' % (name, result)
+                break
+            last_fail = (name, result) if not ok else None
+            messages.append({'role': 'assistant', 'content': content})
+            messages.append({'role': 'user', 'content': '[工具结果] %s' % result})
+        if final:
+            self._ai_log_chat('resp', final or '(空回复)')
+            # 识别结果进历史，便于后续文本追问
+            self._ai_chat_history.append({'role': 'user',
+                                          'content': user_text + '（基于浏览器截图，截图已保存: %s）' % shot_path})
+            self._ai_chat_history.append({'role': 'assistant', 'content': final})
 
     def _ai_chat_send(self):
         """AI 对话（助手模式）：发送用户消息，模型可调用工具操作软件；若已添加截图则走看图识别"""
@@ -3802,6 +3836,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
