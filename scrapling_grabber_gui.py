@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.7'
+APP_VERSION = 'v2.12.8'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -2449,8 +2449,10 @@ class ScraplingGrabberGUI:
             MoveWindow(found_hwnd, 0, 0, width, height, True)
             # 延迟多次执行抖动调整，修复嵌入后图标/图层不绘制的问题
             self.root.after(150, lambda: self._resize_browser(jitter=True))
-            self.root.after(500, lambda: self._resize_browser(jitter=True))
-            self.root.after(1500, lambda: self._resize_browser(jitter=True))
+            self.root.after(600, lambda: self._resize_browser(jitter=True))
+            self.root.after(1800, lambda: self._resize_browser(jitter=True))
+            # 嵌入完成后自动刷新页面一次，强制完整重绘（图标/快捷方式必出）
+            self.root.after(2500, self._browser_reload_once)
 
             self._log('浏览器已嵌入到「浏览器」页签')
             self.browser_hint.pack_forget()  # 隐藏提示标签
@@ -2475,13 +2477,34 @@ class ScraplingGrabberGUI:
                 if width > 0 and height > 0:
                     MoveWindow(self.browser_hwnd, 0, 0, width, height, True)
                     if jitter:
-                        # 先移小1px再恢复：制造真实WM_SIZE变化，强制Chrome重新布局（修复嵌入后图标/图层不绘制）
-                        MoveWindow(self.browser_hwnd, 0, 0, width, max(1, height - 1), True)
-                        MoveWindow(self.browser_hwnd, 0, 0, width, height, True)
+                        # 先明显缩小60px（真实尺寸变化），延迟后再恢复——等效"拖动窗口"，强制Chrome重排渲染
+                        MoveWindow(self.browser_hwnd, 0, 0, width, max(1, height - 60), True)
+                        self.root.after(120, lambda: MoveWindow(self.browser_hwnd, 0, 0, width, height, True))
                     # 强制立即重绘
                     RedrawWindow(self.browser_hwnd, None, None, 0x0001 | 0x0100)  # RDW_INVALIDATE | RDW_UPDATENOW
             except Exception:
                 pass
+
+    def _browser_reload_once(self):
+        """嵌入后自动刷新调试浏览器页面一次，强制完整重绘（修复图标/快捷方式不显示）"""
+        try:
+            import urllib.request as _ur
+            import json as _json
+            import websocket as _ws
+            with _ur.urlopen('http://127.0.0.1:9222/json/list', timeout=3) as r:
+                tabs = _json.loads(r.read())
+            page = next((t for t in tabs if t.get('type') == 'page'), None)
+            if page:
+                ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % page['id'], timeout=10)
+                ws.send(_json.dumps({'id': 1, 'method': 'Page.reload', 'params': {'ignoreCache': True}}))
+                try:
+                    ws.recv()
+                except Exception:
+                    pass
+                ws.close()
+                self._log('已自动刷新嵌入的浏览器页面（强制完整重绘）')
+        except Exception:
+            pass
 
     def _on_browser_resize(self, event):
         """浏览器宿主窗口大小变化时调整浏览器窗口"""
@@ -3275,6 +3298,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
