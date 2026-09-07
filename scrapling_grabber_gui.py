@@ -36,7 +36,7 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.2'
+APP_VERSION = 'v2.12.3'
 
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
@@ -499,11 +499,13 @@ class ScraplingGrabberGUI:
         '  [工具:get_settings {}]\n'
         '  [工具:open_save_dir {}]\n'
         '  [工具:get_browser_info {}]\n'
+        '  [工具:get_browser_view {"prompt":"关于页面你想问什么，可选"}]\n'
         '工具使用场景：\n'
         '- 用户想抓取/下载某个页面或网站的图片（如"抓取这个页面""这个站""这个页面图片抓取""下载图片"）→ 用 start_crawl；用户消息里可能只有网址没有"抓取"两个字，那也是在请求抓取\n'
         '- 用户问抓取进度/状态/剩多少 → 用 get_status\n'
         '- 用户问保存目录/配置/当前设置 → 用 get_settings\n'
         '- 用户问浏览器当前打开了什么页面/几张图/页面状态（如"浏览器上有几张图""现在看的是什么页"）→ 用 get_browser_info\n'
+        '- 用户想让你看页面内容/画面（如"看看这个页面""这个站怎么样""页面上有什么""帮我看看现在这页"）→ 用 get_browser_view，会截屏并用视觉模型理解页面\n'
         '- 用户明确要求设置过滤（开启/关闭智能过滤、最小图片大小KB）→ 才用 set_filter，否则不要调用它\n'
         '规则：\n'
         '1. start_crawl 的 url 可以省略：用户说"这个页面/这个站/当前页"或之前已经给过网址时，直接调用 start_crawl（url 可传空 {}），执行器会自动用当前网址；只有完全不知道网址时才先问用户；\n'
@@ -678,6 +680,8 @@ class ScraplingGrabberGUI:
                 if info is None:
                     return True, '调试浏览器未运行（9222端口无响应），请先在"浏览器模式"下启动调试浏览器'
                 return True, info
+            if name == 'get_browser_view':
+                return self._ai_browser_view(str(args.get('prompt') or '').strip())
             return False, '未知工具: %s' % name
         except Exception as e:
             return False, '工具执行出错: %s' % e
@@ -721,6 +725,70 @@ class ScraplingGrabberGUI:
         else:
             lines.append('当前页: %s' % active.get('url', ''))
         return '\n'.join(lines)
+
+    def _ai_browser_view(self, prompt=''):
+        """截取调试浏览器当前页截图 → 视觉模型理解 → 返回描述（get_browser_view 工具）"""
+        import urllib.request as _ur
+        import json as _json
+        import base64 as _b64
+        import io as _io
+        import time as _time
+        try:
+            with _ur.urlopen('http://127.0.0.1:9222/json/list', timeout=3) as r:
+                tabs = _json.loads(r.read())
+        except Exception:
+            return False, '调试浏览器未运行（9222端口无响应），请先在"浏览器模式"下启动调试浏览器'
+        pages = [t for t in tabs if t.get('type') == 'page']
+        if not pages:
+            return False, '调试浏览器没有打开的网页'
+        active = next((t for t in pages if t.get('active')), pages[0])
+        # 1. CDP 截屏
+        try:
+            import websocket as _ws
+            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=15)
+            ws.send(_json.dumps({'id': 1, 'method': 'Page.captureScreenshot',
+                                 'params': {'format': 'png', 'captureBeyondViewport': False}}))
+            resp = _json.loads(ws.recv())
+            ws.close()
+            png_b64 = resp.get('result', {}).get('data')
+            if not png_b64:
+                return False, '截图失败：%s' % resp.get('error', {}).get('message', '未知错误')
+        except Exception as e:
+            return False, '截图失败: %s' % e
+        # 2. 缩放压缩（控制视觉 token）
+        try:
+            from PIL import Image
+            img = Image.open(_io.BytesIO(_b64.b64decode(png_b64))).convert('RGB')
+            img.thumbnail((1024, 1024))
+            buf = _io.BytesIO()
+            img.save(buf, 'JPEG', quality=85)
+            jpg_b64 = _b64.b64encode(buf.getvalue()).decode()
+            shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
+            os.makedirs(shot_dir, exist_ok=True)
+            shot_path = os.path.join(shot_dir, 'view_%s.jpg' % _time.strftime('%Y%m%d_%H%M%S'))
+            with open(shot_path, 'wb') as f:
+                f.write(buf.getvalue())
+        except Exception as e:
+            return False, '图片处理失败: %s' % e
+        # 3. 视觉模型理解
+        question = prompt or '简要描述这个网页页面的内容和布局：是什么网站、页面上有什么主要内容'
+        body = {'model': _json.loads(_ur.urlopen('http://127.0.0.1:%s/v1/models' % self.ai_port_var.get(), timeout=5).read())['data'][0]['id'],
+                'messages': [{'role': 'user', 'content': [
+                    {'type': 'text', 'text': question},
+                    {'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + jpg_b64}},
+                ]}],
+                'max_tokens': 600}
+        try:
+            req = _ur.Request('http://127.0.0.1:%s/v1/chat/completions' % self.ai_port_var.get(),
+                              data=_json.dumps(body).encode(),
+                              headers={'Content-Type': 'application/json'})
+            with _ur.urlopen(req, timeout=240) as r:
+                out = _json.loads(r.read())
+            desc = out['choices'][0]['message']['content'].strip()
+        except Exception as e:
+            return False, '视觉模型调用失败: %s' % e
+        result = '已截取浏览器当前页(%s)并查看：\n%s\n（截图已保存: %s）' % (active.get('url', '')[:60], desc[:800], shot_path)
+        return True, result
 
     def _ai_tool_status(self):
         """任务状态统计（供 get_status 工具）"""
@@ -3186,3 +3254,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
