@@ -36,7 +36,8 @@ BROWSER_HEADERS = {
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v2.12.27'
+APP_VERSION = 'v3.0.0'
+APP_NAME = '全能网页助手'
 
 
 def ver_gt(a, b):
@@ -68,9 +69,9 @@ AI_PROVIDERS = {
 }
 # 模型预设：名称 -> (主模型, 视觉模型)
 AI_MODEL_PRESETS = {
-    '内置4B（6G显存）': (
-        r'L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-4B-Q4_K_M.gguf',
-        r'L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-4B-mmproj-BF16.gguf',
+    '内置4B（无审查·6G显存）': (
+        r'L:\ComfyUI\ComfyUI\models\LLM\Q35-4B-U-HauhauCS\Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf',
+        r'L:\ComfyUI\ComfyUI\models\LLM\Q35-4B-U-HauhauCS\mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf',
     ),
     '内置9B（12G显存）': (
         r'L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf',
@@ -175,7 +176,7 @@ class ScraplingGrabberGUI:
 
     def __init__(self, root):
         self.root = root
-        self.root.title('Scrapling 图片爬虫 %s' % APP_VERSION)
+        self.root.title('%s %s' % (APP_NAME, APP_VERSION))
         self.root.geometry('900x740')
         self.root.minsize(800, 550)
         # Windows 上 Tk 最大化后还原失灵的兜底：F11 切换最大化/还原，Esc 强制恢复原尺寸
@@ -199,8 +200,10 @@ class ScraplingGrabberGUI:
         self._load_settings()
         # 窗口关闭时保存设置
         self.root.protocol('WM_DELETE_WINDOW', self._on_closing)
+        # 新开软件自动清理残留 llama-server（上次异常退出/手动启动留下的常驻进程）
+        self.root.after(1200, self._kill_stale_llama)
         # 显示内核版本信息
-        self._log('Scrapling 图片爬虫 %s' % APP_VERSION)
+        self._log('%s %s' % (APP_NAME, APP_VERSION))
         self._log('Python 版本: %s' % sys.version.split()[0])
         try:
             import scrapling
@@ -234,7 +237,7 @@ class ScraplingGrabberGUI:
         """从配置文件恢复上次的设置"""
         self.url_var.set(self.cfg.get('url', ''))
         default_dir = os.path.join(os.getcwd(), 'downloads')
-        self.dir_var.set(self.cfg.get('save_dir') or default_dir)
+        self.dir_var.set(os.path.normpath(self.cfg.get('save_dir') or default_dir))
         self.threads_var.set(self.cfg.get('threads', 8))
         self.timeout_var.set(self.cfg.get('timeout', 15))
         self.smart_filter_var.set(self.cfg.get('smart_filter', True))
@@ -243,10 +246,14 @@ class ScraplingGrabberGUI:
         self.grab_mode_var.set(self.cfg.get('grab_mode', '单页'))
         self.post_range_var.set(self.cfg.get('post_range', '20'))
         self.min_size_var.set(self.cfg.get('min_size', 0))
+        if hasattr(self, 'convert_webp_var'):
+            self.convert_webp_var.set(self.cfg.get('convert_webp', False))
+            self.convert_avif_var.set(self.cfg.get('convert_avif', False))
+            self.jpg_quality_var.set(self.cfg.get('jpg_quality', 90))
         # AI 过滤设置（旧预设名自动回退到新默认）
-        preset = self.cfg.get('ai_preset', '内置4B（6G显存）')
+        preset = self.cfg.get('ai_preset', '内置4B（无审查·6G显存）')
         if preset not in AI_MODEL_PRESETS:
-            preset = '内置4B（6G显存）'
+            preset = '内置4B（无审查·6G显存）'
         self.ai_filter_var.set(self.cfg.get('ai_filter', False))
         self.ai_prompt_var.set(self.cfg.get('ai_prompt', False))
         self.ai_auto_stop_var.set(self.cfg.get('ai_auto_stop', False))
@@ -283,7 +290,7 @@ class ScraplingGrabberGUI:
         self._save_provider_state()
         self.cfg.update({
             'url': self.url_var.get().strip(),
-            'save_dir': self.dir_var.get().strip(),
+            'save_dir': os.path.normpath(self.dir_var.get().strip()),
             'threads': self.threads_var.get(),
             'timeout': self.timeout_var.get(),
             'smart_filter': self.smart_filter_var.get(),
@@ -292,6 +299,9 @@ class ScraplingGrabberGUI:
             'grab_mode': self.grab_mode_var.get(),
             'post_range': self.post_range_var.get(),
             'min_size': self.min_size_var.get(),
+            'convert_webp': self.convert_webp_var.get(),
+            'convert_avif': self.convert_avif_var.get(),
+            'jpg_quality': self.jpg_quality_var.get(),
             # AI 过滤设置
             'ai_filter': self.ai_filter_var.get(),
             'ai_prompt': self.ai_prompt_var.get(),
@@ -334,7 +344,17 @@ class ScraplingGrabberGUI:
         path = filedialog.askopenfilename(title='选择文件', initialdir=init,
                                           filetypes=[('模型/程序', '*.gguf *.exe'), ('所有文件', '*.*')])
         if path:
-            getattr(self, var_name).set(path)
+            getattr(self, var_name).set(os.path.normpath(path))
+            # 选完主模型/视觉模块后，实时提示配对情况
+            try:
+                m = self.ai_model_var.get().strip()
+                v = self.ai_mmproj_var.get().strip()
+                if m and v and os.path.exists(m) and os.path.exists(v):
+                    bad = self._ai_check_model_match(m, v)
+                    if bad:
+                        self._log('提示: 主模型与视觉模块可能不匹配 - %s' % '；'.join(bad))
+            except Exception:
+                pass
 
     def _ai_update_status(self, text, color='#888'):
         if self.ai_status_var is not None:
@@ -350,10 +370,35 @@ class ScraplingGrabberGUI:
         else:
             self._start_ai_server()
 
+    def _ai_check_model_match(self, model_path, mmproj_path):
+        """校验主模型与视觉模块(mmproj)是否配对；返回问题描述列表（空=匹配）"""
+        try:
+            m = os.path.basename(model_path).lower()
+            v = os.path.basename(mmproj_path).lower()
+        except Exception:
+            return []
+        problems = []
+        # 参数量对齐：4B/9B 等
+        for tag in ('4b', '9b', '14b', '32b'):
+            if tag in m and tag not in v:
+                problems.append('主模型是 %s，但视觉模块名里没有 %s' % (tag.upper(), tag.upper()))
+                break
+        # 无审查/特殊版本标识对齐
+        for tag in ('uncensored', 'hauhaucs', 'aggressive'):
+            if (tag in m) != (tag in v):
+                problems.append('主模型%s「%s」标识，视觉模块%s（可能配错模型组）' % (
+                    '带' if tag in m else '不带', tag.upper(),
+                    '也带' if tag in m else '没有'))
+        return problems
+
     def _start_ai_server(self):
         """启动/连接 AI 服务：local=拉起llama-server；ollama=检查本机Ollama；api=测试云端连通"""
         if self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None):
             return
+        try:
+            self._save_settings()  # 点启动即记住当前设置，不用再点保存按钮
+        except Exception:
+            pass
         mode = self.ai_mode_var.get()
         if mode == 'api':
             base = self.ai_api_base_var.get().strip()
@@ -421,13 +466,22 @@ class ScraplingGrabberGUI:
             self._log('AI服务: 模型文件不存在，请检查主模型/视觉模块路径')
             self._ai_update_status('模型文件不存在')
             return
+        mism = self._ai_check_model_match(model, mmproj)
+        if mism:
+            warn = ('主模型与视觉模块可能不匹配：\n'
+                    + '\n'.join('· ' + s for s in mism)
+                    + '\n\n配错会导致看图失败或模型加载报错。仍要强行启动吗？')
+            if not messagebox.askyesno('模型不匹配警告', warn, parent=self.root):
+                self._log('AI服务: 用户取消（模型不匹配）')
+                self._ai_update_status('已取消')
+                return
         try:
             port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
         except Exception:
             port = AI_DEFAULT_PORT
         args = [server, '-m', model, '--mmproj', mmproj,
                 '-ngl', '999', '-c', '8192', '--parallel', '1',
-                '--image-min-tokens', '1024', '--cache-ram', '0',
+                '--image-min-tokens', '256', '--cache-ram', '0',
                 '--reasoning', 'off',
                 '--host', '127.0.0.1', '--port', str(port)]
         try:
@@ -441,42 +495,64 @@ class ScraplingGrabberGUI:
         self._log('AI服务: 正在启动（加载模型约10秒）...')
         self._ai_update_status('启动中...')
         self._ai_state = '启动中'
+        self._ai_fail_reason = ''
         threading.Thread(target=self._ai_wait_ready, args=(port,), daemon=True).start()
         self.root.after(500, self._ai_poll_status)
 
     def _ai_wait_ready(self, port):
         """工作线程：轮询服务就绪状态（只写普通属性，不碰 tkinter）"""
-        import requests
+        try:
+            import requests
+        except Exception as ex:
+            self._ai_state = '启动失败'
+            self._ai_fail_reason = '缺少 requests 模块: %s' % ex
+            return
         for _ in range(90):
             time.sleep(1)
             if self.ai_proc is None or self.ai_proc.poll() is not None:
                 self._ai_state = '启动失败'
+                self._ai_fail_reason = 'llama-server 进程退出'
                 return
             try:
                 r = requests.get('http://127.0.0.1:%d/health' % port, timeout=2)
                 if r.status_code == 200:
                     self.ai_ok = True
                     self._ai_state = '运行中'
+                    self._ai_fail_reason = ''
                     return
             except Exception:
                 pass
         self._ai_state = '启动超时'
+        self._ai_fail_reason = '90秒内未就绪'
 
     def _ai_poll_status(self):
         """主线程轮询：把工作线程的 _ai_state 更新到界面"""
         if self._ai_state == '启动中':
             self.root.after(500, self._ai_poll_status)
             return
+        reason = getattr(self, '_ai_fail_reason', '')
         if self._ai_state == '启动失败':
-            self._log('AI服务: 启动失败（进程退出）')
+            self._log('AI服务: 启动失败%s' % ('（%s）' % reason if reason else '（进程退出）'))
         elif self._ai_state == '启动超时':
             self._log('AI服务: 启动超时，请检查模型文件是否损坏或端口被占用')
         elif self._ai_state == '运行中':
             self._log('AI服务: 已就绪')
         self._ai_update_status(self._ai_state)
 
+    def _kill_stale_llama(self):
+        """软件启动时清理残留 llama-server 进程（避免后台常驻占内存/占端口）"""
+        try:
+            import subprocess
+            r = subprocess.run(['taskkill', '/F', '/IM', 'llama-server.exe'],
+                               timeout=10, capture_output=True, text=True)
+            out = (r.stdout or '').strip()
+            if 'SUCCESS' in out:
+                self._log('已自动清理残留 AI 服务进程（llama-server），如需使用 AI 请点「启动AI服务」')
+        except Exception as e:
+            self._log('清理残留 AI 服务进程失败: %s' % e)
+
     def _stop_ai_server(self):
-        """停止 AI 服务"""
+        """停止 AI 服务（含所有残留 llama-server，避免后台常驻占内存）"""
         if self.ai_proc:
             try:
                 self.ai_proc.terminate()
@@ -486,6 +562,12 @@ class ScraplingGrabberGUI:
                 self.ai_proc.kill()
             except Exception:
                 pass
+        # 兜底：清掉所有 llama-server 残留进程（防止历史会话/异常退出留下的常驻）
+        try:
+            subprocess.run(['taskkill', '/F', '/IM', 'llama-server.exe'],
+                           timeout=10, capture_output=True)
+        except Exception:
+            pass
         self.ai_proc = None
         self.ai_ok = False
         self._ai_state = '已停止'
@@ -618,38 +700,60 @@ class ScraplingGrabberGUI:
         except Exception:
             pass
 
-    def _ai_paste_shot(self):
-        """「粘贴」：读取剪贴板里的图片（如 Win+Shift+S 系统截图）加入对话"""
+    def _ai_clipboard_image(self):
+        """读取剪贴板图片（豆包选区/Win+Shift+S 等截图工具）→ (b64, path) 或 None"""
         try:
             from PIL import ImageGrab
             import io
             import base64
             img = ImageGrab.grabclipboard()
-            if not isinstance(img, object) or not hasattr(img, 'save'):
-                self._log('粘贴截图失败：剪贴板里没有图片（先用 Win+Shift+S 或任意截图工具截图）')
-                return
+            if img is None or isinstance(img, list) or not hasattr(img, 'save'):
+                return None
             img = img.convert('RGB')
-            img.thumbnail((1280, 1280))
+            img.thumbnail((768, 768))
             buf = io.BytesIO()
             img.save(buf, 'JPEG', quality=85)
             b64 = base64.b64encode(buf.getvalue()).decode()
             shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
             os.makedirs(shot_dir, exist_ok=True)
-            shot_path = os.path.join(shot_dir, 'paste_%s.jpg' % time.strftime('%Y%m%d_%H%M%S'))
+            shot_path = os.path.join(shot_dir, 'clip_%s.jpg' % time.strftime('%Y%m%d_%H%M%S'))
             with open(shot_path, 'wb') as f:
                 f.write(buf.getvalue())
             self._clean_screenshots(200)
-            self._ai_pending_image = {'b64': b64, 'path': shot_path}
+            return b64, shot_path
+        except Exception:
+            return None
+
+    def _ai_on_ctrl_v(self, entry):
+        """AI输入框 Ctrl+V：剪贴板有图优先加图；无图正常粘贴文本"""
+        shot = self._ai_clipboard_image()
+        if shot:
+            b64, path = shot
+            self._ai_pending_image = {'b64': b64, 'path': path}
             self._ai_log_chat('req', '[已添加截图] 剪贴板截图已就绪，输入问题后点「发送」即可让AI看图回答')
-            self._ai_show_shot_in_chat(shot_path)
-        except Exception as e:
-            self._log('粘贴截图失败: %s' % e)
+            self._ai_show_shot_in_chat(path)
+            return 'break'
+        try:
+            entry.event_generate('<<Paste>>')
+        except Exception:
+            pass
+        return 'break'
+
+    def _ai_paste_shot(self):
+        """「粘贴」：读取剪贴板里的图片（如豆包选区/Win+Shift+S 截图）加入对话"""
+        shot = self._ai_clipboard_image()
+        if not shot:
+            self._log('粘贴截图失败：剪贴板里没有图片（先用豆包选区或 Win+Shift+S 截图）')
+            return
+        b64, path = shot
+        self._ai_pending_image = {'b64': b64, 'path': path}
+        self._ai_log_chat('req', '[已添加截图] 剪贴板截图已就绪，输入问题后点「发送」即可让AI看图回答')
+        self._ai_show_shot_in_chat(path)
 
     def _ai_region_shot(self):
         """「选区」：全屏遮罩 + 鼠标框选区域截图加入对话"""
         try:
             from PIL import ImageGrab, Image, ImageTk
-            import ctypes
             hides = []
             for w in (getattr(self, 'ai_float_win', None), self.root):
                 try:
@@ -668,15 +772,15 @@ class ScraplingGrabberGUI:
                 except Exception:
                     pass
             wpx, hpx = full.size
-            scale = 1.0
-            try:
-                scale = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
-            except Exception:
-                pass
-            tw = max(1, int(wpx / scale))
-            th = max(1, int(hpx / scale))
-            canvas_img = full.copy()
-            canvas_img.thumbnail((tw, th))
+            # 用 Tk 逻辑屏幕尺寸换算（自动含 DPI，比系统 API 可靠）
+            tw = max(1, self.root.winfo_screenwidth())
+            th = max(1, self.root.winfo_screenheight())
+            if wpx == tw and hpx == th:
+                scale_x = scale_y = 1.0
+            else:
+                scale_x = wpx / float(tw)
+                scale_y = hpx / float(th)
+            canvas_img = full.copy().resize((tw, th), Image.LANCZOS)
             mask = tk.Toplevel(self.root)
             mask.overrideredirect(True)
             mask.attributes('-topmost', True)
@@ -710,9 +814,11 @@ class ScraplingGrabberGUI:
                 if x2 - x1 < 10 or y2 - y1 < 10:
                     self._log('选区截图已取消（区域太小）')
                     return
-                px1, py1 = int(x1 * scale), int(y1 * scale)
-                px2, py2 = int(x2 * scale), int(y2 * scale)
+                px1, py1 = int(x1 * scale_x), int(y1 * scale_y)
+                px2, py2 = int(x2 * scale_x), int(y2 * scale_y)
                 crop = full.crop((px1, py1, px2, py2))
+                self._log('选区: 屏幕%d x %d 遮罩%d x %d 裁剪(%d,%d)-(%d,%d) -> %d x %d'
+                          % (wpx, hpx, tw, th, px1, py1, px2, py2, crop.size[0], crop.size[1]))
                 import io
                 import base64
                 buf = io.BytesIO()
@@ -757,7 +863,7 @@ class ScraplingGrabberGUI:
 
     # ===== AI 助手模式：工具调用 =====
     AI_TOOL_DESC = (
-        '你是「Scrapling 图片爬虫」的AI助手，能通过调用工具帮用户完成抓取操作。\n'
+        '你是「%s」的AI助手，能通过调用工具帮用户完成网页抓取、浏览器操作、游戏数值修改等任务。\n' % APP_NAME +
         '可用工具（严格用这个格式输出，一次只调用一个，参数必须带上）：\n'
         '  [工具:start_crawl {"url":"https://www.example.com/", "mode":"全站", "threads":8}]\n'
         '  [工具:stop_crawl {}]\n'
@@ -774,6 +880,9 @@ class ScraplingGrabberGUI:
         '  [工具:get_browser_view {"prompt":"关于页面你想问什么，可选"}]\n'
         '  [工具:ai_adjust_crawl {"url":"目标页面网址，可选，默认浏览器当前页"}]\n'
         '  [工具:run_js {"code":"要执行的JavaScript代码"}]\n'
+        '  [工具:ec_scan {"value":984, "first":true}]\n'
+        '  [工具:ec_set {"path":["cc","director","getScene()","节点名","属性名"],"value":999999}]\n'
+        '  [工具:ec_lock {"path":["..."],"value":999999,"enable":true}]\n'
         '工具使用场景：\n'
         '- 用户想抓取/下载某个页面或网站的图片（如"抓取这个页面""这个站""这个页面图片抓取""下载图片"）→ 用 start_crawl；用户消息里可能只有网址没有"抓取"两个字，那也是在请求抓取\n'
         '- 用户问抓取进度/状态/剩多少 → 用 get_status\n'
@@ -781,10 +890,15 @@ class ScraplingGrabberGUI:
         '- 用户问浏览器当前打开了什么页面/几张图/页面状态（如"浏览器上有几张图""现在看的是什么页"）→ 用 get_browser_info\n'
         '- 用户想让你看页面内容/画面（如"看看这个页面""这个站怎么样""页面上有什么""帮我看看现在这页"）→ 用 get_browser_view，会截屏并用视觉模型理解页面\n'
         '- 用户说页面明明有图但抓取不到/抓不到图片/提取太少/帮我调整抓取策略/怎么才能抓到（如"这个页面有图抓不到""帮我调整抓取策略""图片怎么抓不下来"）→ 用 ai_adjust_crawl，会自动截图分析页面图片加载方式（懒加载/属性/点击），滚动触发并重新提取，返回图片数量变化\n'
-        '- 用户想在当前网页执行JS/修改网页游戏数值/调用页面函数（如"把金币改成999999""修改血量""把得分改成100000""执行这段代码"）→ 用 run_js，先 get_browser_info 或 get_browser_view 了解页面，再注入JS修改\n'
-        '- 用户明确要求设置过滤（开启/关闭智能过滤、最小图片大小KB）→ 才用 set_filter，否则不要调用它\n'
+        '- 用户要求修改网页游戏里的数值/数据（如"把984改成999999""把金币改成999999""修改步数/血量/得分/剩余次数"）→ 用 ec_scan 定位变量，再用 ec_set 修改；不要用 run_js 改 DOM！\n'
+        '网页游戏数值修改（EC模式）专规：\n'
+        '1. 这类网页游戏（Canvas 渲染，Cocos Creator/Phaser/Unity-WebGL/自定义引擎都可能，且常嵌在 iframe 里）没有 DOM 文本节点，画面上的"剩余步数:984"是画布绘制出来的，document.querySelector / innerText / textContent 全部无效，禁止使用；\n'
+        '2. 定位：不要判断游戏是什么引擎——直接 ec_scan {"value":用户要改的当前值,"first":true}，工具会自动进入同源iframe、自动识别 cc/game/Phaser/PIXI/THREE 等引擎挂载点、并递归 window，返回变量路径列表；如果无匹配，告诉用户可输入当前显示的数值再试，或等待游戏数值变化后再调 ec_scan 缩小范围；\n'
+        '3. 修改：取 ec_scan 返回的 path 调 ec_set 赋新值；然后 ec_scan {"value":新值,"first":false} 验证是否生效；\n'
+        '4. 锁定：想让数值一直保持（游戏会自动扣减），用 ec_lock enable=true；取消用 enable=false；\n'
+        '5. 你要自己完成定位→修改→验证整个流程，不要问用户"变量路径是什么"；只有 ec_scan 确实无匹配时才询问用户当前数值或等待用户操作游戏后再再次扫描。\n'
         '规则：\n'
-        '1. start_crawl 的 url 可以省略：用户说"这个页面/这个站/当前页"或之前已经给过网址时，直接调用 start_crawl（url 可传空 {}），执行器会自动用当前网址；只有完全不知道网址时才先问用户；\n'
+        '1. start_crawl 的 url 可以省略：用户说"这个页面/这个站/当前页/内置浏览器里的页面/抓正在看的图"时，直接调用 start_crawl（url 传空 {}），执行器会自动用主界面网址栏、或内置浏览器当前打开的页面地址，不需要反问用户网址是什么；只有执行器明确回复"找不到网址"时才问用户；\n'
         '2. 参数值必须是完整可用的值，例如路径用完整路径，不能省略；\n'
         '3. 工具执行后你会收到 [工具结果]，根据结果给用户简短中文回复；\n'
         '4. 不需要调用工具时直接正常回复用户；\n'
@@ -833,6 +947,58 @@ class ScraplingGrabberGUI:
         m = _re.search(r'[A-Za-z]:[\\/][^\s，。；;""\']+', text)
         return m.group(0) if m else ''
 
+    def _cdp_current_url(self):
+        """读内置调试浏览器当前活跃标签页 URL；没开/无页面返回 ''"""
+        try:
+            import requests as _r
+            tabs = _r.get('http://127.0.0.1:9222/json/list', timeout=3).json()
+            pages = [t for t in tabs if t.get('type') == 'page' and t.get('url', '').startswith('http')]
+            if not pages:
+                return ''
+            active = next((t for t in pages if t.get('active')), pages[0])
+            return active.get('url', '') or ''
+        except Exception:
+            return ''
+
+    def _cdp_download_image(self, img_url, filepath):
+        """在浏览器页面里 fetch 图片（带浏览器代理/登录态/Cookie），base64 写文件。成功返回 True"""
+        import json as _json, base64 as _b64
+        try:
+            import requests as _rq
+            tabs = _rq.get('http://127.0.0.1:9222/json/list', timeout=3).json()
+            pages = [t for t in tabs if t.get('type') == 'page' and t.get('url', '').startswith('http')]
+            if not pages:
+                return False
+            import websocket as _ws
+            ws = _ws.create_connection(pages[0]['webSocketDebuggerUrl'], timeout=90)
+            fetch_js = """
+            (async () => {
+              try {
+                const r = await fetch(%r, {credentials:'include'});
+                if(!r.ok) return 'HTTP'+r.status;
+                const buf = await r.arrayBuffer();
+                let bin=''; const bytes=new Uint8Array(buf);
+                for(let i=0;i<bytes.length;i++) bin+=String.fromCharCode(bytes[i]);
+                return btoa(bin);
+              } catch(e){ return 'ERR:'+e.message; }
+            })()
+            """ % img_url
+            ws.send(_json.dumps({'id': 1, 'method': 'Runtime.evaluate', 'params': {'expression': fetch_js, 'awaitPromise': True, 'returnByValue': True}}))
+            while True:
+                msg = _json.loads(ws.recv())
+                if msg.get('id') == 1:
+                    break
+            ws.close()
+            val = msg.get('result', {}).get('result', {}).get('value', '')
+            if not val or val.startswith('ERR') or val.startswith('HTTP'):
+                return False
+            raw = _b64.b64decode(val)
+            with open(filepath, 'wb') as f:
+                f.write(raw)
+            return True
+        except Exception:
+            return False
+
     def _ai_execute_tool(self, name, args):
         """执行工具调用，返回 (ok, 结果文本)"""
         try:
@@ -841,9 +1007,11 @@ class ScraplingGrabberGUI:
                 if not url:
                     url = self._ai_extract_url(self._ai_last_user_text())  # 参数兜底1：从用户消息提取
                 if not url:
-                    url = self.url_var.get().strip()  # 参数兜底2：用当前网址（用户说"这个页面"时）
+                    url = self.url_var.get().strip()  # 参数兜底2：主界面网址栏
                 if not url:
-                    return False, '缺少网址参数 url，请重新调用 [工具:start_crawl {"url":"https://www.example.com/"}]，或先询问用户网址'
+                    url = self._cdp_current_url()  # 兜底3：读内置调试浏览器当前活跃页
+                if not url:
+                    return False, '缺少网址：主界面网址栏为空，内置浏览器(9222)也没有打开的页面。请先在内置浏览器打开目标页，或直接给我网址'
                 if self.is_running:
                     return False, '当前已有抓取任务在运行，请先停止或等待完成'
                 save_dir = str(args.get('save_dir') or '').strip() or self.dir_var.get().strip()
@@ -867,7 +1035,7 @@ class ScraplingGrabberGUI:
                                 threads = None
                 self.url_var.set(url)
                 if save_dir:
-                    self.dir_var.set(save_dir)
+                    self.dir_var.set(os.path.normpath(save_dir))
                 if mode in ('单页', '全站'):
                     self.grab_mode_var.set(mode)
                 if threads is not None:
@@ -968,6 +1136,59 @@ class ScraplingGrabberGUI:
                 if not code:
                     return False, '缺少 code 参数，请重新调用 [工具:run_js {"code":"document.title"}]'
                 return self._ai_execute_js(code)
+            if name == 'ec_scan':
+                # 游戏数值定位：首次=引擎对象树搜值；再次=按上次路径过滤
+                try:
+                    value = float(args.get('value'))
+                except Exception:
+                    return False, 'value 参数必须是数值，如 [工具:ec_scan {"value":984,"first":true}]'
+                first = bool(args.get('first', True))
+                if not first and not self.ec_scan_state:
+                    return False, '还没有首次扫描结果，请先调用 ec_scan {"value":984,"first":true} 定位变量'
+                hits = self._ai_ec_scan(value, None if first else self.ec_scan_state)
+                if hits is None:
+                    return False, '调试浏览器未运行（9222端口无响应），请先启动浏览器模式'
+                self.ec_scan_state = [s for s, v in hits]
+                self._ec_save_state()
+                if not hits:
+                    return True, 'EC扫描完成：值 %s 无匹配（已遍历Cocos场景树/引擎对象/window，number与string都搜了）' % value
+                lines = ['EC扫描命中 %d 个（值 %s）：' % (len(hits), value)]
+                for s, v in hits[:20]:
+                    lines.append('  %s = %s' % ('.'.join(s), v))
+                if len(hits) > 20:
+                    lines.append('  ... 共 %d 个，可用 ec_set 按 path 修改' % len(hits))
+                else:
+                    lines.append('用 ec_set 按上面的 path 修改，例如 path 取第一行')
+                return True, '\n'.join(lines)
+            if name == 'ec_set':
+                path = args.get('path')
+                if not isinstance(path, list) or not path:
+                    return False, 'path 必须是变量路径数组，如 [工具:ec_set {"path":["cc","director","getScene()","node","label"],"value":999999}]'
+                try:
+                    value = float(args.get('value'))
+                except Exception:
+                    return False, 'value 必须是数值'
+                ok, text = self._ai_ec_edit(path, value)
+                if not ok:
+                    return False, '修改失败: %s' % text
+                return True, '已把 %s 修改为 %s，可用 ec_scan {"value":%s,"first":false} 验证' % ('.'.join(path), value, value)
+            if name == 'ec_lock':
+                path = args.get('path')
+                if not isinstance(path, list) or not path:
+                    return False, 'path 必须是变量路径数组'
+                try:
+                    value = float(args.get('value'))
+                except Exception:
+                    value = None
+                enable = bool(args.get('enable', True))
+                if enable and value is None:
+                    return False, 'enable=true 时 value 必填'
+                if value is None:
+                    value = 0
+                ok, text = self._ai_ec_lock(path, value, enable)
+                if ok:
+                    return True, '已%s：%s 锁定为 %s（每200ms重写一次）' % ('锁定' if enable else '解锁', '.'.join(path), value)
+                return False, '锁定操作失败: %s' % text
             return False, '未知工具: %s' % name
         except Exception as e:
             return False, '工具执行出错: %s' % e
@@ -1199,7 +1420,7 @@ class ScraplingGrabberGUI:
                 return None
             from PIL import Image
             img = Image.open(_io.BytesIO(_b64.b64decode(png_b64))).convert('RGB')
-            img.thumbnail((1024, 1024))
+            img.thumbnail((768, 768))
             buf = _io.BytesIO()
             img.save(buf, 'JPEG', quality=85)
             b64 = _b64.b64encode(buf.getvalue()).decode()
@@ -1276,42 +1497,56 @@ class ScraplingGrabberGUI:
 
     # ===== EC 模式：网页游戏数值搜索/过滤/修改/锁定 =====
     def _ai_ec_scan(self, value, prev_segs=None):
-        """EC模式扫描：首次=引擎专项(Cocos场景树)→window变量；再次=按上次路径过滤。
-        返回 [(segs列表, 当前值)]；segs 段为字符串键，特殊段 'name()' 表示调用方法"""
+        """EC模式扫描：首次=iframe(若有)+多引擎(Cocos场景树/Phaser/全局game)→window；再次=按上次路径过滤。
+        返回 [(segs列表, 当前值)]；segs 段为字符串键，特殊段 'name()' 表示调用方法，'frameN' 表示第N个iframe"""
         import json as _json
         import websocket as _ws
         prev = _json.dumps(prev_segs or [])
         resolve = ('function __r(seg){var cur=window;'
                    'for(var j=1;j<seg.length;j++){var k=seg[j];'
-                   'if(typeof k==="string"&&k.slice(-2)==="()"){cur=cur[k.slice(0,-2)]();}'
+                   'if(k==="frame0"){cur=window;}'
+                   'else if(typeof k==="string"&&k.slice(0,5)==="frame"){cur=window.frames[parseInt(k.slice(5),10)];}'
+                   'else if(typeof k==="string"&&k.slice(-2)==="()"){cur=cur[k.slice(0,-2)]();}'
                    'else{cur=cur[k];}}return cur;}')
         if prev_segs:
-            # 过滤模式：只对上次命中的路径重新取值判断
-            js = ('(function(){var target=%(v)s;var prev=%(p)s;var out=[];'
+            # 过滤模式：只对上次命中的路径重新取值判断（number/string 都支持）
+            js = ('(function(){var target=%(v)s;var tstr=String(target);var prev=%(p)s;var out=[];'
                   'for(var i=0;i<prev.length;i++){try{'
                   'var seg=prev[i];var cur=__r(seg);'
-                  'if(typeof cur==="number"&&cur===target){out.push({s:seg,v:cur});}'
+                  'if((typeof cur==="number"&&cur===target)||(typeof cur==="string"&&cur===tstr)){out.push({s:seg,v:cur});}'
                   '}catch(e){}}return out.slice(0,500);})()'
                   % {'v': repr(value), 'p': prev})
         else:
-            # 首次扫描：Cocos引擎场景树(深15)→cc对象树(深12)→window(深6)
-            js = ('(function(){var target=%(v)s;var hits=[];var seen=[];'
+            # 首次扫描：先枚举同源iframe（webview壳游戏常嵌iframe），
+            # 每个frame扫 Cocos场景树(深18)→cc/game对象树(深14)→window(深8)，number/string都搜
+            js = ('(function(){var target=%(v)s;var tstr=String(target);var hits=[];var seen=[];'
                   'function __push(seg,v){if(hits.length<500)hits.push({s:seg,v:v});}'
                   'function __walk(o,p,d,lim){'
                   'if(d>lim||o===null||hits.length>=500)return;var t=typeof o;'
                   'if(t==="number"){if(o===target)__push(p,o);return;}'
+                  'if(t==="string"){if(o===tstr)__push(p,o);return;}'
                   'if(t!=="object")return;if(seen.indexOf(o)>=0)return;seen.push(o);'
                   'var ks=[];try{ks=Object.keys(o);}catch(e){return;}'
                   'for(var i=0;i<ks.length;i++){try{var k=ks[i];var v=o[k];'
-                  'if(typeof v==="number"&&v===target){__push(p.concat([k]),v);}'
+                  'if(typeof v==="number"){if(v===target)__push(p.concat([k]),v);}'
+                  'else if(typeof v==="string"){if(v===tstr)__push(p.concat([k]),v);}'
                   'else if(typeof v==="object"&&v!==null){__walk(v,p.concat([k]),d+1,lim);}'
                   '}catch(e){}}}'
-                  'try{var CC=window.cc||window.CocosEngine;'
+                  'function __scanFrame(f,prefix){'
+                  'try{var CC=f.cc||f.CocosEngine;'
                   'if(CC&&CC.director){var sc=CC.director.getScene();'
-                  'if(sc){__walk(sc,["cc","director","getScene()"],0,15);}'
-                  'if(hits.length===0){__walk(CC,["cc"],0,12);}'
+                  'if(sc){__walk(sc,prefix.concat(["cc","director","getScene()"]),0,18);}'
+                  'if(hits.length===0){__walk(CC,prefix.concat(["cc"]),0,14);}'
                   '}}catch(e){}'
-                  'if(hits.length===0){__walk(window,["window"],0,6);}'
+                  'if(hits.length===0){try{var G=f.game||f.Game||f.Phaser||f.PIXI||f.THREE;'
+                  'if(G){__walk(G,prefix.concat(["game"]),0,14);}}catch(e){}}'
+                  'if(hits.length===0){try{__walk(f,prefix.concat(["window"]),0,8);}catch(e){}}'
+                  '}'
+                  'var frames=[window];'
+                  'try{var fs=document.querySelectorAll("iframe");'
+                  'for(var i=0;i<fs.length&&i<8;i++){try{frames.push(fs[i].contentWindow);}catch(e){}}}catch(e){}'
+                  'for(var i=0;i<frames.length;i++){try{__scanFrame(frames[i],["frame"+i]);}catch(e){}'
+                  'if(hits.length>0)break;}'
                   'return hits.slice(0,500);})()' % {'v': repr(value)})
         try:
             pages = _json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json/list', timeout=5).read())
@@ -1332,12 +1567,15 @@ class ScraplingGrabberGUI:
             return None
 
     def _ec_assign_expr(self, segs, value):
-        """生成给路径赋值的 JS 表达式（支持调用段 k()；末段为调用则不可赋值）"""
+        """生成给路径赋值的 JS 表达式（支持调用段 k() 与 iframe 段 frameN；末段为调用则不可赋值）"""
         import json as _json
         segj = _json.dumps(segs)
         return ('(function(){var seg=%s;var cur=window;'
                 'for(var j=1;j<seg.length-1;j++){var k=seg[j];'
-                'cur=(typeof k==="string"&&k.slice(-2)==="()")?cur[k.slice(0,-2)]():cur[k];}'
+                'if(k==="frame0"){cur=window;}'
+                'else if(typeof k==="string"&&k.slice(0,5)==="frame"){cur=window.frames[parseInt(k.slice(5),10)];}'
+                'else if(typeof k==="string"&&k.slice(-2)==="()"){cur=cur[k.slice(0,-2)]();}'
+                'else{cur=cur[k];}}'
                 'var last=seg[seg.length-1];'
                 'if(typeof last==="string"&&last.slice(-2)==="()"){return null;}'
                 'cur[last]=%s;return cur[last];})()'
@@ -1347,15 +1585,21 @@ class ScraplingGrabberGUI:
         """EC模式修改：把变量路径（支持调用段）赋新值"""
         return self._ai_execute_js(self._ec_assign_expr(segs, value), timeout=8)
 
-    def _ai_ec_lock(self, segs, value, enable):
-        """EC模式锁定：定时把变量重写为目标值（enable=False 取消）"""
+    def _ai_ec_lock(self, segs, value, enable, lock_key=None):
+        """EC模式锁定：定时把变量重写为目标值（50ms高频，抗游戏每帧覆盖）。
+        支持多数据独立锁定：lock_key 唯一标识一个锁，互不干扰（enable=False 只停该锁）"""
         expr = self._ec_assign_expr(segs, value)
+        if lock_key is None:
+            lock_key = '.'.join(str(s) for s in segs)
         if enable:
-            js = ('window.__ecLock&&clearInterval(window.__ecLock);'
-                  'window.__ecLock=setInterval(function(){try{%(e)s;}catch(e1){}},200);'
-                  'window.__ecLock;' % {'e': expr})
+            js = ('window.__ecLocks=window.__ecLocks||{};'
+                  'if(window.__ecLocks[%r]){clearInterval(window.__ecLocks[%r]);}'
+                  'window.__ecLocks[%r]=setInterval(function(){try{%s;}catch(e1){}},50);'
+                  'true;' % (lock_key, lock_key, lock_key, expr))
         else:
-            js = 'window.__ecLock&&(clearInterval(window.__ecLock),window.__ecLock=null);true;'
+            js = ('window.__ecLocks=window.__ecLocks||{};'
+                  'if(window.__ecLocks[%r]){clearInterval(window.__ecLocks[%r]);delete window.__ecLocks[%r];}'
+                  'true;' % (lock_key, lock_key, lock_key))
         return self._ai_execute_js(js, timeout=8)
 
     def _ai_ec_reload(self, segs):
@@ -1364,12 +1608,14 @@ class ScraplingGrabberGUI:
         import websocket as _ws
         resolve = ('function __r(seg){var cur=window;'
                    'for(var j=1;j<seg.length;j++){var k=seg[j];'
-                   'if(typeof k==="string"&&k.slice(-2)==="()"){cur=cur[k.slice(0,-2)]();}'
+                   'if(k==="frame0"){cur=window;}'
+                   'else if(typeof k==="string"&&k.slice(0,5)==="frame"){cur=window.frames[parseInt(k.slice(5),10)];}'
+                   'else if(typeof k==="string"&&k.slice(-2)==="()"){cur=cur[k.slice(0,-2)]();}'
                    'else{cur=cur[k];}}return cur;}')
         js = ('(function(){var prev=%(p)s;var out=[];'
               'for(var i=0;i<prev.length;i++){try{'
               'var seg=prev[i];var cur=__r(seg);'
-              'if(typeof cur==="number"){out.push({s:seg,v:cur});}'
+              'if(typeof cur==="number"||typeof cur==="string"){out.push({s:seg,v:cur});}'
               '}catch(e){}}return out.slice(0,500);})()'
               % {'p': _json.dumps(segs)})
         try:
@@ -1391,17 +1637,20 @@ class ScraplingGrabberGUI:
             return None
 
     def _ai_add_shot(self):
-        """「截图给AI」：优先截调试浏览器当前页；未开浏览器则截全屏"""
+        """「截图给AI」：剪贴板有图优先用剪贴板（豆包选区/Win+Shift+S）；否则截调试浏览器当前页；都没有则全屏"""
         if not (self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)):
             self._log('AI对话: AI服务未运行，请先点击「启动AI服务」')
             return
-        shot = self._ai_capture_shot()
-        src = '浏览器'
+        shot = self._ai_clipboard_image()
+        src = '剪贴板'
+        if not shot:
+            shot = self._ai_capture_shot()
+            src = '浏览器'
         if not shot:
             shot = self._ai_capture_fullscreen()
             src = '全屏'
         if not shot:
-            self._log('截图给AI失败：浏览器未运行且全屏截图失败')
+            self._log('截图给AI失败：剪贴板无图、浏览器未运行且全屏截图失败')
             return
         b64, path = shot
         self._ai_pending_image = {'b64': b64, 'path': path}
@@ -1448,7 +1697,7 @@ class ScraplingGrabberGUI:
             finally:
                 if hide:
                     self.ai_float_win.deiconify()
-            img.thumbnail((1280, 1280))
+            img.thumbnail((768, 768))
             buf = io.BytesIO()
             img.save(buf, 'JPEG', quality=85)
             b64 = base64.b64encode(buf.getvalue()).decode()
@@ -1800,6 +2049,12 @@ class ScraplingGrabberGUI:
                 self.ai_proc.kill()
             except Exception:
                 pass
+        # 兜底：清掉所有 llama-server 残留（防止历史会话/异常退出留下的常驻进程）
+        try:
+            subprocess.run(['taskkill', '/F', '/IM', 'llama-server.exe'],
+                           timeout=10, capture_output=True)
+        except Exception:
+            pass
         self.root.destroy()
 
     def _create_widgets(self):
@@ -1857,6 +2112,7 @@ class ScraplingGrabberGUI:
         self.ai_chat_input = ttk.Entry(ai_input_frame)
         self.ai_chat_input.pack(side='top', fill='x')
         self.ai_chat_input.bind('<Return>', lambda e: self._ai_chat_send())
+        self.ai_chat_input.bind('<Control-v>', lambda e: self._ai_on_ctrl_v(self.ai_chat_input))
         ai_btn_row = ttk.Frame(ai_input_frame)
         ai_btn_row.pack(side='top', fill='x', pady=(3, 0))
         ttk.Button(ai_btn_row, text='截图给AI', width=8, command=self._ai_add_shot).pack(side='left', padx=(0, 4))
@@ -1908,6 +2164,9 @@ class ScraplingGrabberGUI:
         # 磁吸窗按钮（放在保存目录行右侧空白）
         ttk.Button(dir_frame, text='AI对话', width=10, command=self._toggle_ai_float_window).pack(side='left', padx=(10, 4))
         ttk.Button(dir_frame, text='游戏修改', width=10, command=self._toggle_game_mod_window).pack(side='left')
+        # 预约抢购辅助：资料库 + 一键自动填写（工行/农行纪念币预约等表单）
+        ttk.Button(dir_frame, text='预约资料', width=8, command=self._open_appt_window).pack(side='left', padx=(10, 2))
+        ttk.Button(dir_frame, text='自动填写', width=8, command=self._appt_fill).pack(side='left')
 
         # 选项行
         opt_frame = ttk.Frame(top_frame)
@@ -1966,6 +2225,22 @@ class ScraplingGrabberGUI:
         self.ai_toggle_btn.pack(side='left', padx=6)
         self.ai_status_var = tk.StringVar(value=self._ai_state)
         ttk.Label(ai_opt, textvariable=self.ai_status_var, foreground='#888').pack(side='left')
+
+        # 格式转换行：下载时 WEBP/AVIF 自动转 JPG（可选）
+        conv_opt = ttk.Frame(top_frame)
+        conv_opt.pack(fill='x', pady=1)
+        self.convert_webp_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(conv_opt, text='WEBP转JPG', variable=self.convert_webp_var).pack(side='left')
+        self.convert_avif_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(conv_opt, text='AVIF转JPG', variable=self.convert_avif_var).pack(side='left', padx=(8, 0))
+        ttk.Label(conv_opt, text='JPG品质(1-100):').pack(side='left', padx=(10, 2))
+        self.jpg_quality_var = tk.IntVar(value=90)
+        ttk.Spinbox(conv_opt, from_=1, to=100, textvariable=self.jpg_quality_var, width=4).pack(side='left')
+        self.auto_page_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(conv_opt, text='自动翻页抓全部(N.html)', variable=self.auto_page_var).pack(side='left', padx=(12, 0))
+        ttk.Label(conv_opt, text='最多页:').pack(side='left', padx=(8, 2))
+        self.auto_page_max_var = tk.IntVar(value=100)
+        ttk.Spinbox(conv_opt, from_=2, to=999, textvariable=self.auto_page_max_var, width=5).pack(side='left')
 
         # AI 模型/服务路径变量（控件在设置窗口）
         self.ai_model_var = tk.StringVar()
@@ -2374,6 +2649,117 @@ class ScraplingGrabberGUI:
 
         self._log('未找到 Chrome 或 Edge 浏览器')
 
+    def _open_appt_window(self):
+        """预约资料库窗口：姓名/身份证/手机/地址/数量，保存后供「自动填写」使用"""
+        import tkinter.ttk as _ttk
+        import tkinter.messagebox as _mb
+        if getattr(self, 'appt_win', None) is not None and self.appt_win.winfo_exists():
+            self.appt_win.lift()
+            self.appt_win.focus_set()
+            return
+        win = tk.Toplevel(self.root)
+        self.appt_win = win
+        win.title('预约资料库')
+        win.geometry('300x250+20+20')
+        win.resizable(False, False)
+
+        prof = dict(self.cfg.get('appt_profile') or {})
+        fields = [
+            ('name', '姓名', 18),
+            ('idcard', '身份证号', 18),
+            ('mobile', '手机号', 18),
+            ('address', '地址', 22),
+            ('count', '预约数量', 6),
+        ]
+        self.appt_vars = {}
+        body = ttk.Frame(win)
+        body.pack(fill='both', expand=True, padx=10, pady=8)
+        for key, label, w in fields:
+            row = ttk.Frame(body)
+            row.pack(fill='x', pady=2)
+            ttk.Label(row, text=label, width=8).pack(side='left')
+            var = tk.StringVar(value=str(prof.get(key, '')))
+            self.appt_vars[key] = var
+            ttk.Entry(row, textvariable=var, width=w).pack(side='left', fill='x', expand=True)
+
+        btns = ttk.Frame(win)
+        btns.pack(fill='x', padx=10, pady=(0, 8))
+
+        def _save():
+            new = {k: v.get().strip() for k, v in self.appt_vars.items()}
+            self.cfg['appt_profile'] = new
+            save_config(self.cfg)
+            self._log('预约资料已保存')
+            _mb.showinfo('提示', '预约资料已保存', parent=win)
+
+        def _fill_cur():
+            _save()
+            self._appt_fill()
+
+        ttk.Button(btns, text='保存', width=6, command=_save).pack(side='left')
+        ttk.Button(btns, text='保存并填写当前页', width=13, command=_fill_cur).pack(side='left', padx=4)
+        ttk.Label(btns, text='（填写功能需浏览器模式已启动）', foreground='#888').pack(side='left')
+
+    def _appt_fill(self):
+        """用预约资料自动填写当前浏览器页面的表单（工行/农行等预约页）"""
+        prof = dict(self.cfg.get('appt_profile') or {})
+        if not prof.get('name') or not prof.get('idcard'):
+            import tkinter.messagebox as _mb
+            _mb.showwarning('提示', '请先在「预约资料」里填好姓名和身份证号')
+            return
+        import json as _json
+        P = {k: v for k, v in prof.items()}
+        js = r'''(function(){
+          var P=%(P)s;
+          var filled=[];
+          function setField(els, value, kws, tag){
+            if(!value)return;
+            for(var i=0;i<els.length;i++){
+              var el=els[i];
+              if(el.disabled||el.readOnly)continue;
+              var ph=String(el.placeholder||'').toLowerCase();
+              var nm=String(el.name||el.id||'').toLowerCase();
+              var ok=false;
+              for(var j=0;j<kws.length;j++){if(ph.indexOf(kws[j])>=0||nm.indexOf(kws[j])>=0){ok=true;break;}}
+              if(!ok)continue;
+              try{
+                var proto=el.tagName==='TEXTAREA'?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;
+                var setter=Object.getOwnPropertyDescriptor(proto,'value').set;
+                setter.call(el, value);
+              }catch(e){el.value=value;}
+              el.dispatchEvent(new Event('input',{bubbles:true}));
+              el.dispatchEvent(new Event('change',{bubbles:true}));
+              el.dispatchEvent(new Event('blur',{bubbles:true}));
+              filled.push(tag+':'+(nm||ph));
+              break;
+            }
+          }
+          var els=Array.prototype.slice.call(document.querySelectorAll('input,textarea'));
+          setField(els, P.name,    ['xingming','username','recvname','customer','姓名'], '姓名');
+          setField(els, P.idcard,  ['idcard','idno','id_no','sfz','certno','certno','certificate','credential','身份证','证件','idnumber','id_number'], '身份证');
+          setField(els, P.mobile,  ['mobile','mobilephone','phone','tel','contact','手机','电话','mobilephone'], '手机');
+          setField(els, P.address, ['address','addr','detailaddr','recvaddr','收货','地址'], '地址');
+          setField(els, P.count,   ['quantity','count','num','amount','数量'], '数量');
+          return filled;
+        })()''' % {'P': _json.dumps(P, ensure_ascii=False)}
+        try:
+            ok, text = self._ai_execute_js(js, timeout=8)
+        except Exception as e:
+            self._log('自动填写失败: %s' % e)
+            return
+        filled = []
+        if ok and text.startswith('执行成功'):
+            import json as _json2
+            try:
+                val = _json2.loads(text[len('执行成功: '):])
+                if isinstance(val, list):
+                    filled = val
+            except Exception:
+                pass
+        self._log('自动填写完成，已填 %d 项: %s' % (len(filled), '、'.join(filled) if filled else '无'))
+        if not filled:
+            self._log('提示: 未匹配到可填字段，可能页面未打开或字段命名特殊，可开AI对话让AI帮填')
+
     def _favorite_url(self):
         """收藏当前网址"""
         url = self.url_var.get().strip()
@@ -2422,7 +2808,7 @@ class ScraplingGrabberGUI:
         init = cur if cur and os.path.isdir(cur) else None
         directory = filedialog.askdirectory(title='选择保存目录', initialdir=init)
         if directory:
-            self.dir_var.set(directory)
+            self.dir_var.set(os.path.normpath(directory))
 
     def _open_screenshots_dir(self):
         """打开临时截图目录"""
@@ -2471,14 +2857,14 @@ class ScraplingGrabberGUI:
         r1 = ttk.Frame(gen)
         r1.pack(fill='x', padx=6, pady=3)
         ttk.Label(r1, text='保存目录:').pack(side='left')
-        ttk.Entry(r1, textvariable=self.dir_var, width=48).pack(side='left', padx=2)
+        ttk.Entry(r1, textvariable=self.dir_var, width=60).pack(side='left', padx=2)
         ttk.Button(r1, text='浏览', width=5, command=self._browse_dir).pack(side='left')
         r2 = ttk.Frame(gen)
         r2.pack(fill='x', padx=6, pady=3)
         ttk.Label(r2, text='临时截图:').pack(side='left')
         shot_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'screenshots')
         self.shot_dir_var = tk.StringVar(value=shot_dir)
-        ttk.Entry(r2, textvariable=self.shot_dir_var, width=46, state='readonly').pack(side='left', padx=2)
+        ttk.Entry(r2, textvariable=self.shot_dir_var, width=58, state='readonly').pack(side='left', padx=2)
         ttk.Button(r2, text='打开', width=5, command=self._open_screenshots_dir).pack(side='left')
         ttk.Button(r2, text='清理', width=6, command=self._clear_screenshots_manual).pack(side='left', padx=(4, 0))
 
@@ -2499,17 +2885,17 @@ class ScraplingGrabberGUI:
         r4 = ttk.Frame(self.ai_local_frame)
         r4.pack(fill='x', pady=2)
         ttk.Label(r4, text='主模型:').pack(side='left')
-        ttk.Entry(r4, textvariable=self.ai_model_var, width=44).pack(side='left', padx=2)
+        ttk.Entry(r4, textvariable=self.ai_model_var, width=60).pack(side='left', padx=2)
         ttk.Button(r4, text='浏览', width=5, command=lambda: self._browse_ai_file('ai_model_var')).pack(side='left')
         r5 = ttk.Frame(self.ai_local_frame)
         r5.pack(fill='x', pady=2)
         ttk.Label(r5, text='视觉模块:').pack(side='left')
-        ttk.Entry(r5, textvariable=self.ai_mmproj_var, width=44).pack(side='left', padx=2)
+        ttk.Entry(r5, textvariable=self.ai_mmproj_var, width=60).pack(side='left', padx=2)
         ttk.Button(r5, text='浏览', width=5, command=lambda: self._browse_ai_file('ai_mmproj_var')).pack(side='left')
         r6 = ttk.Frame(self.ai_local_frame)
         r6.pack(fill='x', pady=2)
         ttk.Label(r6, text='服务程序:').pack(side='left')
-        ttk.Entry(r6, textvariable=self.ai_server_var, width=50).pack(side='left', padx=2)
+        ttk.Entry(r6, textvariable=self.ai_server_var, width=62).pack(side='left', padx=2)
         ttk.Button(r6, text='浏览', width=5, command=lambda: self._browse_ai_file('ai_server_var')).pack(side='left')
 
         # Ollama 配置组（模型名 + 端口）
@@ -2935,7 +3321,7 @@ class ScraplingGrabberGUI:
         import shutil
         import time
         base = os.path.dirname(src)
-        exe_name = 'Scrapling图片爬虫_GUI_%s.exe' % APP_VERSION
+        exe_name = '%s_GUI_%s.exe' % (APP_NAME, APP_VERSION)
         dist_exe = os.path.join(base, 'dist', exe_name)
 
         def upd(text):
@@ -2955,7 +3341,7 @@ class ScraplingGrabberGUI:
                 return
             # 2. 杀旧进程（避免 exe 占用）
             subprocess.run(['powershell', '-Command',
-                            "Get-Process -Name '*Scrapling*' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"],
+                            "Get-Process -Name '*%s*' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue" % APP_NAME],
                            cwd=base, timeout=30)
             time.sleep(2)
             # 3. 重新打包
@@ -2970,7 +3356,8 @@ class ScraplingGrabberGUI:
             # 4. 覆盖 L 盘存档
             upd('更新中(3/3)：同步L盘存档...')
             try:
-                l_dst = r'L:\工作流\小工具\Scrapling图片爬虫\v2.12.27'
+                l_dst = r'L:\工作流\小工具\%s\v3.0.0' % APP_NAME
+                os.makedirs(l_dst, exist_ok=True)
                 if os.path.isdir(l_dst):
                     shutil.copy2(dist_exe, os.path.join(l_dst, exe_name))
                     shutil.copy2(src, os.path.join(l_dst, 'scrapling_grabber_gui.py'))
@@ -3012,6 +3399,8 @@ class ScraplingGrabberGUI:
     def _on_root_configure(self, e):
         """主窗口移动/缩放：贴合状态的修改器/AI窗实时跟随（用winfo查询，不依赖e.x_root——Windows上它为0）"""
         try:
+            if self.root.state() != 'normal':
+                return  # 主窗口最小化/隐藏时不动子窗口，让修改器/AI窗独立留在桌面
             if (getattr(self, 'game_win', None) and self.game_win.winfo_exists()
                     and self.game_win.state() == 'normal' and getattr(self, '_ec_docked', False)):
                 cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
@@ -3030,18 +3419,21 @@ class ScraplingGrabberGUI:
     def _poll_game_snap(self):
         """轮询兜底：Configure未触发时（如拖动中），贴合状态的窗口也跟随"""
         try:
-            if (getattr(self, 'game_win', None) and self.game_win.winfo_exists()
-                    and self.game_win.state() == 'normal' and getattr(self, '_ec_docked', False)):
-                cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
-                if cur != getattr(self, '_last_root_pos_game', None):
-                    self._last_root_pos_game = cur
-                    self._snap_game_win()
-            if (getattr(self, 'ai_float_win', None) and self.ai_float_win.winfo_exists()
-                    and self.ai_float_win.state() == 'normal' and getattr(self, '_ai_float_docked', False)):
-                cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
-                if cur != getattr(self, '_last_root_pos_ai', None):
-                    self._last_root_pos_ai = cur
-                    self._snap_ai_float_win()
+            if self.root.state() != 'normal':
+                pass  # 主窗口最小化时保持子窗口独立，不跟随
+            else:
+                if (getattr(self, 'game_win', None) and self.game_win.winfo_exists()
+                        and self.game_win.state() == 'normal' and getattr(self, '_ec_docked', False)):
+                    cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
+                    if cur != getattr(self, '_last_root_pos_game', None):
+                        self._last_root_pos_game = cur
+                        self._snap_game_win()
+                if (getattr(self, 'ai_float_win', None) and self.ai_float_win.winfo_exists()
+                        and self.ai_float_win.state() == 'normal' and getattr(self, '_ai_float_docked', False)):
+                    cur = (self.root.winfo_x(), self.root.winfo_y(), self.root.winfo_width())
+                    if cur != getattr(self, '_last_root_pos_ai', None):
+                        self._last_root_pos_ai = cur
+                        self._snap_ai_float_win()
         except Exception:
             pass
         self.root.after(150, self._poll_game_snap)
@@ -3056,10 +3448,11 @@ class ScraplingGrabberGUI:
         self.game_win = win
         win.title('游戏数值修改')
         win.geometry('320x600+0+0')
-        win.transient(self.root)
+        # 不用 transient：Windows 下 transient 子窗口会跟随主窗口一起最小化/隐藏，
+        # 主窗口最小化后修改器窗要能独立留在桌面
 
         self.ec_scan_state = None   # 上次命中路径列表 [(segs,...)]
-        self.ec_lock_info = None    # (segs, value) 当前锁定项
+        self.ec_locks = []          # 当前锁定项列表 [{'segs','value','key'}]
         self._ec_docked = False     # 是否贴合主窗口（拖走变False，松手靠近吸回）
         import tkinter.ttk as _ttk
         import tkinter.messagebox as _mb
@@ -3078,17 +3471,46 @@ class ScraplingGrabberGUI:
         self.ec_count_var = tk.StringVar(value='尚未扫描')
         ttk.Label(top2, textvariable=self.ec_count_var, foreground='#888').pack(side='left', padx=8)
 
-        mid = ttk.Frame(win)
-        mid.pack(fill='both', expand=True, padx=6)
+        # 上/下可拖拽分栏（PanedWindow，默认对半分）
+        pane = ttk.PanedWindow(win, orient='vertical')
+        pane.pack(fill='both', expand=True, padx=6, pady=(4, 0))
+
+        # 上半区：搜索结果列表
+        mid = ttk.Frame(pane)
         cols = ('path', 'value')
-        self.ec_tree = ttk.Treeview(mid, columns=cols, show='headings', height=15)
+        self.ec_tree = ttk.Treeview(mid, columns=cols, show='headings', height=12)
         self.ec_tree.heading('path', text='变量路径')
         self.ec_tree.heading('value', text='当前值')
         self.ec_tree.column('path', width=210)
         self.ec_tree.column('value', width=70, anchor='center')
         self.ec_tree.pack(fill='both', expand=True)
-        self.ec_tree.bind('<Double-1>', lambda e: self._ec_edit_selected())
+        self.ec_tree.bind('<Double-1>', lambda e: self._ec_add_lock_from_selected())
+        pane.add(mid, weight=1)
 
+        # 下半区：锁定条目列表（CE 风格：#0列图片勾选框/路径/锁定值，点勾选框切换启用暂停）
+        lock_frame = ttk.LabelFrame(pane, text='锁定条目（点启用列切换启用/暂停）')
+        lcols = ('path', 'value')
+        self.ec_lock_tree = ttk.Treeview(lock_frame, columns=lcols, show='tree headings', height=5)
+        self.ec_lock_tree.heading('#0', text='启用')
+        self.ec_lock_tree.heading('path', text='变量路径')
+        self.ec_lock_tree.heading('value', text='锁定值')
+        self.ec_lock_tree.column('#0', width=46, anchor='center')
+        self.ec_lock_tree.column('path', width=180)
+        self.ec_lock_tree.column('value', width=70, anchor='center')
+        self.ec_lock_tree.pack(fill='both', expand=True)
+        self.ec_lock_tree.bind('<Button-1>', self._ec_toggle_lock_click)
+        self.ec_lock_tree.bind('<Double-1>', self._ec_edit_lock_value)
+        lbtns = ttk.Frame(lock_frame)
+        lbtns.pack(fill='x', side='bottom', pady=(2, 2))
+        ttk.Button(lbtns, text='解锁选中', width=7, command=self._ec_unlock_selected).pack(side='left', padx=1)
+        ttk.Button(lbtns, text='改值', width=5, command=self._ec_edit_lock_btn).pack(side='left', padx=1)
+        ttk.Button(lbtns, text='启用全部', width=7, command=lambda: self._ec_lock_all(True)).pack(side='left', padx=1)
+        ttk.Button(lbtns, text='暂停全部', width=7, command=lambda: self._ec_lock_all(False)).pack(side='left', padx=1)
+        self.ec_lock_var = tk.StringVar(value='未锁定')
+        ttk.Label(lbtns, textvariable=self.ec_lock_var, foreground='#c0392b').pack(side='left', padx=6)
+        pane.add(lock_frame, weight=1)
+
+        # 底部：新值 + 修改/锁定 + 加入即锁定开关
         bot = ttk.Frame(win)
         bot.pack(fill='x', padx=6, pady=6)
         ttk.Label(bot, text='新值:').pack(side='left')
@@ -3096,9 +3518,8 @@ class ScraplingGrabberGUI:
         ttk.Entry(bot, textvariable=self.ec_newval_var, width=9).pack(side='left', padx=3)
         ttk.Button(bot, text='修改', width=5, command=self._ec_edit_selected).pack(side='left', padx=1)
         ttk.Button(bot, text='锁定', width=5, command=lambda: self._ec_lock(True)).pack(side='left', padx=1)
-        ttk.Button(bot, text='解锁', width=5, command=lambda: self._ec_lock(False)).pack(side='left', padx=1)
-        self.ec_lock_var = tk.StringVar(value='未锁定')
-        ttk.Label(bot, textvariable=self.ec_lock_var, foreground='#c0392b').pack(side='left', padx=6)
+        self.ec_lock_on_add_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bot, text='双击加入即锁定', variable=self.ec_lock_on_add_var).pack(side='left', padx=6)
         win.protocol('WM_DELETE_WINDOW', self._ec_close)
         # 主窗口移动跟随：Configure实时（winfo查询）+ 轮询兜底
         if not getattr(self, '_root_cfg_bound', False):
@@ -3111,7 +3532,6 @@ class ScraplingGrabberGUI:
         win.bind('<Configure>', self._on_game_win_configure)
         # 打开时自动恢复上次扫描结果与锁定
         self.root.after(400, self._ec_restore_state)
-
     def _on_game_win_configure(self, e):
         """窗口独立拖动/缩放：放大时路径列伸展；松手在边缘100px内自动吸回；拖远自由"""
         try:
@@ -3190,6 +3610,7 @@ class ScraplingGrabberGUI:
         self.ai_float_input = ttk.Entry(bottom)
         self.ai_float_input.pack(side='left', fill='x', expand=True)
         self.ai_float_input.bind('<Return>', lambda e: self._ai_chat_send_from(self.ai_float_input))
+        self.ai_float_input.bind('<Control-v>', lambda e: self._ai_on_ctrl_v(self.ai_float_input))
         ttk.Button(bottom, text='截图给AI', width=8,
                    command=self._ai_add_shot).pack(side='left', padx=(4, 0))
         ttk.Button(bottom, text='发送', width=6,
@@ -3259,7 +3680,8 @@ class ScraplingGrabberGUI:
     def _ec_close(self):
         """X 关闭 = 隐藏（贴合窗口复用）；锁定保持运行，重开自动恢复"""
         try:
-            if self.ec_lock_info:
+            self._ec_locks_refresh()
+            if self.ec_locks:
                 self.ec_lock_var.set('已锁定（隐藏中，仍生效）')
         except Exception:
             pass
@@ -3270,12 +3692,17 @@ class ScraplingGrabberGUI:
 
     def _ec_clear(self):
         self.ec_scan_state = None
-        self.ec_lock_info = None
+        self.ec_locks = []
+        try:
+            self._ai_ec_lock([], 0, False, 'ALL')
+        except Exception:
+            pass
         for i in self.ec_tree.get_children():
             self.ec_tree.delete(i)
+        self._ec_locks_refresh()
         self.ec_count_var.set('已清除')
         self.cfg.pop('ec_scan_paths', None)
-        self.cfg.pop('ec_lock', None)
+        self.cfg.pop('ec_locks', None)
         save_config(self.cfg)
 
     def _ec_save_state(self):
@@ -3285,18 +3712,20 @@ class ScraplingGrabberGUI:
                 self.cfg['ec_scan_paths'] = [list(s) for s in self.ec_scan_state[:500]]
             else:
                 self.cfg.pop('ec_scan_paths', None)
-            if self.ec_lock_info:
-                self.cfg['ec_lock'] = {'segs': list(self.ec_lock_info[0]), 'value': self.ec_lock_info[1]}
+            if self.ec_locks:
+                self.cfg['ec_locks'] = [{'segs': list(x['segs']), 'value': x['value'],
+                                         'enabled': bool(x.get('enabled', True))} for x in self.ec_locks]
             else:
-                self.cfg.pop('ec_lock', None)
+                self.cfg.pop('ec_locks', None)
             save_config(self.cfg)
         except Exception:
             pass
 
     def _ec_restore_state(self):
-        """恢复上次扫描结果：回读路径当前值 + 自动恢复锁定"""
+        """恢复上次扫描结果：回读路径当前值 + 自动恢复全部锁定"""
+        self.ec_locks = []  # 每次打开重新恢复，避免重复追加
         paths = self.cfg.get('ec_scan_paths')
-        lock = self.cfg.get('ec_lock')
+        locks = self.cfg.get('ec_locks') or []
         if paths:
             hits = self._ai_ec_reload([list(p) for p in paths])
             if hits:
@@ -3304,15 +3733,23 @@ class ScraplingGrabberGUI:
                 self._ec_fill(hits)
             elif hits is not None:
                 self.ec_count_var.set('已恢复，但路径全部失效（页面可能已变），请重新扫描')
-        if lock:
-            segs = list(lock.get('segs', []))
-            value = lock.get('value', 0)
-            try:
-                self._ai_ec_lock(segs, value, True)
-                self.ec_lock_info = (segs, value)
-                self.ec_lock_var.set('已恢复锁定 %s = %s' % ('.'.join(segs), value))
-            except Exception:
-                pass
+        if locks:
+            restored = 0
+            for lk in locks:
+                try:
+                    segs = list(lk.get('segs', []))
+                    value = lk.get('value', 0)
+                    enabled = bool(lk.get('enabled', True))
+                    key = '.'.join(str(s) for s in segs)
+                    if enabled:
+                        self._ai_ec_lock(segs, value, True, key)
+                    self.ec_locks.append({'segs': segs, 'value': value, 'key': key, 'enabled': enabled})
+                    restored += 1
+                except Exception:
+                    pass
+            if restored:
+                self._ec_locks_refresh()
+                self._log('EC锁定恢复: %d 项' % restored)
 
     def _ec_fill(self, hits):
         for i in self.ec_tree.get_children():
@@ -3380,9 +3817,10 @@ class ScraplingGrabberGUI:
         import tkinter.messagebox as _mb
         _mb.showinfo('结果', msg, parent=self.game_win)
 
-    def _ec_lock(self, enable):
-        segs = self._ec_selected_segs() if enable else None
-        if enable and not segs:
+    def _ec_add_lock_from_selected(self):
+        """双击搜索结果行：按「新值」加入下方锁定列表（是否启动锁由勾选决定）"""
+        segs = self._ec_selected_segs()
+        if not segs:
             return
         try:
             value = float(self.ec_newval_var.get().strip())
@@ -3390,14 +3828,205 @@ class ScraplingGrabberGUI:
             import tkinter.messagebox as _mb
             _mb.showwarning('提示', '请输入有效数值', parent=self.game_win)
             return
-        if enable:
-            self._ai_ec_lock(segs, value, True)
-            self.ec_lock_info = (segs, value)
-            self.ec_lock_var.set('已锁定 %s = %s' % ('.'.join(segs), value))
+        enabled = self.ec_lock_on_add_var.get()
+        key = '.'.join(str(s) for s in segs)
+        for item in self.ec_locks:
+            if item['key'] == key:
+                item['value'] = value
+                item['enabled'] = enabled
+                self._ai_ec_lock(item['segs'], value, enabled, key)
+                break
         else:
-            self._ai_ec_lock([], 0, False)
-            self.ec_lock_info = None
-            self.ec_lock_var.set('未锁定')
+            self.ec_locks.append({'segs': list(segs), 'value': value, 'key': key, 'enabled': enabled})
+            self._ai_ec_lock(segs, value, enabled, key)
+        self._ec_locks_refresh()
+        self._log('EC加入锁定: %s = %s（%s）' % (key, value, '已启用' if enabled else '已暂停'))
+        self._ec_save_state()
+
+    def _ec_edit_lock_btn(self):
+        """「改值」按钮：对锁定列表中选中的行改锁定值（双击的兜底方案）"""
+        try:
+            sel = self.ec_lock_tree.selection()
+            if not sel:
+                import tkinter.messagebox as _mb
+                _mb.showinfo('提示', '请先在下方锁定列表中选中要改值的条目', parent=self.root)
+                return
+            idx = self._ec_lock_idx_by_iid(sel[0])
+            self._ec_edit_lock_at(idx)
+        except Exception as ex:
+            self._log('改值失败: %s' % ex)
+
+    def _ec_edit_lock_value(self, e=None):
+        """双击锁定列表行：修改该条的锁定值（整行双击均可，不依赖选中状态）"""
+        try:
+            if e is None:
+                sel = self.ec_lock_tree.selection()
+                if not sel:
+                    return
+                iid = sel[0]
+            else:
+                if self.ec_lock_tree.identify_column(e.x) == '#0':
+                    return  # 双击勾选框列=快速切换，不弹改值
+                iid = self.ec_lock_tree.identify_row(e.y)
+                if not iid:
+                    return
+            idx = self._ec_lock_idx_by_iid(iid)
+            self._ec_edit_lock_at(idx)
+        except Exception as ex:
+            self._log('双击改值失败: %s' % ex)
+
+    def _ec_edit_lock_at(self, idx):
+        """按索引改某条锁定值：弹框输入新值，立即生效并保存"""
+        if idx < 0 or idx >= len(self.ec_locks):
+            self._log('改值索引无效: %s' % idx)
+            return
+        item = self.ec_locks[idx]
+        import tkinter.simpledialog as _sd
+        try:
+            newv = _sd.askstring('修改锁定值', '变量: %s\n当前锁定值: %s\n\n新锁定值:' % (item['key'], item['value']),
+                                 initialvalue=str(item['value']), parent=self.root)
+        except Exception as ex:
+            self._log('弹框失败: %s' % ex)
+            return
+        if newv is None:
+            return
+        try:
+            v = float(newv.strip())
+        except Exception:
+            import tkinter.messagebox as _mb
+            _mb.showwarning('提示', '请输入有效数值', parent=self.root)
+            return
+        try:
+            item['value'] = v
+            if item.get('enabled', True):
+                self._ai_ec_lock(item['segs'], v, True, item['key'])
+            self._ec_locks_refresh()
+            self._log('EC锁定值修改: %s = %s' % (item['key'], v))
+            self._ec_save_state()
+        except Exception as ex:
+            self._log('改值写入失败: %s' % ex)
+
+    def _ec_lock(self, enable):
+        """把搜索列表选中行加入/更新锁定（锁定条目显示在下半区）"""
+        if not enable:
+            return
+        segs = self._ec_selected_segs()
+        if not segs:
+            return
+        try:
+            value = float(self.ec_newval_var.get().strip())
+        except Exception:
+            import tkinter.messagebox as _mb
+            _mb.showwarning('提示', '请输入有效数值', parent=self.game_win)
+            return
+        key = '.'.join(str(s) for s in segs)
+        for item in self.ec_locks:
+            if item['key'] == key:
+                item['value'] = value
+                item['enabled'] = True
+                self._ai_ec_lock(item['segs'], value, True, key)
+                break
+        else:
+            self.ec_locks.append({'segs': list(segs), 'value': value, 'key': key, 'enabled': True})
+            self._ai_ec_lock(segs, value, True, key)
+        self._ec_locks_refresh()
+        self._log('EC锁定: %s = %s（共%d项）' % (key, value, len(self.ec_locks)))
+        self._ec_save_state()
+
+    def _ec_check_images(self):
+        """生成勾选框图片：启用=蓝底白勾，暂停=空框"""
+        if getattr(self, '_chk_on', None) is not None:
+            return
+        self._chk_on = None
+        self._chk_off = None
+        try:
+            from PIL import Image as _Img, ImageDraw as _Drw, ImageTk as _Tk
+            def make(on):
+                im = _Img.new('RGBA', (16, 16), (0, 0, 0, 0))
+                d = _Drw.Draw(im)
+                if on:
+                    d.rounded_rectangle([1, 1, 15, 15], radius=3, fill='#0a84ff', outline='#0a84ff')
+                    d.line([4, 8, 7, 11, 12, 5], fill='white', width=2)
+                else:
+                    d.rounded_rectangle([1, 1, 15, 15], radius=3, outline='#9aa0a6', width=1)
+                return _Tk.PhotoImage(im)
+            self._chk_on = make(True)
+            self._chk_off = make(False)
+        except Exception:
+            self._chk_on = None
+            self._chk_off = None
+
+    def _ec_locks_refresh(self):
+        """重绘下半区锁定条目列表"""
+        try:
+            for i in self.ec_lock_tree.get_children():
+                self.ec_lock_tree.delete(i)
+            if not self.ec_locks:
+                self.ec_lock_var.set('未锁定')
+                return
+            self._ec_check_images()
+            for item in self.ec_locks:
+                enabled = item.get('enabled', True)
+                img = self._chk_on if enabled else self._chk_off
+                self.ec_lock_tree.insert('', 'end', image=img,
+                                         values=('.'.join(str(s) for s in item['segs']), item['value']))
+            active = sum(1 for x in self.ec_locks if x.get('enabled', True))
+            self.ec_lock_var.set('已锁定 %d/%d 项' % (active, len(self.ec_locks)))
+        except Exception:
+            pass
+
+    def _ec_lock_idx_by_iid(self, iid):
+        """把 Treeview 行 iid 映射到 ec_locks 索引（用行序，不依赖 iid 格式）"""
+        if not iid:
+            return -1
+        try:
+            rows = self.ec_lock_tree.get_children()
+            if iid in rows:
+                return rows.index(iid)
+            return int(iid[1:]) - 1
+        except Exception:
+            return -1
+
+    def _ec_toggle_lock_click(self, e):
+        """点锁定列表勾选框列（#0）：启用/暂停该锁"""
+        row = self.ec_lock_tree.identify_row(e.y)
+        col = self.ec_lock_tree.identify_column(e.x)
+        if not row or col != '#0':
+            return
+        idx = self._ec_lock_idx_by_iid(row)
+        if idx < 0 or idx >= len(self.ec_locks):
+            return
+        item = self.ec_locks[idx]
+        item['enabled'] = not item.get('enabled', True)
+        if item['enabled']:
+            self._ai_ec_lock(item['segs'], item['value'], True, item['key'])
+        else:
+            self._ai_ec_lock(item['segs'], item['value'], False, item['key'])
+        self._ec_locks_refresh()
+        self._ec_save_state()
+
+    def _ec_unlock_selected(self):
+        """解锁：删除锁定列表中选中的条目"""
+        sel = self.ec_lock_tree.selection()
+        if not sel:
+            import tkinter.messagebox as _mb
+            _mb.showinfo('提示', '请先在下方锁定列表中选中要解锁的条目', parent=self.root)
+            return
+        idx = self._ec_lock_idx_by_iid(sel[0])
+        if idx < 0 or idx >= len(self.ec_locks):
+            return
+        item = self.ec_locks.pop(idx)
+        self._ai_ec_lock(item['segs'], item['value'], False, item['key'])
+        self._ec_locks_refresh()
+        self._log('EC解锁: %s（剩余%d项）' % (item['key'], len(self.ec_locks)))
+        self._ec_save_state()
+
+    def _ec_lock_all(self, enable):
+        """启用/暂停全部锁定（保留条目）"""
+        for item in self.ec_locks:
+            item['enabled'] = enable
+            self._ai_ec_lock(item['segs'], item['value'], enable, item['key'])
+        self._ec_locks_refresh()
         self._ec_save_state()
 
     def _close_settings(self):
@@ -3435,6 +4064,8 @@ class ScraplingGrabberGUI:
         # 清空任务列表
         for item in self.task_tree.get_children():
             self.task_tree.delete(item)
+        # 清空上一次的CDP直读原图缓存
+        self._cdp_direct_urls = []
         # 禁用重试失败按钮
         if hasattr(self, 'retry_btn'):
             self.retry_btn.config(state='disabled')
@@ -3442,6 +4073,20 @@ class ScraplingGrabberGUI:
         self._update_task_stat()
         try:
             url = self._clean_url(self.url_var.get())
+            # CDP浏览器模式：强制用浏览器当前页，不导航、不跳转（避免把用户正在看的页跳走）
+            if self.render_mode_var.get() == '浏览器模式(CDP)':
+                cu = self._cdp_current_url()
+                if cu:
+                    cu = self._clean_url(cu)
+                    self.url_var.set(cu)
+                    url = cu
+                    self._log('使用浏览器当前页: %s' % cu[:90])
+            elif not url:
+                cu = self._cdp_current_url()
+                if cu:
+                    self._log('网址栏为空，自动使用内置浏览器当前页: %s' % cu[:90])
+                    self.url_var.set(cu)
+                    url = self._clean_url(cu)
             if url:
                 self.url_var.set(url)
             if url:
@@ -3449,7 +4094,7 @@ class ScraplingGrabberGUI:
             save_dir = self.dir_var.get().strip()
 
             if not url:
-                messagebox.showwarning('提示', '请输入网址')
+                messagebox.showwarning('提示', '请输入网址，或先在内置浏览器打开目标页面')
                 return
             if not save_dir:
                 messagebox.showwarning('提示', '请选择保存目录')
@@ -3492,6 +4137,29 @@ class ScraplingGrabberGUI:
             self._log('启动失败: %s' % e)
             self._log('详细错误: %s' % traceback.format_exc())
             self._finish_crawl()
+
+    def _return_focus_to_browser(self):
+        """抓取开始后把焦点还给 Chrome，避免主程序抢焦点"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            hwnd_found = []
+            def enum_cb(hwnd, lparam):
+                if ctypes.windll.user32.IsWindowVisible(hwnd):
+                    length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                    if length > 0:
+                        buf = ctypes.create_unicode_buffer(length + 1)
+                        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                        t = buf.value
+                        if ('Chrome' in t or 'Edge' in t or 'xchina' in t.lower()) and '全能网页助手' not in t:
+                            hwnd_found.append(hwnd)
+                return True
+            WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            ctypes.windll.user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
+            if hwnd_found:
+                ctypes.windll.user32.SetForegroundWindow(hwnd_found[0])
+        except Exception:
+            pass
 
     def _toggle_pause(self):
         """切换暂停/继续状态"""
@@ -3703,6 +4371,136 @@ class ScraplingGrabberGUI:
                         'expression': 'document.documentElement.outerHTML',
                         'returnByValue': True
                     })
+
+                    # ===== 页面直读原图（油猴同款，站点无关）：扫渲染好的 <img>，srcset取最大+各data-*属性+去缩略图后缀 =====
+                    try:
+                        direct_js = r"""
+                        (function(){
+                          var out = [];
+                          function norm(u){
+                            if(!u) return null;
+                            u = String(u).trim();
+                            if(!u || u.indexOf('data:')===0 || u==='about:blank') return null;
+                            try { u = new URL(u, location.href).href; } catch(e){ return null; }
+                            u = u.replace(/-\d+x\d+\.(jpg|jpeg|png|webp|gif)/i, '.$1');
+                            return u;
+                          }
+                          var seen = {};
+                          function add(u){ u = norm(u); if(u && !seen[u]){ seen[u]=1; out.push(u); } }
+                          var imgs = document.querySelectorAll('img');
+                          for(var i=0;i<imgs.length;i++){
+                            var im = imgs[i];
+                            var ss = im.getAttribute('srcset');
+                            if(ss && ss.indexOf(',')>=0){
+                              var parts = ss.split(',').map(function(s){return s.trim();}).filter(Boolean);
+                              parts.sort(function(a,b){
+                                var ma=a.match(/\s([\d.]+)(w|x)$/), mb=b.match(/\s([\d.]+)(w|x)$/);
+                                return (ma?parseFloat(ma[1]):1)-(mb?parseFloat(mb[1]):1);
+                              });
+                              var last = parts[parts.length-1];
+                              if(last) add(last.split(' ')[0]);
+                            }
+                            var attrs = ['src','data-src','data-original','data-lazy-src','data-lazy','data-actual','data-url','data-image','data-photo','data-img','data-pic','data-file','data-origin','data-real','data-source','data-large','data-big','data-full','data-origin-src','data-original-src'];
+                            for(var j=0;j<attrs.length;j++){ add(im.getAttribute(attrs[j])); }
+                          }
+                          // 补扫：很多站用 <div style="background-image:url(...)"> 当预览图
+                          var divs = document.querySelectorAll('[style*="background-image"]');
+                          for(var k=0;k<divs.length;k++){
+                            var st = divs[k].style.backgroundImage || getComputedStyle(divs[k]).backgroundImage;
+                            if(st && st.indexOf('url(')===0){
+                              var m = st.match(/url\(["']?([^"')]+)["']?\)/);
+                              if(m) add(m[1]);
+                            }
+                          }
+                          // 补扫：<picture><source srcset> 和 <source srcset>
+                          var sources = document.querySelectorAll('source[srcset]');
+                          for(var s=0;s<sources.length;s++){ add(sources[s].getAttribute('srcset')); }
+                          // 补扫：<video> 和 <video><source> 的视频地址
+                          var vids = document.querySelectorAll('video[src], video source[src], video source[srcset]');
+                          for(var v=0;v<vids.length;v++){
+                            add(vids[v].getAttribute('src'));
+                            add(vids[v].getAttribute('srcset'));
+                          }
+                          // 再扫 video/播放器元素的所有属性（data-src/data-video/data-url 等懒加载）
+                          var players = document.querySelectorAll('video, [data-video], [data-src], [data-url], [data-file], [data-mp4]');
+                          for(var p=0;p<players.length;p++){
+                            var attrs = players[p].attributes;
+                            for(var a=0;a<attrs.length;a++){
+                              var av = attrs[a].value;
+                              if(av && /\.(mp4|webm|mov|m4v)(\?|$)/i.test(av)) add(av);
+                            }
+                          }
+                          // 暴力兜底：整个 HTML 正则扫所有图片+视频 URL（支持相对路径+JSON转义\/）
+                          var html = document.documentElement.outerHTML;
+                          html = html.replace(/\\\//g, '/');
+                          var re = /[^\s"'<>\\()]+?\.(?:jpg|jpeg|png|webp|avif|mp4|webm|mov|m4v)(?:\?[^\s"'<>\\]*)?/gi;
+                          var mm;
+                          while((mm=re.exec(html))!==null){ add(mm[0]); }
+                          return out;
+                        })()
+                        """
+                        dr = send_cdp(200, 'Runtime.evaluate', {'expression': direct_js, 'returnByValue': True})
+                        durls = dr.get('result', {}).get('result', {}).get('value', []) or []
+                        self._cdp_direct_urls = [u for u in durls if isinstance(u, str)]
+                        if self._cdp_direct_urls:
+                            self._log('CDP直读原图: 从渲染页面提取到 %d 个图片地址（srcset/data-*）' % len(self._cdp_direct_urls))
+                        # ===== 自动翻页抓全部：拼 N.html 逐页访问，合并去重 =====
+                        try:
+                            if getattr(self, 'auto_page_var', None) and self.auto_page_var.get():
+                                import re as _re
+                                if _re.search(r'/\d+\.html$', url):
+                                    base = _re.sub(r'/\d+\.html$', '/', url)
+                                else:
+                                    base = url[:-5] + '/'
+                                seen = set(self._cdp_direct_urls)
+                                try:
+                                    _maxp = int(self.auto_page_max_var.get())
+                                except Exception:
+                                    _maxp = 100
+                                for n in range(2, _maxp + 1):
+                                    if self.stop_flag.is_set():
+                                        self._log('已停止')
+                                        break
+                                    nxt = '%s%d.html' % (base, n)
+                                    self._log('自动翻页: 第 %d 页 %s' % (n, nxt))
+                                    send_cdp(210 + n, 'Page.navigate', {'url': nxt})
+                                    for _w in range(8):
+                                        if self.stop_flag.is_set():
+                                            break
+                                        time.sleep(0.5)
+                                    send_cdp(230 + n, 'Runtime.evaluate', {'expression': 'window.scrollTo(0,document.body.scrollHeight)', 'returnByValue': True})
+                                    time.sleep(0.5)
+                                    dr2 = send_cdp(250 + n, 'Runtime.evaluate', {'expression': direct_js, 'returnByValue': True})
+                                    new2 = dr2.get('result', {}).get('result', {}).get('value', []) or []
+                                    added = 0
+                                    for u in new2:
+                                        if isinstance(u, str) and u not in seen:
+                                            seen.add(u)
+                                            self._cdp_direct_urls.append(u)
+                                            added += 1
+                                    self._log('  第 %d 页新增 %d 张，累计 %d 张' % (n, added, len(self._cdp_direct_urls)))
+                                    if added == 0:
+                                        break
+                        except Exception as _ape:
+                            self._log('自动翻页出错（忽略）: %s' % _ape)
+                        # ===== 视频轮播：点"下一个"收集同页多个视频（3/3 这种看图器）=====
+                        try:
+                            for _v in range(10):
+                                # 点"下一个"按钮
+                                send_cdp(300 + _v, 'Runtime.evaluate', {'expression': "(function(){var bs=document.querySelectorAll('a,button,div,span');for(var i=0;i<bs.length;i++){var t=(bs[i].textContent||'').trim();if(t.indexOf('下一个')>=0&&t.length<12){bs[i].click();return true;}}return false;})()"})
+                                time.sleep(2)
+                                dr_v = send_cdp(320 + _v, 'Runtime.evaluate', {'expression': "(function(){var v=document.querySelector('video');return (v&&(v.currentSrc||v.src))||'';})()", 'returnByValue': True})
+                                vurl = dr_v.get('result', {}).get('result', {}).get('value', '') or ''
+                                if vurl and vurl not in self._cdp_direct_urls:
+                                    self._cdp_direct_urls.append(vurl)
+                                    self._log('轮播视频: 新增 %s' % vurl[-60:])
+                                else:
+                                    break
+                        except Exception as _ve:
+                            self._log('视频轮播出错（忽略）: %s' % _ve)
+                    except Exception as _e:
+                        self._cdp_direct_urls = []
+                        self._log('CDP直读原图: 提取失败（忽略，走HTML解析）: %s' % _e)
                     ws.close()
 
                     # 关闭独立标签页（复用用户标签页时不关闭）
@@ -4106,6 +4904,7 @@ class ScraplingGrabberGUI:
         self._log('正在启动%s调试浏览器（9222端口）...' % browser_name)
         try:
             proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+            self._debug_browser_pid = proc.pid
             self._log('%s调试浏览器已启动（PID=%d），正在嵌入...' % (browser_name, proc.pid))
             # 延迟嵌入浏览器窗口
             self.root.after(3000, lambda: self._embed_browser())
@@ -4130,10 +4929,19 @@ class ScraplingGrabberGUI:
             found_hwnd = None
             browser_choice = getattr(self, 'browser_choice_var', None)
             choice = browser_choice.get() if browser_choice else 'Chrome'
+            target_pid = getattr(self, '_debug_browser_pid', None)
 
             def enum_callback(hwnd, lParam):
                 nonlocal found_hwnd
                 if not IsWindowVisible(hwnd):
+                    return True
+                # 优先按启动时的 PID 精确匹配（最可靠，不依赖窗口标题）
+                if target_pid:
+                    pid = wintypes.DWORD()
+                    GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if pid.value == target_pid:
+                        found_hwnd = hwnd
+                        return False
                     return True
                 length = GetWindowTextLength(hwnd)
                 if length == 0:
@@ -4358,7 +5166,7 @@ class ScraplingGrabberGUI:
         min_size = self.min_size_var.get()
 
         self._log('=' * 50)
-        self._log('Scrapling 图片爬虫 %s' % APP_VERSION)
+        self._log('%s %s' % (APP_NAME, APP_VERSION))
         self._log('=' * 50)
         self._log('目标网址: %s' % url)
         self._log('保存目录: %s' % save_dir)
@@ -5079,6 +5887,15 @@ class ScraplingGrabberGUI:
             elif not any(url_lower.endswith(ext) for ext in ['.html', '.htm', '.php', '.asp', '.jsp', '.aspx', '.css', '.js']):
                 img_urls.add(full_url)
 
+        # ===== CDP直读原图优先：浏览器模式下已从渲染页面拿到原图列表（srcset最大+去缩略图后缀）=====
+        direct = getattr(self, '_cdp_direct_urls', None)
+        if direct:
+            for u in direct:
+                try_add(u)
+            self._cdp_direct_urls = []  # 用完即清，避免污染后续页
+            self._log('图片提取: 使用CDP直读原图，共 %d 张（渲染页面直读，非HTML猜解）' % len(img_urls))
+            return list(img_urls)
+
         # 从 img 标签提取
         try:
             imgs = page.css('img')
@@ -5115,8 +5932,23 @@ class ScraplingGrabberGUI:
 
     def _download_image_list(self, img_urls, save_dir, max_threads, min_size, task_id=None):
         """下载图片列表，返回 (成功数, 失败数, 跳过数)"""
-        # 统一过滤无效URL（about:blank、模板残留等）
-        img_urls = [u for u in img_urls if u and not u.startswith('about:') and '{{' not in u and '}}' not in u]
+        # 统一过滤无效URL（about:blank、模板残留、非图片静态资源等）
+        _NON_IMG_EXT = ('.js', '.css', '.html', '.htm', '.php', '.json', '.xml', '.woff', '.woff2', '.ttf', '.ico')
+        def _looks_like_img(u):
+            if not u or 'about:' in u or '{{' in u or '}}' in u:
+                return False
+            ul = u.lower().split('?')[0].split('#')[0]
+            if ul.endswith(_NON_IMG_EXT):
+                return False
+            # 站点导航/标签图标等非正文资源
+            for junk in ('/images/sites/', '/images/user-tags/', '/images/empty.png', '/static/image/'):
+                if junk in ul:
+                    return False
+            # 暴力正则误抓的 JS 代码片段（含 %60、路径里有多个=）
+            if '%60' in u or u.count('=') > 2:
+                return False
+            return True
+        img_urls = [u for u in img_urls if _looks_like_img(u)]
         # 下载前 AI 预筛（可选）：只对规则拿不准的 URL 调模型，拿得准的不消耗算力
         if getattr(self, 'ai_prescreen_var', None) is not None and self.ai_prescreen_var.get():
             if self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None):
@@ -5139,6 +5971,8 @@ class ScraplingGrabberGUI:
 
         def download_one(idx, img_url):
             nonlocal success, fail, skipped, total_bytes
+            if self.stop_flag.is_set():
+                return
             # 保存原始URL
             original_url = img_url
             # 尝试将缩略图URL转换为原图URL
@@ -5159,6 +5993,9 @@ class ScraplingGrabberGUI:
                 if pattern in img_url_lower:
                     img_url = img_url_lower.replace(pattern, replacement)
                     break
+            # xchina 站：视频/大图真实在 img.xchina.io CDN，页面里写的 xchina.co 路径是错的
+            if img_url.startswith('https://xchina.co/') and ('/photos/' in img_url or '.mp4' in img_url):
+                img_url = 'https://img.xchina.io/' + img_url[len('https://xchina.co/'):]
             # 重试机制：最多重试3次
             max_retries = 3
             for retry in range(max_retries):
@@ -5203,6 +6040,38 @@ class ScraplingGrabberGUI:
                     os.makedirs(save_dir, exist_ok=True)
                     with open(filepath, 'wb') as f:
                         f.write(content)
+                    # ===== 伪装嗅探：MP4 视频常被改名为 .jpg，读文件头 ftyp 自动改名 =====
+                    try:
+                        with open(filepath, 'rb') as f:
+                            head = f.read(12)
+                        if len(head) >= 12 and head[4:8] == b'ftyp':
+                            mp4_path = filepath.rsplit('.', 1)[0] + '.mp4'
+                            os.rename(filepath, mp4_path)
+                            filepath = mp4_path
+                            self._log('检测到伪装视频（ftyp），已重命名: %s' % os.path.basename(mp4_path))
+                    except Exception:
+                        pass
+                    # ===== 格式转换：WEBP/AVIF -> JPG（可选，品质可调）=====
+                    try:
+                        cw = getattr(self, 'convert_webp_var', None) and self.convert_webp_var.get()
+                        ca = getattr(self, 'convert_avif_var', None) and self.convert_avif_var.get()
+                        if (cw and ext == '.webp') or (ca and ext == '.avif'):
+                            from PIL import Image
+                            import io as _io
+                            im = Image.open(_io.BytesIO(content)).convert('RGB')
+                            q = 90
+                            try:
+                                q = int(self.jpg_quality_var.get())
+                            except Exception:
+                                pass
+                            q = max(1, min(100, q))
+                            new_filepath = filepath.rsplit('.', 1)[0] + '.jpg'
+                            im.save(new_filepath, 'JPEG', quality=q)
+                            if new_filepath != filepath:
+                                os.remove(filepath)
+                                filepath = new_filepath
+                    except Exception:
+                        pass  # 转失败就保留原文件
                     success += 1
                     total_bytes += len(content)
                     # 更新任务进度
@@ -5218,7 +6087,18 @@ class ScraplingGrabberGUI:
                         time.sleep(1)
                         continue
                     else:
-                        # 最后一次重试还是失败
+                        # 最后一次重试还是失败：尝试走浏览器通道（带代理/登录态）
+                        try:
+                            os.makedirs(save_dir, exist_ok=True)
+                            if self._cdp_download_image(img_url, filepath):
+                                success += 1
+                                total_bytes += os.path.getsize(filepath)
+                                self._log('浏览器通道下载成功[%d/%d]: %s' % (success + fail + skipped, len(img_urls), img_url[:80]))
+                                if task_id:
+                                    self._update_task(task_id, progress='%d/%d' % (success + fail + skipped, len(img_urls)))
+                                return
+                        except Exception:
+                            pass
                         fail += 1
                         self._log('下载失败[%d/%d] (重试%d次): %s - %s' % (success + fail + skipped, len(img_urls), max_retries, img_url[:100], str(e)[:150]))
                         # 更新任务进度
@@ -5231,6 +6111,11 @@ class ScraplingGrabberGUI:
             for idx, img_url in enumerate(img_urls):
                 futures.append(executor.submit(download_one, idx, img_url))
             for future in as_completed(futures):
+                if self.stop_flag.is_set():
+                    self._log('用户停止下载，取消剩余 %d 个任务' % sum(1 for f in futures if not f.done()))
+                    for f in futures:
+                        f.cancel()
+                    break
                 try:
                     future.result()
                 except Exception as e:
@@ -5270,6 +6155,8 @@ class ScraplingGrabberGUI:
             pass
         import re
         title = re.sub(r'[\\/:*?\"<>|]', '_', title)
+        # 去掉 " - 第 N 页" 后缀，避免多页抓取建不同文件夹
+        title = re.sub(r'\s*[-_—]\s*第\s*\d+\s*页\s*$', '', title)
         title = title[:80] if title else 'untitled'
         save_dir = os.path.join(save_dir, domain, title)
         os.makedirs(save_dir, exist_ok=True)
@@ -5351,6 +6238,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
