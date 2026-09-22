@@ -4,6 +4,7 @@ build_v*/
 /dist/
 *.spec
 *.exe
+!/全能网页助手_GUI_v3.1.*.exe
 *.pdb
 __pycache__/
 *.py[cod]
