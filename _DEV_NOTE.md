@@ -1,4 +1,41 @@
-# Scrapling 图片爬虫 - 开发交接笔记（v2.12.27）
+# Scrapling 图片爬虫 - 开发交接笔记（截至 v3.1.10）
+
+## v3.x 交接补充（v3.0.0 → v3.1.10）
+
+> 仓库 git 历史里 v3.1.x 的逐版细节没留（只有 v3.0.0 两条提交 + 最后一次 v3.1.10），这里按「发布版本 → 实际改动」补齐；
+> 依据是各版 exe 的内嵌代码解包核对（逐版探测标志性方法/常量存在性）+ 改造过程记录，不是回忆推测。
+
+### 发布顺序与内容
+- **v3.0.0**（2026-09-08 / 09-14，两条提交）：CDP 直读 + 自动翻页 + 视频轮播 + 伪装嗅探；修复模型路径/下拉框 bug，自定义模型点选 + 自适应，复用外部 LLM 服务，新增 AI 状态灯
+- **v3.1.0**：新增 WASM 内存扫描（先是独立窗口，后按要求并入游戏修改器的统一扫描：`_ec_fill` 改走 `ec_tree_segs` 的 iid→segs 映射，WASM 段统一表示成 `['__wasm', memIdx, type, offset]`，过滤/对比/写入/锁定全复用）；新增深色科技蓝/浅色双主题 `_apply_widget_theme` + 底部状态栏
+- **v3.1.1**：顶部设置区从 6 行精简为「网址行 + 可折叠高级选项面板 `_toggle_advanced`」；修复 ttk clam 勾选框选中后视觉无变化（显式配 `indicatorforeground` + 选中态 `indicatorbackground`）；「保存到」改可点击链接 `Link.TLabel`
+- **v3.1.2**：顶部工具行压成一行 —— `opt.pack(in_=other_frame)` 复用同一批控件在两种排布间切换 + `Row.TButton` 系列紧凑样式（`width=-1` 破 ttk 最小宽度）+ 宽度自适应三件套（`_apply_opt_layout` / `_measure_inline_need` / `_opt_recheck`）
+- **v3.1.3**：下载容错 —— `IMAGE_HEADERS`（图片专用请求头，绕开图床 CDN 的 403）+ `HttpSessions`（直连/系统代理双通道会话池，直连通道 `trust_env=False`）+ `http_get()`；`_download_image_list` 增加 `referer`
+- **v3.1.4**：功能审计；修 `_open_save_dir` 被重复定义（后者覆盖前者 → 任务列表右键不再优先打开该任务目录）、设置窗口恢复保存目录历史下拉（`dir_combo` / `_dir_refresh_combo`）
+- **v3.1.5 / v3.1.6**：`_launch_debug_browser` 重写为三分支 —— ①已嵌入且窗口有效 → 静默跳过 ②桌面有顶层可见窗口 → 嵌入 ③端口通但窗口看不见（残留）→ 清理残留 + 等端口释放 + 重启 + 嵌入；新增 `_embedded_browser_alive`（`EnumWindows` 只枚举顶层窗口，已嵌入的浏览器必须用 `IsWindow+IsWindowVisible` 判断，否则会被误判成残留反复杀重启）；与「独立窗口」共用同一套 helper，顺带修掉选 Edge 也只会启动 Chrome 的死变量
+- **v3.1.7**：「高级选项」挪到「设置」后面；功能入口 8 个按钮收进面板；新增 `_panel_need_width`（把面板所需宽度并进启动 autosize/minsize）
+- **v3.1.8**：参数行并入面板（`opt_frame` 变成 `adv_frame` 的子控件）；运行控制行按需出现（`_show_run_bar` / `_sync_run_bar`，`_finish_crawl` → `after(300, _sync_run_bar)`）；**删除**整套宽度自适应机制（`_apply_opt_layout` / `_measure_inline_need` / `_pack_opt_row` / `_opt_need_width` / `opt_sep` 等）
+- **v3.1.9**：顶部留白收紧（`top_frame.pady/ipady`、`url_frame.pady`、`TNotebook.tabmargins` 三处）
+- **v3.1.10**：面板排版放宽（行距/分隔条/AI 开关拆两排）+ 新样式 `Feature.TButton` + 功能入口按钮右对齐
+
+### 当前顶部结构（v3.1.10）
+`url_frame`（行1：网址 + 收藏 / 设置 / 高级选项 ▾ / 开始抓取）→ `btn_frame`（**默认不 pack**：暂停/停止/重试失败）→ `adv_frame`（可折叠面板：抓取参数 / 功能入口 / 智能过滤 / AI / 转换+性能 / 浏览器模式）。
+标签条高度约 36px 由 `TNotebook.Tab` 的 `padding=(14,6)` 决定，改 `tabmargins` 或 `TNotebook.padding` 对标签条高度无效。
+
+### v3.x 新增代码位置
+- 主题：`_apply_widget_theme` / `THEMES` / `_apply_theme`（切换主题要重新 `.configure(text=...)` 手动改过文案的按钮）
+- 顶部布局：`_toggle_advanced` / `_show_run_bar` / `_sync_run_bar`
+- 下载：`IMAGE_HEADERS` / `HttpSessions` / `http_get` / `_download_image_list` / `_cdp_download_image`
+- 调试浏览器：`_launch_debug_browser` / `_open_independent_browser` / `_embed_browser` / `_debug_browser_visible_pid` / `_embedded_browser_alive` / `_prepare_debug_profile` / `_find_browser_exe` / `_wait_debug_port_free`
+- 游戏修改：`_open_game_mod_window` / `_ai_ec_scan` / `_ai_ec_edit` / `_ai_ec_lock` / `_wasm_boot` / `_ec_assign_expr`
+- 目录历史：`_dir_remember` / `_dir_refresh_combo` / `_on_dir_pick` / `cfg['save_dirs']`
+
+### v3.x 期间的坑（务必遵守）
+- **同一文件不要并行发多个 Edit**：会互相覆盖（工具报成功但改动丢失），必须串行改 + 改完 grep 核对落点。
+- **exe 内嵌代码核对**：`CArchiveReader(exe).extract('scrapling_grabber_gui')` 返回的字节**直接** `marshal.loads` 即可（6.x 不写文件）；**不要**自己按 toc 里的 offset seek（那读到的是 bootloader 机器码）。递归收集 `co_consts` 时**必须同时递归 tuple/frozenset/list**，否则 `self._cfg('TNotebook', tabmargins=...)` 这类 kwarg 名会漏 → 误报"配置没生效"。
+- **老 exe 可能读不出来**：v3.0.0 那个 exe 是另一套 Python 环境打的，`marshal.loads` 报 `bad marshal data`；核对不到不代表操作错了。
+- **打包**：`--workpath` 给一个**全新不存在**的目录（沙箱 safe-delete 会在清理 >50 文件时报错 rc=1，而 rc=1 时 exe 仍是上一次的旧产物，靠 mtime 识破）；正在运行的 exe 会锁住 dist 目录，改版本号 + 新目录打包，别动用户正在用的文件。
+- **exe 冒烟**：给子进程 `USERPROFILE=<临时目录>` 隔离配置；窗口用 `FindWindowW(None, '全能网页助手 vX.Y.Z')` 按标题找（onefile 的 `Popen.pid` 是 bootloader 父进程，按 pid 比归属永远不匹配）；截图/点击前先 `SetWindowPos(HWND_TOPMOST)`，点击必须 `SetCursorPos` + `mouse_event`（给 Tk 发 `PostMessage` 不生效）。
 
 ## v2.12.27 新增（AI对话磁吸窗 + Cocos引擎扫描）
 - **AI对话磁吸窗**：AI 行新增「AI对话」按钮，点一下贴合主窗口右侧（360px 宽、高度跟主窗），再点隐藏；与游戏修改窗口同款机制（拖动100px内吸回、拖远自由、主窗移动实时跟随/轮询兜底）
