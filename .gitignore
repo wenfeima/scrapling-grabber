@@ -1,8 +1,12 @@
 # ===== 构建产物 =====
 /build/
+build_v*/
+/dist/
 *.spec
+*.exe
+*.pdb
 __pycache__/
-*.pyc
+*.py[cod]
 
 # ===== 调试截图 =====
 screenshot*.png
@@ -12,6 +16,7 @@ screenshot*.png
 *.gif
 
 # ===== 一次性修复/分析脚本 =====
+_*.py
 fix_*.py
 analyze_*.py
 check_*.py
@@ -45,3 +50,10 @@ tuiimg_*.html
 # ===== 运行时文件 =====
 *.log
 *.txt
+
+# ===== 备份与虚拟环境 =====
+*.bak
+scrapling_grabber_gui.py.v*
+*.egg-info/
+.venv/
+venv/

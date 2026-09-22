@@ -33,11 +33,159 @@ BROWSER_HEADERS = {
     'Sec-Fetch-User': '?1',
 }
 
+# 图片专用请求头：CDN 会看 Accept / Sec-Fetch-* 判断是不是真浏览器在取图，
+# 用文档头（Sec-Fetch-Dest: document）会被 Cloudflare 判成爬虫直接 403
+IMAGE_HEADERS = {
+    'User-Agent': BROWSER_HEADERS['User-Agent'],
+    'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+    'Accept-Language': BROWSER_HEADERS['Accept-Language'],
+    'Sec-Fetch-Dest': 'image',
+    'Sec-Fetch-Mode': 'no-cors',
+    'Sec-Fetch-Site': 'same-site',
+}
+
+
+class HttpSessions:
+    """会话池：直连 / 系统代理 两条通道，自动择优并记住上次成功的那条。
+
+    注意：Windows 上 requests 会通过 urllib.getproxies() 读注册表里的代理设置
+    （即使没有任何 HTTP_PROXY 环境变量）。注册表里留着已失效的代理
+    （例如 127.0.0.1:10809 但代理软件没开）时，所有请求都会抛 ProxyError，
+    所以直连通道必须 trust_env=False，并显式清空 proxies。
+    """
+    _lock = threading.Lock()
+    _sessions = {}
+    _preferred = None
+
+    @classmethod
+    def get(cls, use_env_proxy):
+        with cls._lock:
+            key = bool(use_env_proxy)
+            if key not in cls._sessions:
+                cls._sessions[key] = cls._build(key)
+            return cls._sessions[key]
+
+    @staticmethod
+    def _build(use_env_proxy):
+        import requests
+        s = requests.Session()
+        s.trust_env = bool(use_env_proxy)
+        if not use_env_proxy:
+            s.proxies = {'http': None, 'https': None}
+        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=64, max_retries=0)
+        s.mount('http://', adapter)
+        s.mount('https://', adapter)
+        return s
+
+    @classmethod
+    def order(cls):
+        """上次成功的通道优先，避免每次都先白等一轮超时"""
+        if cls._preferred is None:
+            return (False, True)
+        return (cls._preferred, not cls._preferred)
+
+    @classmethod
+    def mark(cls, use_env_proxy):
+        cls._preferred = bool(use_env_proxy)
+
+
+def http_get(url, headers=None, timeout=30, referer=None, allow_proxy_fallback=True):
+    """带代理容错 + 会话复用的 GET，返回 requests.Response。
+
+    顺序：先直连（避开注册表里的失效代理）→ 直连网络层失败再退回系统代理
+    （用户挂着可用代理访问受限站点时仍然能下）。两条都失败时抛出最后一次异常。
+    """
+    import requests
+    hdrs = dict(BROWSER_HEADERS if headers is None else headers)
+    if referer:
+        hdrs.setdefault('Referer', referer)
+    modes = HttpSessions.order() if allow_proxy_fallback else (False,)
+    last_exc = None
+    for use_env_proxy in modes:
+        sess = HttpSessions.get(use_env_proxy)
+        try:
+            # (连接超时, 读取超时)：连接阶段短一些，直连不通能快速切到代理通道
+            resp = sess.get(url, headers=hdrs, timeout=(10, timeout), verify=False)
+            HttpSessions.mark(use_env_proxy)
+            return resp
+        except (requests.exceptions.ProxyError, requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout, requests.exceptions.SSLError) as e:
+            last_exc = e
+            continue
+    raise last_exc
+
+
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v3.0.0'
+APP_VERSION = 'v3.1.10'
 APP_NAME = '全能网页助手'
+
+# ===== 界面主题（深色科技蓝 / 浅色简约，可一键切换）=====
+UI_FONT = 'Microsoft YaHei UI'
+FONT_UI = (UI_FONT, 9)
+FONT_UI_BOLD = (UI_FONT, 9, 'bold')
+FONT_TITLE = (UI_FONT, 13, 'bold')
+FONT_MONO = ('Consolas', 9)
+
+THEMES = {
+    # 深色科技蓝（默认）
+    'dark': {
+        'bg': '#0d1220',          # 窗口底色
+        'surface': '#151c2c',     # 面板/卡片
+        'border': '#242e44',      # 描边
+        'input': '#0f1626',       # 输入框
+        'fg': '#e8edf7',          # 主文字
+        'muted': '#8a97b0',       # 次要文字
+        'accent': '#3b82f6',      # 主色（科技蓝）
+        'accent_active': '#2f6fe4',
+        'accent_fg': '#ffffff',
+        'btn': '#1e2739',
+        'btn_active': '#2a3752',
+        'btn_pressed': '#34446a',
+        'btn_disabled_bg': '#171e2d',
+        'btn_disabled_fg': '#5b6780',
+        'head_bg': '#1b2438',     # 表头
+        'select': '#1e3a5f',      # 选中
+        'success': '#22c55e',
+        'warn': '#f59e0b',
+        'danger': '#ef4444',
+        'danger_active': '#dc2626',
+        'text_bg': '#0f1523',     # 日志/对话区
+        'bubble_req': '#1d2c4a',  # 我的气泡
+        'bubble_resp': '#1b3327',  # AI 气泡
+        'tag_ts': '#7c89a4', 'tag_req': '#7cb0ff', 'tag_resp': '#5fd08a',
+        'tag_tool': '#f0b429', 'tag_sep': '#3a4661',
+    },
+    # 浅色简约
+    'light': {
+        'bg': '#eef1f7',
+        'surface': '#ffffff',
+        'border': '#dbe1ec',
+        'input': '#ffffff',
+        'fg': '#1f2937',
+        'muted': '#6b7280',
+        'accent': '#2563eb',
+        'accent_active': '#1d4ed8',
+        'accent_fg': '#ffffff',
+        'btn': '#f1f4fa',
+        'btn_active': '#e3e9f5',
+        'btn_pressed': '#d6dff0',
+        'btn_disabled_bg': '#f5f6f9',
+        'btn_disabled_fg': '#a8b0bd',
+        'head_bg': '#f3f5fa',
+        'select': '#dbe7ff',
+        'success': '#16a34a',
+        'warn': '#d97706',
+        'danger': '#dc2626',
+        'danger_active': '#b91c1c',
+        'text_bg': '#ffffff',
+        'bubble_req': '#e3f2fd',
+        'bubble_resp': '#e8f5e9',
+        'tag_ts': '#999999', 'tag_req': '#1a56db', 'tag_resp': '#0d7a3d',
+        'tag_tool': '#b45309', 'tag_sep': '#bbbbbb',
+    },
+}
 
 
 def ver_gt(a, b):
@@ -55,7 +203,7 @@ def ver_gt(a, b):
 # ===== AI 过滤配置 =====
 AI_DEFAULT_PORT = 8080
 # llama-server 可执行文件（官方预编译版）
-AI_SERVER_DEFAULT = r'L:\工作流\千问无审查模型配置\llama-b9297-bin-win-cuda-12.4-x64\llama-server.exe'
+AI_SERVER_DEFAULT = r'L:\工作流\千问无审查模型配置\llama-b9375-cuda13\llama-server.exe'
 
 # 云端 API 服务商预设（选服务商自动填 API 地址）
 AI_PROVIDERS = {
@@ -70,8 +218,8 @@ AI_PROVIDERS = {
 # 模型预设：名称 -> (主模型, 视觉模型)
 AI_MODEL_PRESETS = {
     '内置4B（无审查·6G显存）': (
-        r'L:\ComfyUI\ComfyUI\models\LLM\Q35-4B-U-HauhauCS\Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf',
-        r'L:\ComfyUI\ComfyUI\models\LLM\Q35-4B-U-HauhauCS\mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf',
+        r'L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf',
+        r'L:\ComfyUI\ComfyUI\models\LLM\mmproj-Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-BF16.gguf',
     ),
     '内置9B（12G显存）': (
         r'L:\ComfyUI\ComfyUI\models\LLM\Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf',
@@ -126,6 +274,92 @@ AI_PRESCREEN_PROMPT = ('以下每行是一个图片URL（来自网页抓取）�
                        '逐行输出，每行只写两个字：下  或  跳过\n'
                        'URL列表：\n{urls}')
 
+# ===== WASM 内存扫描（网页游戏修改器）=====
+# 支持的数据类型（typed array 名称）
+WASM_TYPES = ('i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'f32', 'f64')
+WASM_TYPE_SIZE = {'i8': 1, 'u8': 1, 'i16': 2, 'u16': 2, 'i32': 4, 'u32': 4, 'f32': 4, 'f64': 8}
+
+# 注入页面的引导脚本：枚举 WASM 线性内存（WebAssembly.Memory / Emscripten HEAPU8.buffer）。
+# 缓存的是 Memory 对象本身而非 buffer —— memory.grow() 后旧 buffer 会 detach，
+# 所以每次读写都要重新取 .buffer。结果存 window.__wgWasm，页面刷新后自动重建（幂等）。
+WASM_BOOT_JS = r'''
+if(!window.__wgFind){window.__wgFind=function(){
+ var out=[],seen=[];
+ function addMem(m){
+  if(!m)return;var b=null;
+  try{b=m.buffer;}catch(e){return;}
+  if(!b||b.byteLength<4096)return;
+  for(var i=0;i<out.length;i++){if(out[i].m===m)return;}
+  /* 若已按裸 ArrayBuffer 登记过同一块内存，换成 Memory 条目（能跟随 grow） */
+  for(var j=out.length-1;j>=0;j--){if(out[j].ab&&out[j].ab===b){out.splice(j,1);}}
+  out.push({m:m});}
+ function addBuf(b){
+  if(!b||b.byteLength<65536)return;
+  for(var i=0;i<out.length;i++){var e=out[i];var eb=null;
+   try{eb=e.m?e.m.buffer:e.ab;}catch(err){}
+   if(eb===b)return;}
+  out.push({ab:b});}
+ function look(o,d){
+  if(d>3||o===null||o===undefined||out.length>=64)return;
+  try{if(o instanceof WebAssembly.Memory){addMem(o);return;}}catch(e){}
+  if(typeof o!=='object')return;
+  if(o===document||o===navigator||o===location||o===history||o===performance)return;
+  if(seen.indexOf(o)>=0)return;seen.push(o);
+  if(seen.length>4000)return;
+  var ks;try{ks=Object.keys(o);}catch(e){return;}
+  if(ks.length>500)ks=ks.slice(0,500);
+  for(var i=0;i<ks.length;i++){try{var v=o[ks[i]];
+   if(v instanceof WebAssembly.Memory){addMem(v);continue;}
+   if(v instanceof ArrayBuffer){addBuf(v);continue;}
+   if(v&&typeof v==='object'&&v.buffer instanceof ArrayBuffer&&v.byteLength!==undefined){addBuf(v.buffer);continue;}
+   look(v,d+1);
+  }catch(e){}}
+ }
+ try{look(window,0);}catch(e){}
+ try{var cand=[window.wasmMemory,(window.Module&&window.Module.wasmMemory),window.__wasmMemory];
+  for(var i=0;i<cand.length;i++){var c=cand[i];
+   if(c instanceof WebAssembly.Memory){addMem(c);}
+   else if(c instanceof ArrayBuffer){addBuf(c);}}}catch(e){}
+ try{var h=[window.HEAPU8,window.HEAPU32,window.HEAPF32,window.HEAPF64];
+  for(var j=0;j<h.length;j++){if(h[j]&&h[j].buffer instanceof ArrayBuffer){addBuf(h[j].buffer);}}}catch(e){}
+ return out;};}
+if(!window.__wgMem){window.__wgMem=function(){
+ var W=window.__wgWasm;
+ if(!W||!W.m||!W.m.length){W=window.__wgWasm={m:window.__wgFind(),t:Date.now()};}
+ return W;};}
+if(!window.__wgBuf){window.__wgBuf=function(i){
+ var W=window.__wgMem();var e=W.m[i];if(!e)return null;
+ try{return e.m?e.m.buffer:e.ab;}catch(err){return null;}};}
+if(!window.__wgRead){window.__wgRead=function(i,t,o){
+ var b=window.__wgBuf(i);if(!b)return null;
+ var d=new DataView(b);
+ try{switch(t){
+  case 'i8':return d.getInt8(o);
+  case 'u8':return d.getUint8(o);
+  case 'i16':return d.getInt16(o,true);
+  case 'u16':return d.getUint16(o,true);
+  case 'i32':return d.getInt32(o,true);
+  case 'u32':return d.getUint32(o,true);
+  case 'f32':return d.getFloat32(o,true);
+  case 'f64':return d.getFloat64(o,true);}}catch(e){return null;}
+ return null;};}
+if(!window.__wgWrite){window.__wgWrite=function(i,t,o,v){
+ var b=window.__wgBuf(i);if(!b)return null;
+ var d=new DataView(b);
+ try{switch(t){
+  case 'i8':d.setInt8(o,v);break;
+  case 'u8':d.setUint8(o,v);break;
+  case 'i16':d.setInt16(o,v,true);break;
+  case 'u16':d.setUint16(o,v,true);break;
+  case 'i32':d.setInt32(o,v,true);break;
+  case 'u32':d.setUint32(o,v,true);break;
+  case 'f32':d.setFloat32(o,v,true);break;
+  case 'f64':d.setFloat64(o,v,true);break;
+  default:return null;}}catch(e){return null;}
+ return window.__wgRead(i,t,o);};}
+true;
+'''
+
 # 配置文件路径
 CONFIG_FILE = os.path.join(os.path.expanduser('~'), '.scrapling_grabber_config.json')
 
@@ -159,11 +393,12 @@ def safe_filename(name):
 
 
 def download_image(url, save_path, timeout=15):
-    """下载单张图片"""
+    """下载单张图片（直连优先，避开系统里的失效代理）"""
     try:
-        req = urllib.request.Request(url, headers=BROWSER_HEADERS)
-        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
-            data = resp.read()
+        resp = http_get(url, headers=IMAGE_HEADERS, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.content
         with open(save_path, 'wb') as f:
             f.write(data)
         return len(data)
@@ -177,8 +412,8 @@ class ScraplingGrabberGUI:
     def __init__(self, root):
         self.root = root
         self.root.title('%s %s' % (APP_NAME, APP_VERSION))
-        self.root.geometry('900x740')
-        self.root.minsize(800, 550)
+        self.root.geometry('980x800')
+        self.root.minsize(860, 640)
         # Windows 上 Tk 最大化后还原失灵的兜底：F11 切换最大化/还原，Esc 强制恢复原尺寸
         self.root.bind('<F11>', self._toggle_maximize)
         self.root.bind('<Escape>', self._restore_window)
@@ -189,6 +424,7 @@ class ScraplingGrabberGUI:
         self.cfg = load_config()
         # AI 过滤状态
         self.ai_proc = None          # llama-server 进程
+        self._ai_busy = False
         self.ai_ok = False           # 服务是否就绪
         self.ai_cache = {}           # 图片路径 -> 判断结果缓存
         self._ai_state = '未启动'     # 服务状态（工作线程写入，主线程轮询显示）
@@ -196,6 +432,7 @@ class ScraplingGrabberGUI:
         self.ai_status_var = None    # 设置窗口里的状态标签
         self.settings_win = None     # 设置窗口句柄
 
+        self._setup_theme()
         self._create_widgets()
         self._load_settings()
         # 窗口关闭时保存设置
@@ -210,6 +447,369 @@ class ScraplingGrabberGUI:
             self._log('Scrapling 版本: %s' % getattr(scrapling, '__version__', '未知'))
         except Exception:
             self._log('Scrapling 版本: 未安装')
+
+    # ===== 界面主题 =====
+    def _setup_theme(self):
+        """初始化主题（默认深色科技蓝，配置记住上次选择）"""
+        name = self.cfg.get('ui_theme') or 'dark'
+        if name not in THEMES:
+            name = 'dark'
+        self.theme_name = name
+        try:
+            self.style = ttk.Style(self.root)
+        except Exception:
+            self.style = ttk.Style()
+        try:
+            self.style.theme_use('clam')  # clam 支持自定义配色，其他主题改不动
+        except Exception:
+            pass
+        try:
+            self.root.option_add('*Font', FONT_UI)
+        except Exception:
+            pass
+        self._apply_theme()
+
+    def _cfg(self, name, **kw):
+        """安全设置 ttk 样式（个别选项在部分 Tk 版本不支持，跳过该选项即可）"""
+        try:
+            self.style.configure(name, **kw)
+            return
+        except Exception:
+            pass
+        for k, v in kw.items():
+            try:
+                self.style.configure(name, **{k: v})
+            except Exception:
+                pass
+
+    def _map(self, name, **kw):
+        try:
+            self.style.map(name, **kw)
+            return
+        except Exception:
+            pass
+        for k, v in kw.items():
+            try:
+                self.style.map(name, **{k: v})
+            except Exception:
+                pass
+
+    def _apply_theme(self):
+        """应用当前主题：ttk 控件样式 + 原生 tk 控件配色"""
+        p = THEMES.get(self.theme_name, THEMES['dark'])
+        self.palette = p
+        try:
+            self.root.configure(background=p['bg'])
+        except Exception:
+            pass
+
+        # ---- 全局默认：面板底色统一，控件自动融入卡片 ----
+        self._cfg('.', background=p['surface'], foreground=p['fg'],
+                  fieldbackground=p['input'], bordercolor=p['border'],
+                  troughcolor=p['bg'], focuscolor=p['accent'],
+                  selectbackground=p['select'], selectforeground=p['fg'],
+                  font=FONT_UI, borderwidth=1)
+        self._cfg('TFrame', background=p['surface'], borderwidth=0, relief='flat')
+        self._cfg('Card.TFrame', background=p['surface'], borderwidth=1,
+                  relief='solid', bordercolor=p['border'])
+        self._cfg('Header.TFrame', background=p['surface'], borderwidth=0, relief='flat')
+        self._cfg('TLabel', background=p['surface'], foreground=p['fg'])
+        self._cfg('Muted.TLabel', foreground=p['muted'])
+        self._cfg('Danger.TLabel', foreground=p['danger'])
+        self._cfg('Title.TLabel', font=FONT_TITLE, foreground=p['accent'])
+        self._cfg('Link.TLabel', foreground=p['accent'],
+                  font=(UI_FONT, 9, 'underline'))
+
+        # ---- 按钮：主色 / 危险色 / 普通 ----
+        self._cfg('TButton', background=p['btn'], foreground=p['fg'],
+                  bordercolor=p['border'], lightcolor=p['btn'], darkcolor=p['btn'],
+                  padding=(6, 4), anchor='center', relief='flat', focuscolor=p['accent'])
+        self._map('TButton',
+                  background=[('active', p['btn_active']), ('pressed', p['btn_pressed']),
+                              ('disabled', p['btn_disabled_bg'])],
+                  foreground=[('disabled', p['btn_disabled_fg'])],
+                  bordercolor=[('focus', p['accent'])])
+        for sname, base, active in (('Accent.TButton', 'accent', 'accent_active'),
+                                    ('Danger.TButton', 'danger', 'danger_active')):
+            self._cfg(sname, background=p[base], foreground=p['accent_fg'],
+                      bordercolor=p[base], lightcolor=p[base], darkcolor=p[base],
+                      padding=(6, 4), anchor='center', relief='flat')
+            self._map(sname,
+                      background=[('active', p[active]), ('pressed', p[active]),
+                                  ('disabled', p['btn_disabled_bg'])],
+                      foreground=[('disabled', p['btn_disabled_fg'])])
+
+        # ---- 顶部工具行专用：紧凑按钮（取消 clam 的等宽下限 width=-1，并收紧内边距，
+        #      让「运行控制 + 工具入口 + 抓取参数 + 浏览器/高级」能挤进同一行且不留空档）----
+        _row_pad = (4, 2)
+        self._cfg('Row.TButton', background=p['btn'], foreground=p['fg'],
+                  bordercolor=p['border'], lightcolor=p['btn'], darkcolor=p['btn'],
+                  width=-1, padding=_row_pad, anchor='center', relief='flat',
+                  focuscolor=p['accent'])
+        self._map('Row.TButton',
+                  background=[('active', p['btn_active']), ('pressed', p['btn_pressed']),
+                              ('disabled', p['btn_disabled_bg'])],
+                  foreground=[('disabled', p['btn_disabled_fg'])],
+                  bordercolor=[('focus', p['accent'])])
+        for sname, base, active in (('Row.Accent.TButton', 'accent', 'accent_active'),
+                                    ('Row.Danger.TButton', 'danger', 'danger_active')):
+            self._cfg(sname, background=p[base], foreground=p['accent_fg'],
+                      bordercolor=p[base], lightcolor=p[base], darkcolor=p[base],
+                      width=-1, padding=_row_pad, anchor='center', relief='flat')
+            self._map(sname,
+                      background=[('active', p[active]), ('pressed', p[active]),
+                                  ('disabled', p['btn_disabled_bg'])],
+                      foreground=[('disabled', p['btn_disabled_fg'])])
+
+        # ---- 高级面板「功能入口」：比紧凑按钮大一档、加粗、带主色描边，右侧对齐看起来更醒目 ----
+        self._cfg('Feature.TButton', background=p['btn_active'], foreground=p['fg'],
+                  bordercolor=p['accent'], lightcolor=p['btn_active'], darkcolor=p['btn_active'],
+                  width=-1, padding=(16, 6), anchor='center', relief='flat',
+                  font=(UI_FONT, 10, 'bold'), focuscolor=p['accent'])
+        self._map('Feature.TButton',
+                  background=[('active', p['btn_pressed']), ('pressed', p['btn_pressed']),
+                              ('disabled', p['btn_disabled_bg'])],
+                  foreground=[('disabled', p['btn_disabled_fg'])],
+                  bordercolor=[('active', p['accent'])])
+
+        # ---- 输入框 / 下拉 / 数字框 ----
+        common = dict(fieldbackground=p['input'], foreground=p['fg'],
+                      background=p['input'], bordercolor=p['border'],
+                      insertcolor=p['fg'], padding=(5, 4), relief='flat')
+        for wname, extra in (('TEntry', {}), ('TCombobox', {'arrowcolor': p['fg']}),
+                             ('TSpinbox', {'arrowcolor': p['fg']})):
+            self._cfg(wname, **dict(common, **extra))
+            self._map(wname, bordercolor=[('focus', p['accent'])],
+                      fieldbackground=[('readonly', p['input'])])
+        # 顶部工具行专用的紧凑输入控件（与紧凑按钮同高，省宽度）
+        row_common = dict(common, padding=(4, 2))
+        for wname, extra in (('Row.TEntry', {}), ('Row.TCombobox', {'arrowcolor': p['fg']})):
+            self._cfg(wname, **dict(row_common, **extra))
+            self._map(wname, bordercolor=[('focus', p['accent'])],
+                      fieldbackground=[('readonly', p['input'])])
+
+        # ---- 复选框 / 单选（勾 mark 用 indicatorforeground 画，必须显式给出）----
+        for wname in ('TCheckbutton', 'TRadiobutton'):
+            self._cfg(wname, background=p['surface'], foreground=p['fg'],
+                      indicatorcolor=p['input'], indicatorbackground=p['input'],
+                      indicatorforeground=p['accent'],
+                      bordercolor=p['border'], focuscolor=p['surface'])
+            self._map(wname, indicatorcolor=[('selected', p['accent'])],
+                      indicatorbackground=[('selected', p['accent']),
+                                           ('pressed', p['btn_active']),
+                                           ('active', p['btn_active'])],
+                      indicatorforeground=[('selected', p['accent_fg']),
+                                           ('disabled', p['muted'])],
+                      background=[('active', p['surface'])],
+                      foreground=[('disabled', p['muted'])])
+
+        # ---- 标签页 ----
+        self._cfg('TNotebook', background=p['bg'], bordercolor=p['border'], tabmargins=(2, 1, 2, 0))
+        self._cfg('TNotebook.Tab', background=p['surface'], foreground=p['muted'],
+                  bordercolor=p['border'], padding=(14, 6), font=FONT_UI)
+        self._map('TNotebook.Tab',
+                  background=[('selected', p['accent']), ('active', p['btn_active'])],
+                  foreground=[('selected', p['accent_fg']), ('active', p['fg'])],
+                  bordercolor=[('selected', p['accent'])])
+
+        # ---- 分组框 ----
+        self._cfg('TLabelframe', background=p['surface'], bordercolor=p['border'], relief='solid')
+        self._cfg('TLabelframe.Label', background=p['surface'], foreground=p['accent'], font=FONT_UI_BOLD)
+        self._cfg('TSeparator', background=p['border'])
+
+        # ---- 表格 ----
+        self._cfg('Treeview', background=p['surface'], fieldbackground=p['surface'],
+                  foreground=p['fg'], bordercolor=p['border'], rowheight=26, relief='flat')
+        self._cfg('Treeview.Heading', background=p['head_bg'], foreground=p['muted'],
+                  font=FONT_UI_BOLD, bordercolor=p['border'], relief='flat', padding=(6, 5))
+        self._map('Treeview', background=[('selected', p['select'])],
+                  foreground=[('selected', p['fg'])])
+        self._map('Treeview.Heading', background=[('active', p['btn_active'])])
+
+        # ---- 滚动条 / 进度条 ----
+        for wname in ('Vertical.TScrollbar', 'Horizontal.TScrollbar'):
+            self._cfg(wname, background=p['btn'], troughcolor=p['surface'],
+                      bordercolor=p['border'], arrowcolor=p['fg'], relief='flat', borderwidth=0)
+            self._map(wname, background=[('active', p['btn_active'])])
+        self._cfg('TProgressbar', background=p['accent'], troughcolor=p['surface'],
+                  bordercolor=p['border'], lightcolor=p['accent'], darkcolor=p['accent'])
+
+        # ---- 原生控件（Text / Listbox / Canvas / Menu）----
+        self._apply_widget_theme()
+
+    def _apply_widget_theme(self, widget=None):
+        """递归给原生 tk 控件上色（ttk 样式管不到它们）"""
+        p = getattr(self, 'palette', THEMES['dark'])
+        if widget is None:
+            widget = self.root
+        stack = [widget]
+        while stack:
+            w = stack.pop()
+            try:
+                if isinstance(w, (tk.Tk, tk.Toplevel)):
+                    w.configure(background=p['bg'])
+                elif isinstance(w, tk.Text):
+                    w.configure(background=p['text_bg'], foreground=p['fg'],
+                                insertbackground=p['fg'], selectbackground=p['select'],
+                                selectforeground=p['fg'], relief='flat', borderwidth=0,
+                                highlightthickness=1, highlightbackground=p['border'],
+                                highlightcolor=p['border'])
+                    # 对话气泡 / 日志高亮跟随主题
+                    for tag, key, val in (
+                            ('ts', 'foreground', p['tag_ts']),
+                            ('req', 'foreground', p['tag_req']),
+                            ('resp', 'foreground', p['tag_resp']),
+                            ('tool', 'foreground', p['tag_tool']),
+                            ('sep', 'foreground', p['tag_sep']),
+                            ('req_bubble', 'background', p['bubble_req']),
+                            ('resp_bubble', 'background', p['bubble_resp']),
+                            ('user', 'background', p['bubble_req']),
+                            ('assistant', 'background', p['bubble_resp']),
+                    ):
+                        try:
+                            w.tag_configure(tag, **{key: val})
+                        except Exception:
+                            pass
+                elif isinstance(w, tk.Listbox):
+                    w.configure(background=p['input'], foreground=p['fg'],
+                                selectbackground=p['select'], selectforeground=p['fg'],
+                                relief='flat', borderwidth=1, highlightthickness=1,
+                                highlightbackground=p['border'], highlightcolor=p['border'])
+                elif isinstance(w, tk.Canvas):
+                    w.configure(background=p['surface'], highlightthickness=0)
+                elif isinstance(w, tk.Menu):
+                    w.configure(background=p['surface'], foreground=p['fg'],
+                                activebackground=p['accent'], activeforeground=p['accent_fg'],
+                                borderwidth=1, relief='flat', activeborderwidth=0)
+            except Exception:
+                pass
+            try:
+                stack.extend(w.winfo_children())
+            except Exception:
+                pass
+
+    def _toggle_theme(self):
+        """深浅主题一键切换"""
+        self.theme_name = 'light' if self.theme_name == 'dark' else 'dark'
+        self.cfg['ui_theme'] = self.theme_name
+        save_config(self.cfg)
+        self._apply_theme()
+        try:
+            self.theme_btn.configure(
+                text='切换深色' if self.theme_name == 'light' else '切换浅色')
+        except Exception:
+            pass
+        try:
+            self._log('界面主题已切换：%s' % ('浅色简约' if self.theme_name == 'light' else '深色科技蓝'))
+        except Exception:
+            pass
+
+    def _dir_remember(self, path=None):
+        """把目录记进历史（最近 12 个，当前值排最前）"""
+        d = (path or self.dir_var.get()).strip()
+        if not d:
+            return
+        d = os.path.normpath(d)
+        hist = [x for x in getattr(self, '_dir_history', []) if os.path.normpath(x) != d]
+        self._dir_history = ([d] + hist)[:12]
+
+    def _dir_refresh_combo(self):
+        """刷新设置窗口里的保存目录下拉（历史目录，最多 12 个，当前值排最前）"""
+        combo = getattr(self, 'dir_combo', None)
+        if combo is None:
+            return
+        try:
+            if not combo.winfo_exists():
+                return
+        except Exception:
+            self.dir_combo = None
+            return
+        try:
+            self._dir_remember(self.dir_var.get())
+            combo['values'] = list(self._dir_history)
+        except Exception:
+            pass
+
+    def _on_dir_pick(self):
+        """从下拉里选了历史目录 → 记为最近使用并立即保存设置"""
+        try:
+            self._dir_remember(self.dir_var.get())
+            self._save_settings()
+            self._dir_refresh_combo()
+            self._log('保存目录已切换为: %s' % self.dir_var.get())
+        except Exception:
+            pass
+
+    def _toggle_advanced(self):
+        """展开/收起顶部高级选项面板"""
+        if getattr(self, '_adv_packed', False):
+            self.adv_frame.pack_forget()
+            self.adv_toggle_btn.configure(text='高级选项 ▾')
+            self._adv_packed = False
+        else:
+            self.adv_frame.pack(fill='x', pady=(6, 4))
+            self.adv_toggle_btn.configure(text='收起选项 ▴')
+            self._adv_packed = True
+            # 面板比工具行宽：把窗口最小宽度抬到能完整显示面板，避免展开后被右侧切掉
+            try:
+                need = int(self.adv_frame.winfo_reqwidth()) + 44
+                if need > 880:
+                    self.root.minsize(need, 640)
+            except Exception:
+                pass
+
+    # ===== 运行控制行（暂停/停止/重试失败）的显隐 =====
+    def _show_run_bar(self, show=True):
+        """运行控制行平时隐藏（顶部只留网址那一行）；
+        开始抓取时自动出现，任务结束且没有可重试任务时自动收起"""
+        bf = getattr(self, 'btn_frame', None)
+        if bf is None:
+            return
+
+        def _apply():
+            try:
+                adv = getattr(self, 'adv_frame', None)
+                if show:
+                    if not bf.winfo_manager():
+                        if adv is not None and adv.winfo_manager():
+                            bf.pack(fill='x', pady=(3, 1), before=adv)
+                        else:
+                            bf.pack(fill='x', pady=(3, 1))
+                    self._run_bar_visible = True
+                else:
+                    if bf.winfo_manager():
+                        bf.pack_forget()
+                    self._run_bar_visible = False
+            except Exception:
+                pass
+
+        # 可能从工作线程调用：统一回到主线程再动控件
+        try:
+            self.root.after(0, _apply)
+        except Exception:
+            _apply()
+
+    def _sync_run_bar(self):
+        """运行中、或列表里还有失败任务可重试 → 保持显示；否则收起
+        （顺带把「重试失败」按钮校准成：真的存在失败任务才可用）"""
+        show = bool(getattr(self, 'is_running', False))
+        if not show and getattr(self, 'retry_btn', None) is not None:
+            try:
+                has_failed = False
+                for item in self.task_tree.get_children():
+                    vals = self.task_tree.item(item, 'values')
+                    if len(vals) > 4 and str(vals[4]) in ('失败', '部分失败'):
+                        has_failed = True
+                        break
+                self.retry_btn.config(state=('normal' if has_failed else 'disabled'))
+                show = has_failed
+            except Exception:
+                try:
+                    show = str(self.retry_btn.cget('state')) != 'disabled'
+                except Exception:
+                    show = False
+        self._show_run_bar(show)
+
 
     def _load_url_history(self):
         """加载网址历史记录"""
@@ -237,7 +837,9 @@ class ScraplingGrabberGUI:
         """从配置文件恢复上次的设置"""
         self.url_var.set(self.cfg.get('url', ''))
         default_dir = os.path.join(os.getcwd(), 'downloads')
+        self._dir_history = list(self.cfg.get('save_dirs') or [])
         self.dir_var.set(os.path.normpath(self.cfg.get('save_dir') or default_dir))
+        self._dir_remember(self.dir_var.get())
         self.threads_var.set(self.cfg.get('threads', 8))
         self.timeout_var.set(self.cfg.get('timeout', 15))
         self.smart_filter_var.set(self.cfg.get('smart_filter', True))
@@ -282,7 +884,7 @@ class ScraplingGrabberGUI:
         self.ai_api_adv_var.set(self.cfg.get('ai_api_adv', False))
         self.ai_api_temperature_var.set(self.cfg.get('ai_api_temperature', 0.3))
         self.ai_api_max_tokens_var.set(self.cfg.get('ai_api_max_tokens', 1024))
-        self._ai_apply_preset()
+        self._ai_apply_preset(auto=True)
 
     def _save_settings(self):
         """保存当前设置到配置文件"""
@@ -291,6 +893,7 @@ class ScraplingGrabberGUI:
         self.cfg.update({
             'url': self.url_var.get().strip(),
             'save_dir': os.path.normpath(self.dir_var.get().strip()),
+            'save_dirs': list(getattr(self, '_dir_history', [])),
             'threads': self.threads_var.get(),
             'timeout': self.timeout_var.get(),
             'smart_filter': self.smart_filter_var.get(),
@@ -328,14 +931,70 @@ class ScraplingGrabberGUI:
         save_config(self.cfg)
 
     # ===== AI 智能过滤方法 =====
-    def _ai_apply_preset(self):
-        """按预设自动填充模型路径"""
+    def _ai_apply_preset(self, auto=False):
+        """按预设自动填充模型路径；预设路径失效自动扫描匹配；自定义弹窗点选"""
         name = self.ai_preset_var.get()
         m, v = AI_MODEL_PRESETS.get(name, (None, None))
-        if m:
+        ok_m = m and os.path.exists(m)
+        ok_v = v and os.path.exists(v)
+        if ok_m:
             self.ai_model_var.set(m)
-        if v:
+        if ok_v:
             self.ai_mmproj_var.set(v)
+        if ok_m and ok_v:
+            return
+        # 预设路径失效（文件被移走/改名）：自动扫描模型目录重新配对
+        if name != '自定义':
+            found = self._ai_auto_find_model()
+            if found:
+                self.ai_model_var.set(found[0])
+                self.ai_mmproj_var.set(found[1])
+                self._log('AI服务: 预设路径失效，已自动匹配 → %s' % os.path.basename(found[0]))
+                return
+        if auto:
+            return  # 启动自动加载阶段不弹窗
+        # 自定义 / 自动匹配失败：弹窗让用户点选
+        self._ai_pick_model_dialog()
+
+    def _ai_auto_find_model(self):
+        """扫描 LLM 模型目录，自动配对「主模型 + mmproj 视觉模块」；返回 (model, mmproj) 或 None"""
+        for d in (r'L:\ComfyUI\ComfyUI\models\LLM',):
+            if not os.path.isdir(d):
+                continue
+            try:
+                files = os.listdir(d)
+            except Exception:
+                continue
+            mmprojs = sorted(f for f in files
+                             if f.lower().startswith('mmproj-') and f.lower().endswith('.gguf'))
+            mains = sorted(f for f in files
+                           if f.lower().endswith('.gguf') and not f.lower().startswith('mmproj-'))
+            for mm in mmprojs:
+                stem = mm[7:-4].lower()  # 去 mmproj- 前缀和 .gguf
+                for suf in ('-bf16', '-fp16', '-f16', '-q8', '-q4'):
+                    if stem.endswith(suf):
+                        stem = stem[:-len(suf)]
+                        break
+                for main in mains:
+                    mstem = main[:-4].lower()
+                    if mstem == stem or mstem.startswith(stem):
+                        return (os.path.join(d, main), os.path.join(d, mm))
+        return None
+
+    def _ai_pick_model_dialog(self):
+        """自定义模型：连续弹窗点选 主模型 + 视觉模块（默认目录=LLM 模型目录）"""
+        base = r'L:\ComfyUI\ComfyUI\models\LLM'
+        m = filedialog.askopenfilename(
+            title='选择主模型 (gguf)', initialdir=base if os.path.isdir(base) else None,
+            filetypes=[('GGUF模型', '*.gguf'), ('所有文件', '*.*')])
+        if not m:
+            return
+        self.ai_model_var.set(os.path.normpath(m))
+        v = filedialog.askopenfilename(
+            title='选择视觉模块 mmproj (gguf)', initialdir=os.path.dirname(m),
+            filetypes=[('GGUF模型', '*.gguf'), ('所有文件', '*.*')])
+        if v:
+            self.ai_mmproj_var.set(os.path.normpath(v))
 
     def _browse_ai_file(self, var_name):
         """浏览选择模型/服务文件（初始目录=当前值所在目录）"""
@@ -362,6 +1021,28 @@ class ScraplingGrabberGUI:
         if self.ai_toggle_btn is not None:
             running = self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None)
             self.ai_toggle_btn.config(text='停止AI服务' if running else '启动AI服务')
+        self._ai_light(text)
+
+    def _ai_light(self, text):
+        """AI 服务状态灯：绿=运行中 黄=启动中 红=异常 灰=已停止/待启动"""
+        if not getattr(self, 'ai_status_light', None):
+            return
+        t = text or ''
+        if '运行中' in t:
+            c = '#4caf50'
+        elif '启动中' in t:
+            c = '#ffc107'
+        elif '已停止' in t or '待启动' in t:
+            c = '#9e9e9e'
+        elif ('失败' in t or '不存在' in t or '未运行' in t or '超时' in t
+              or '未配置' in t or '错误' in t or '无法' in t):
+            c = '#f44336'
+        else:
+            c = '#ff9800'
+        try:
+            self.ai_status_light.itemconfig(self._ai_light_ball, fill=c)
+        except Exception:
+            pass
 
     def _ai_toggle_server(self):
         """启动/停止 AI 服务"""
@@ -395,11 +1076,23 @@ class ScraplingGrabberGUI:
         """启动/连接 AI 服务：local=拉起llama-server；ollama=检查本机Ollama；api=测试云端连通"""
         if self.ai_ok or (self.ai_proc and self.ai_proc.poll() is None):
             return
+        self._ai_busy = False
         try:
             self._save_settings()  # 点启动即记住当前设置，不用再点保存按钮
         except Exception:
             pass
         mode = self.ai_mode_var.get()
+        # 先探测本机是否已有 LLM 服务（外部程序已启动则直接复用，不重复拉起）
+        try:
+            _port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
+        except Exception:
+            _port = AI_DEFAULT_PORT
+        if self._ai_probe_external(_port):
+            self.ai_ok = True
+            self._ai_state = '运行中'
+            self._ai_update_status('运行中(外部服务)')
+            self._log('AI服务: 端口%d已有 LLM 服务，直接复用（未启动新进程）' % _port)
+            return
         if mode == 'api':
             base = self.ai_api_base_var.get().strip()
             key = self.ai_api_key_var.get().strip()
@@ -481,13 +1174,15 @@ class ScraplingGrabberGUI:
             port = AI_DEFAULT_PORT
         args = [server, '-m', model, '--mmproj', mmproj,
                 '-ngl', '999', '-c', '8192', '--parallel', '1',
-                '--image-min-tokens', '256', '--cache-ram', '0',
+                '--image-min-tokens', '1024', '--cache-ram', '0',
+                '--flash-attn', '1',
                 '--reasoning', 'off',
                 '--host', '127.0.0.1', '--port', str(port)]
         try:
             CREATE_NO_WINDOW = 0x08000000
+            logf = open(os.path.join(os.path.dirname(server), 'llama_server.log'), 'w')
             self.ai_proc = subprocess.Popen(args, creationflags=CREATE_NO_WINDOW,
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                            stdout=logf, stderr=subprocess.STDOUT)
         except Exception as e:
             self._log('AI服务: 启动失败: %s' % e)
             self._ai_update_status('启动失败')
@@ -539,12 +1234,37 @@ class ScraplingGrabberGUI:
             self._log('AI服务: 已就绪')
         self._ai_update_status(self._ai_state)
 
+    def _ai_probe_external(self, port):
+        """探测本机端口是否已有 LLM 服务在运行（/health 或 /v1/models 返回 200）"""
+        try:
+            import requests
+            for path in ('/health', '/v1/models'):
+                try:
+                    r = requests.get('http://127.0.0.1:%d%s' % (port, path), timeout=2)
+                    if r.status_code == 200:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
     def _kill_stale_llama(self):
-        """软件启动时清理残留 llama-server 进程（避免后台常驻占内存/占端口）"""
+        """软件启动时：已有 LLM 服务在跑则保留并标记可用；否则清理残留 llama-server 进程"""
+        try:
+            port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
+        except Exception:
+            port = AI_DEFAULT_PORT
+        if self._ai_probe_external(port):
+            self.ai_ok = True
+            self._ai_state = '运行中'
+            self._ai_update_status('运行中(外部服务)')
+            self._log('AI服务: 检测到已有 LLM 服务（端口%d），直接复用' % port)
+            return
         try:
             import subprocess
             r = subprocess.run(['taskkill', '/F', '/IM', 'llama-server.exe'],
-                               timeout=10, capture_output=True, text=True)
+                               timeout=10, capture_output=True, text=True, errors='replace')
             out = (r.stdout or '').strip()
             if 'SUCCESS' in out:
                 self._log('已自动清理残留 AI 服务进程（llama-server），如需使用 AI 请点「启动AI服务」')
@@ -552,7 +1272,8 @@ class ScraplingGrabberGUI:
             self._log('清理残留 AI 服务进程失败: %s' % e)
 
     def _stop_ai_server(self):
-        """停止 AI 服务（含所有残留 llama-server，避免后台常驻占内存）"""
+        """停止 AI 服务：只终止本程序拉起的进程；外部 LLM 服务保留不杀"""
+        external = self.ai_proc is None and getattr(self, 'ai_ok', False)
         if self.ai_proc:
             try:
                 self.ai_proc.terminate()
@@ -562,17 +1283,11 @@ class ScraplingGrabberGUI:
                 self.ai_proc.kill()
             except Exception:
                 pass
-        # 兜底：清掉所有 llama-server 残留进程（防止历史会话/异常退出留下的常驻）
-        try:
-            subprocess.run(['taskkill', '/F', '/IM', 'llama-server.exe'],
-                           timeout=10, capture_output=True)
-        except Exception:
-            pass
         self.ai_proc = None
         self.ai_ok = False
         self._ai_state = '已停止'
         self._ai_update_status('已停止')
-        self._log('AI服务: 已停止')
+        self._log('AI服务: 已停止%s' % ('（外部服务保留运行）' if external else ''))
 
     def _ai_server_ok(self):
         """检查服务是否可用，不可用时提示"""
@@ -701,16 +1416,37 @@ class ScraplingGrabberGUI:
             pass
 
     def _ai_clipboard_image(self):
-        """读取剪贴板图片（豆包选区/Win+Shift+S 等截图工具）→ (b64, path) 或 None"""
+        """读取剪贴板图片（截图位图或复制的图片文件）→ (b64, path) 或 None"""
         try:
             from PIL import ImageGrab
             import io
             import base64
             img = ImageGrab.grabclipboard()
-            if img is None or isinstance(img, list) or not hasattr(img, 'save'):
+            # 情况1：复制的是图片文件（Windows返回文件路径列表）
+            if isinstance(img, list) and img:
+                img_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp')
+                for fn in img:
+                    fn = fn if isinstance(fn, str) else fn.decode('utf-8', errors='ignore')
+                    if fn.lower().endswith(img_exts) and os.path.exists(fn):
+                        with open(fn, 'rb') as f:
+                            raw = f.read()
+                        # 统一转JPEG
+                        try:
+                            pim = Image.open(io.BytesIO(raw)).convert('RGB')
+                            pim.thumbnail((512, 512))
+                            buf = io.BytesIO()
+                            pim.save(buf, 'JPEG', quality=85)
+                            data = buf.getvalue()
+                        except Exception:
+                            data = raw
+                        b64 = base64.b64encode(data).decode()
+                        return b64, fn
+                return None
+            # 情况2：截图位图
+            if img is None or not hasattr(img, 'save'):
                 return None
             img = img.convert('RGB')
-            img.thumbnail((768, 768))
+            img.thumbnail((512, 512))
             buf = io.BytesIO()
             img.save(buf, 'JPEG', quality=85)
             b64 = base64.b64encode(buf.getvalue()).decode()
@@ -738,6 +1474,25 @@ class ScraplingGrabberGUI:
         except Exception:
             pass
         return 'break'
+
+    def _ai_on_drop_file(self, filenames):
+        """拖拽图片文件到输入框：转base64加入待发送图片"""
+        import base64, os
+        img_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp')
+        for fn in filenames:
+            if not fn:
+                continue
+            fn = fn if isinstance(fn, str) else fn.decode('gbk', errors='ignore')
+            if fn.lower().endswith(img_exts):
+                try:
+                    with open(fn, 'rb') as f:
+                        b64 = base64.b64encode(f.read()).decode('ascii')
+                    self._ai_pending_image = {'b64': b64, 'path': fn}
+                    self._ai_log_chat('req', '[已添加图片] %s' % os.path.basename(fn))
+                    self._ai_show_shot_in_chat(fn)
+                    return
+                except Exception as e:
+                    self._log('拖拽图片失败: %s' % e)
 
     def _ai_paste_shot(self):
         """「粘贴」：读取剪贴板里的图片（如豆包选区/Win+Shift+S 截图）加入对话"""
@@ -848,6 +1603,144 @@ class ScraplingGrabberGUI:
         except Exception as e:
             self._log('选区截图失败: %s' % e)
 
+    def _build_character_tab(self):
+        """角色聊天标签页（酒馆模式）"""
+        tab = ttk.Frame(self.content_notebook)
+        self.content_notebook.add(tab, text='角色聊天')
+
+        # 顶部：角色选择
+        top = ttk.Frame(tab)
+        top.pack(fill='x', padx=4, pady=2)
+        ttk.Label(top, text='角色:').pack(side='left')
+        self.char_name_var = tk.StringVar(value='默认')
+        self.char_combo = ttk.Combobox(top, textvariable=self.char_name_var, width=18, state='readonly')
+        self.char_combo['values'] = ['默认', '新建角色...']
+        self.char_combo.pack(side='left', padx=4)
+        ttk.Button(top, text='导入角色卡', width=10, command=self._char_import).pack(side='left', padx=2)
+        ttk.Button(top, text='保存角色', width=10, command=self._char_save).pack(side='left', padx=2)
+        ttk.Button(top, text='删除角色', width=10, command=self._char_delete).pack(side='left', padx=2)
+
+        # 人设提示词
+        sys_frame = ttk.LabelFrame(tab, text='人设提示词（System Prompt）')
+        sys_frame.pack(fill='x', padx=4, pady=2)
+        self.char_sys_text = tk.Text(sys_frame, height=4, wrap='word', font=('Microsoft YaHei UI', 9))
+        self.char_sys_text.pack(fill='x', padx=4, pady=2)
+        self.char_sys_text.insert('1.0', '你是一个友好的AI助手，用自然、亲切的语气和用户对话。')
+
+        # 对话区
+        self.char_chat_text = tk.Text(tab, wrap='word', font=('Microsoft YaHei UI', 10))
+        char_scroll = ttk.Scrollbar(tab, command=self.char_chat_text.yview)
+        self.char_chat_text.configure(yscrollcommand=char_scroll.set)
+        self.char_chat_text.tag_configure('ts', font=('Microsoft YaHei UI', 8), foreground='#999')
+        self.char_chat_text.tag_configure('user', background='#e3f2fd', lmargin1=60, lmargin2=60, rmargin=10, spacing1=3, spacing3=3)
+        self.char_chat_text.tag_configure('assistant', background='#e8f5e9', lmargin1=10, lmargin2=10, rmargin=60, spacing1=3, spacing3=3)
+        self.char_chat_text.pack(side='top', fill='both', expand=True, padx=4)
+        char_scroll.pack(side='right', fill='y')
+
+        # 输入区
+        input_frame = ttk.Frame(tab)
+        input_frame.pack(fill='x', padx=4, pady=2)
+        self.char_input = tk.Text(input_frame, height=2, wrap='word', font=('Microsoft YaHei UI', 10))
+        self.char_input.pack(side='left', fill='x', expand=True)
+        self.char_input.bind('<Return>', self._char_on_return)
+        btn_frame = ttk.Frame(input_frame)
+        btn_frame.pack(side='right', padx=4)
+        ttk.Button(btn_frame, text='发送', command=self._char_send).pack(pady=2)
+        ttk.Button(btn_frame, text='清空', command=lambda: self.char_chat_text.delete('1.0', 'end')).pack()
+
+    def _char_import(self):
+        """导入角色卡（JSON文件）"""
+        pass
+
+    def _char_save(self):
+        """保存当前角色"""
+        pass
+
+    def _char_delete(self):
+        """删除角色"""
+        pass
+
+    def _char_on_return(self, e):
+        if e.state & 0x0004:  # Ctrl+Enter
+            return
+        self._char_send()
+        return 'break'
+
+    def _char_send(self):
+        """发送角色聊天消息"""
+        text = self.char_input.get('1.0', 'end').strip()
+        if not text:
+            return
+        self.char_input.delete('1.0', 'end')
+        self._char_log('你', text, 'user')
+        sys_prompt = self.char_sys_text.get('1.0', 'end').strip()
+        # 复用AI对话逻辑，注入人设
+        self._char_reply(text, sys_prompt)
+
+    def _char_log(self, role, text, tag):
+        import datetime
+        self.char_chat_text.insert('end', '[%s] ' % datetime.datetime.now().strftime('%H:%M:%S'), 'ts')
+        self.char_chat_text.insert('end', role + ': ', tag)
+        self.char_chat_text.insert('end', text + '\n\n', tag)
+        self.char_chat_text.see('end')
+
+    def _char_reply(self, user_text, sys_prompt):
+        """调AI回复角色对话"""
+        def worker():
+            try:
+                body = {
+                    'messages': [
+                        {'role': 'system', 'content': sys_prompt},
+                        {'role': 'user', 'content': user_text},
+                    ],
+                    'max_tokens': 500,
+                    'temperature': 0.8,
+                    'stream': False,
+                }
+                resp = self._ai_completion(body, timeout=120)
+                reply = resp['choices'][0]['message']['content']
+                self._char_log('AI', reply, 'assistant')
+            except Exception as e:
+                self._char_log('系统', '错误: %s' % e, 'assistant')
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_sillytavern(self):
+        """启动SillyTavern并打开内置浏览器，自动启动AI服务"""
+        import os, subprocess, time
+        # 先启动AI服务
+        if not self._ai_server_ok():
+            try:
+                self._ai_toggle_server()
+                # 等待启动
+                for _ in range(30):
+                    time.sleep(1)
+                    if self._ai_server_ok():
+                        break
+            except Exception:
+                pass
+        st_dir = r'L:\SillyTavern-1.11.5整合包\SillyTavern-1.11.5'
+        try:
+            import requests as _rq
+            _rq.get('http://127.0.0.1:8000', timeout=2)
+            # 已在运行，不重复启动
+        except Exception:
+            try:
+                subprocess.Popen(
+                    ['node', 'server.js'],
+                    cwd=st_dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=0x08000000  # CREATE_NO_WINDOW
+                )
+                time.sleep(5)
+            except Exception:
+                pass
+        time.sleep(3)
+        # 用外部浏览器打开
+        import webbrowser
+        webbrowser.open('http://127.0.0.1:8000')
+
     def _ai_clear_chat(self):
         """清空 AI 对话记录（页签+磁吸窗）"""
         try:
@@ -881,6 +1774,7 @@ class ScraplingGrabberGUI:
         '  [工具:ai_adjust_crawl {"url":"目标页面网址，可选，默认浏览器当前页"}]\n'
         '  [工具:run_js {"code":"要执行的JavaScript代码"}]\n'
         '  [工具:ec_scan {"value":984, "first":true}]\n'
+        '  [工具:web_search {"query":"搜索关键词"}]\n'
         '  [工具:ec_set {"path":["cc","director","getScene()","节点名","属性名"],"value":999999}]\n'
         '  [工具:ec_lock {"path":["..."],"value":999999,"enable":true}]\n'
         '工具使用场景：\n'
@@ -891,6 +1785,7 @@ class ScraplingGrabberGUI:
         '- 用户想让你看页面内容/画面（如"看看这个页面""这个站怎么样""页面上有什么""帮我看看现在这页"）→ 用 get_browser_view，会截屏并用视觉模型理解页面\n'
         '- 用户说页面明明有图但抓取不到/抓不到图片/提取太少/帮我调整抓取策略/怎么才能抓到（如"这个页面有图抓不到""帮我调整抓取策略""图片怎么抓不下来"）→ 用 ai_adjust_crawl，会自动截图分析页面图片加载方式（懒加载/属性/点击），滚动触发并重新提取，返回图片数量变化\n'
         '- 用户要求修改网页游戏里的数值/数据（如"把984改成999999""把金币改成999999""修改步数/血量/得分/剩余次数"）→ 用 ec_scan 定位变量，再用 ec_set 修改；不要用 run_js 改 DOM！\n'
+        '- 用户问技术问题/不知道的方案/需要查资料（如"这个网站怎么爬""怎么绕过反爬""xx工具怎么用"）→ 用 web_search 联网搜索，根据结果回答\n'
         '网页游戏数值修改（EC模式）专规：\n'
         '1. 这类网页游戏（Canvas 渲染，Cocos Creator/Phaser/Unity-WebGL/自定义引擎都可能，且常嵌在 iframe 里）没有 DOM 文本节点，画面上的"剩余步数:984"是画布绘制出来的，document.querySelector / innerText / textContent 全部无效，禁止使用；\n'
         '2. 定位：不要判断游戏是什么引擎——直接 ec_scan {"value":用户要改的当前值,"first":true}，工具会自动进入同源iframe、自动识别 cc/game/Phaser/PIXI/THREE 等引擎挂载点、并递归 window，返回变量路径列表；如果无匹配，告诉用户可输入当前显示的数值再试，或等待游戏数值变化后再调 ec_scan 缩小范围；\n'
@@ -960,17 +1855,30 @@ class ScraplingGrabberGUI:
         except Exception:
             return ''
 
+    def _http_get(self, url, timeout=30, headers=None):
+        """带代理容错的 GET（统一走模块级 http_get：直连优先，失败再回退系统代理）"""
+        return http_get(url, headers=headers, timeout=timeout)
+
     def _cdp_download_image(self, img_url, filepath):
-        """在浏览器页面里 fetch 图片（带浏览器代理/登录态/Cookie），base64 写文件。成功返回 True"""
-        import json as _json, base64 as _b64
+        """浏览器通道下载图片。两级策略：
+        1) 页内 fetch（同源最快，但跨域会被 CORS 挡）
+        2) 新开标签页直接导航到图片 URL（顶级导航不受 CORS 限制），用
+           Page.getResourceContent 抓主资源 base64 —— Cloudflare 拦 requests
+           但放行真浏览器，这条通道最稳。成功返回 True"""
+        import json as _json, base64 as _b64, time as _time
+        import requests as _rq
         try:
-            import requests as _rq
             tabs = _rq.get('http://127.0.0.1:9222/json/list', timeout=3).json()
-            pages = [t for t in tabs if t.get('type') == 'page' and t.get('url', '').startswith('http')]
-            if not pages:
-                return False
+        except Exception:
+            return False
+        pages = [t for t in tabs if t.get('type') == 'page' and t.get('url', '').startswith('http')]
+        if not pages:
+            return False
+
+        # ---- 尝试1：页内 fetch（带登录态/Cookie）----
+        try:
             import websocket as _ws
-            ws = _ws.create_connection(pages[0]['webSocketDebuggerUrl'], timeout=90)
+            ws = _ws.create_connection(pages[0]['webSocketDebuggerUrl'], timeout=60)
             fetch_js = """
             (async () => {
               try {
@@ -990,18 +1898,123 @@ class ScraplingGrabberGUI:
                     break
             ws.close()
             val = msg.get('result', {}).get('result', {}).get('value', '')
-            if not val or val.startswith('ERR') or val.startswith('HTTP'):
-                return False
-            raw = _b64.b64decode(val)
-            with open(filepath, 'wb') as f:
-                f.write(raw)
-            return True
+            if val and not val.startswith('ERR') and not val.startswith('HTTP'):
+                raw = _b64.b64decode(val)
+                os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+                with open(filepath, 'wb') as f:
+                    f.write(raw)
+                return True
         except Exception:
-            return False
+            pass
+
+        # ---- 尝试2：新标签页导航到图片 URL，抓主资源 ----
+        tid = None
+        try:
+            from urllib.parse import quote as _q
+            qurl = _q(img_url, safe=':/?&=')
+            try:
+                tgt = _rq.put('http://127.0.0.1:9222/json/new?' + qurl, timeout=8).json()
+            except Exception:
+                tgt = _rq.get('http://127.0.0.1:9222/json/new?' + qurl, timeout=8).json()
+            tid = tgt.get('id')
+            wsurl = tgt.get('webSocketDebuggerUrl')
+            if not (tid and wsurl):
+                return False
+            import websocket as _ws
+            ws = _ws.create_connection(wsurl, timeout=4)
+            state = {'mid': 0}
+
+            def rpc(method, params=None):
+                state['mid'] += 1
+                ws.send(_json.dumps({'id': state['mid'], 'method': method, 'params': params or {}}))
+                return state['mid']
+
+            raw = None
+            deadline = _time.time() + 25
+            while _time.time() < deadline and raw is None:
+                frame = None
+                try:
+                    rid = rpc('Page.getResourceTree')
+                    t0 = _time.time()
+                    while _time.time() - t0 < 4:
+                        try:
+                            m = _json.loads(ws.recv())
+                        except Exception:
+                            break
+                        if m.get('id') == rid:
+                            frame = (m.get('result', {}).get('frameTree') or {}).get('frame') or {}
+                            break
+                except Exception:
+                    pass
+                if not frame:
+                    _time.sleep(0.5)
+                    continue
+                if frame.get('url') == img_url:
+                    try:
+                        rid = rpc('Page.getResourceContent', {'frameId': frame.get('id'), 'url': img_url})
+                        t0 = _time.time()
+                        while _time.time() - t0 < 6:
+                            try:
+                                m = _json.loads(ws.recv())
+                            except Exception:
+                                break
+                            if m.get('id') == rid:
+                                got = m.get('result') or {}
+                                if got.get('base64Encoded') and got.get('body'):
+                                    raw = _b64.b64decode(got['body'])
+                                break
+                    except Exception:
+                        pass
+                else:
+                    _time.sleep(0.6)  # 页面还在加载
+            try:
+                ws.close()
+            except Exception:
+                pass
+            try:
+                _rq.get('http://127.0.0.1:9222/json/close/' + tid, timeout=3)
+            except Exception:
+                pass
+            if raw and len(raw) > 128:
+                os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+                with open(filepath, 'wb') as f:
+                    f.write(raw)
+                return True
+        except Exception:
+            pass
+        finally:
+            if tid:
+                try:
+                    _rq.get('http://127.0.0.1:9222/json/close/' + tid, timeout=3)
+                except Exception:
+                    pass
+        return False
 
     def _ai_execute_tool(self, name, args):
         """执行工具调用，返回 (ok, 结果文本)"""
         try:
+            if name == 'web_search':
+                q = str(args.get('query') or args.get('q') or '').strip()
+                if not q:
+                    return False, '缺少搜索关键词'
+                try:
+                    import requests as _r
+                    r = _r.get('https://duckduckgo.com/html/', params={'q': q}, timeout=10,
+                               headers={'User-Agent': 'Mozilla/5.0'})
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(r.text, 'html.parser')
+                    results = []
+                    for item in soup.select('.result')[:5]:
+                        title = item.select_one('.result__title')
+                        snippet = item.select_one('.result__snippet')
+                        if title:
+                            results.append((title.get_text(strip=True),
+                                          snippet.get_text(strip=True) if snippet else ''))
+                    if not results:
+                        return False, '搜索无结果'
+                    return True, '\n\n'.join('%s\n%s' % (t, s) for t, s in results)
+                except Exception as e:
+                    return False, '搜索失败: %s' % e
             if name == 'start_crawl':
                 url = str(args.get('url') or '').strip()
                 if not url:
@@ -1420,7 +2433,7 @@ class ScraplingGrabberGUI:
                 return None
             from PIL import Image
             img = Image.open(_io.BytesIO(_b64.b64decode(png_b64))).convert('RGB')
-            img.thumbnail((768, 768))
+            img.thumbnail((512, 512))
             buf = _io.BytesIO()
             img.save(buf, 'JPEG', quality=85)
             b64 = _b64.b64encode(buf.getvalue()).decode()
@@ -1433,37 +2446,6 @@ class ScraplingGrabberGUI:
             return b64, shot_path
         except Exception:
             return None
-
-    def _ai_execute_js(self, code, timeout=8):
-        """CDP 在活跃标签页执行 JS，返回 (ok, 结果)。网页游戏修改/页面调试工具"""
-        import json as _json
-        import urllib.request as _ur
-        import websocket as _ws
-        try:
-            pages = _json.loads(_ur.urlopen('http://127.0.0.1:9222/json/list', timeout=5).read())
-            pages = [t for t in pages if t.get('type') == 'page']
-            if not pages:
-                return False, '调试浏览器没有打开的网页'
-            active = next((t for t in pages if t.get('active')), pages[0])
-            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=timeout)
-            ws.send(_json.dumps({'id': 1, 'method': 'Runtime.evaluate', 'params': {
-                'expression': code, 'returnByValue': True, 'awaitPromise': False}}))
-            resp = _json.loads(ws.recv())
-            ws.close()
-            if 'error' in resp:
-                return False, '执行失败: %s' % resp['error'].get('message', '?')
-            r = resp.get('result', {})
-            if 'exceptionDetails' in r:
-                return False, 'JS异常: %s' % r['exceptionDetails'].get('exception', {}).get('description',
-                                    r['exceptionDetails'].get('text', '?'))[:300]
-            val = r.get('result', {})
-            if 'value' in val:
-                return True, '执行成功: %s' % _json.dumps(val['value'], ensure_ascii=False)[:500]
-            if 'description' in val:
-                return True, '执行成功: %s' % val['description'][:500]
-            return True, '执行成功（无返回值）'
-        except Exception as e:
-            return False, '执行JS失败: %s' % e
 
     def _ai_execute_js(self, code, timeout=8):
         """CDP 在活跃标签页执行 JS，返回 (ok, 结果文本)。网页游戏修改工具"""
@@ -1496,11 +2478,13 @@ class ScraplingGrabberGUI:
             return False, '执行JS失败: %s' % e
 
     # ===== EC 模式：网页游戏数值搜索/过滤/修改/锁定 =====
-    def _ai_ec_scan(self, value, prev_segs=None):
-        """EC模式扫描：首次=iframe(若有)+多引擎(Cocos场景树/Phaser/全局game)→window；再次=按上次路径过滤。
+    def _ai_ec_scan(self, value, prev_segs=None, compare=None, unknown=False):
+        """EC模式扫描：首次=iframe(若有)+多引擎(Cocos场景树/Phaser/全局game)→window；
+        再次=按上次路径过滤。compare: None=精确值; 'unchanged'/'changed'/'increased'/'decreased'=变动对比。
         返回 [(segs列表, 当前值)]；segs 段为字符串键，特殊段 'name()' 表示调用方法，'frameN' 表示第N个iframe"""
         import json as _json
         import websocket as _ws
+        # prev_segs 在 diff 模式下是 [[seg, oldval], ...]，精确模式下是 [seg, ...]
         prev = _json.dumps(prev_segs or [])
         resolve = ('function __r(seg){var cur=window;'
                    'for(var j=1;j<seg.length;j++){var k=seg[j];'
@@ -1508,46 +2492,67 @@ class ScraplingGrabberGUI:
                    'else if(typeof k==="string"&&k.slice(0,5)==="frame"){cur=window.frames[parseInt(k.slice(5),10)];}'
                    'else if(typeof k==="string"&&k.slice(-2)==="()"){cur=cur[k.slice(0,-2)]();}'
                    'else{cur=cur[k];}}return cur;}')
-        if prev_segs:
+        if compare:
+            # 变动对比模式：prev 是 [[seg, oldval], ...]
+            cmp_js = {
+                'unchanged': 'cur===old',
+                'changed': 'typeof cur==="number"&&cur!==old',
+                'increased': 'typeof cur==="number"&&cur>old',
+                'decreased': 'typeof cur==="number"&&cur<old',
+            }[compare]
+            js = ('(function(){var prev=%(p)s;var out=[];'
+                  'for(var i=0;i<prev.length;i++){try{'
+                  'var seg=prev[i][0];var old=prev[i][1];var cur=__r(seg);'
+                  'if(typeof cur!=="number")continue;'
+                  'if(%(cmp)s){out.push({s:seg,v:cur});}'
+                  '}catch(e){}}return out.slice(0,500);})()'
+                  % {'p': prev, 'cmp': cmp_js})
+        elif prev_segs:
             # 过滤模式：只对上次命中的路径重新取值判断（number/string 都支持）
+            # prev 现在是 [[seg, oldval], ...]，取 seg
             js = ('(function(){var target=%(v)s;var tstr=String(target);var prev=%(p)s;var out=[];'
                   'for(var i=0;i<prev.length;i++){try{'
-                  'var seg=prev[i];var cur=__r(seg);'
+                  'var seg=prev[i][0];var cur=__r(seg);'
                   'if((typeof cur==="number"&&cur===target)||(typeof cur==="string"&&cur===tstr)){out.push({s:seg,v:cur});}'
                   '}catch(e){}}return out.slice(0,500);})()'
                   % {'v': repr(value), 'p': prev})
         else:
             # 首次扫描：先枚举同源iframe（webview壳游戏常嵌iframe），
             # 每个frame扫 Cocos场景树(深18)→cc/game对象树(深14)→window(深8)，number/string都搜
-            js = ('(function(){var target=%(v)s;var tstr=String(target);var hits=[];var seen=[];'
+            _unk = 'true' if unknown else 'false'
+            _v_js = 'null' if unknown else repr(value)
+            js = ('(function(){var target=%(v)s;var tstr=String(target);var unk=%(unk)s;var hits=[];var seen=[];'
                   'function __push(seg,v){if(hits.length<500)hits.push({s:seg,v:v});}'
                   'function __walk(o,p,d,lim){'
                   'if(d>lim||o===null||hits.length>=500)return;var t=typeof o;'
-                  'if(t==="number"){if(o===target)__push(p,o);return;}'
-                  'if(t==="string"){if(o===tstr)__push(p,o);return;}'
+                  'if(t==="number"){if(unk||o===target)__push(p,o);return;}'
+                  'if(t==="string"){if(!unk&&o===tstr)__push(p,o);return;}'
                   'if(t!=="object")return;if(seen.indexOf(o)>=0)return;seen.push(o);'
                   'var ks=[];try{ks=Object.keys(o);}catch(e){return;}'
                   'for(var i=0;i<ks.length;i++){try{var k=ks[i];var v=o[k];'
-                  'if(typeof v==="number"){if(v===target)__push(p.concat([k]),v);}'
-                  'else if(typeof v==="string"){if(v===tstr)__push(p.concat([k]),v);}'
+                  'if(typeof v==="number"){if(unk||v===target)__push(p.concat([k]),v);}'
+                  'else if(typeof v==="string"){if(!unk&&v===tstr)__push(p.concat([k]),v);}'
                   'else if(typeof v==="object"&&v!==null){__walk(v,p.concat([k]),d+1,lim);}'
                   '}catch(e){}}}'
                   'function __scanFrame(f,prefix){'
                   'try{var CC=f.cc||f.CocosEngine;'
                   'if(CC&&CC.director){var sc=CC.director.getScene();'
                   'if(sc){__walk(sc,prefix.concat(["cc","director","getScene()"]),0,18);}'
-                  'if(hits.length===0){__walk(CC,prefix.concat(["cc"]),0,14);}'
+                  'if(unk||hits.length===0){__walk(CC,prefix.concat(["cc"]),0,14);}'
                   '}}catch(e){}'
-                  'if(hits.length===0){try{var G=f.game||f.Game||f.Phaser||f.PIXI||f.THREE;'
-                  'if(G){__walk(G,prefix.concat(["game"]),0,14);}}catch(e){}}'
-                  'if(hits.length===0){try{__walk(f,prefix.concat(["window"]),0,8);}catch(e){}}'
+                  'try{var rmKeys=["$gameActors","$gameParty","$gamePlayer","$gameTroop","$gameMap","$gameSwitches","$gameVariables"];'
+                  'for(var ri=0;ri<rmKeys.length;ri++){try{var rm=f[rmKeys[ri]];if(rm){__walk(rm,prefix.concat([rmKeys[ri]]),0,10);}}catch(e){}}'
+                  '}catch(e){}'
+                  'try{var G=f.game||f.Game||f.Phaser||f.PIXI||f.THREE;'
+                  'if(G){__walk(G,prefix.concat(["game"]),0,14);}}catch(e){}'
+                  'try{__walk(f,prefix.concat(["window"]),0,8);}catch(e){}'
                   '}'
                   'var frames=[window];'
                   'try{var fs=document.querySelectorAll("iframe");'
                   'for(var i=0;i<fs.length&&i<8;i++){try{frames.push(fs[i].contentWindow);}catch(e){}}}catch(e){}'
                   'for(var i=0;i<frames.length;i++){try{__scanFrame(frames[i],["frame"+i]);}catch(e){}'
-                  'if(hits.length>0)break;}'
-                  'return hits.slice(0,500);})()' % {'v': repr(value)})
+                  'if(!unk&&hits.length>0)break;}'
+                  'return hits.slice(0,500);})()' % {'v': _v_js, 'unk': _unk})
         try:
             pages = _json.loads(urllib.request.urlopen('http://127.0.0.1:9222/json/list', timeout=5).read())
             pages = [t for t in pages if t.get('type') == 'page']
@@ -1567,8 +2572,22 @@ class ScraplingGrabberGUI:
             return None
 
     def _ec_assign_expr(self, segs, value):
-        """生成给路径赋值的 JS 表达式（支持调用段 k() 与 iframe 段 frameN；末段为调用则不可赋值）"""
+        """生成给路径赋值的 JS 表达式（支持调用段 k() 与 iframe 段 frameN；末段为调用则不可赋值）
+        特殊段：['__wasm', memIdx, type, offset] —— 写入 WASM 线性内存"""
         import json as _json
+        # ---- WASM 线性内存写入 ----
+        if segs and str(segs[0]) == '__wasm' and len(segs) >= 4:
+            try:
+                _mi = int(segs[1])
+                _t = str(segs[2])
+                _off = int(segs[3])
+            except Exception:
+                return 'null'
+            if _t not in WASM_TYPE_SIZE:
+                return 'null'
+            return ('(function(){var v=%s;'
+                    'var r=window.__wgWrite(%d,%r,%d,v);'
+                    'return r;})()' % (_json.dumps(value), _mi, _t, _off))
         segj = _json.dumps(segs)
         return ('(function(){var seg=%s;var cur=window;'
                 'for(var j=1;j<seg.length-1;j++){var k=seg[j];'
@@ -1603,10 +2622,15 @@ class ScraplingGrabberGUI:
         return self._ai_execute_js(js, timeout=8)
 
     def _ai_ec_reload(self, segs):
-        """EC恢复：按保存的变量路径回读当前值（页面刷新后变量重建，路径一般仍有效）"""
+        """EC恢复：按保存的变量路径回读当前值（页面刷新后变量重建，路径一般仍有效）
+        支持 WASM 段 ['__wasm', memIdx, type, offset]，走 __wgRead 回读"""
         import json as _json
         import websocket as _ws
-        resolve = ('function __r(seg){var cur=window;'
+        self._wasm_boot()   # 确保 WASM 读写助手已注入
+        resolve = ('function __r(seg){'
+                   'if(seg[0]==="__wasm"&&window.__wgRead){'
+                   'return window.__wgRead(seg[1],seg[2],seg[3]);}'
+                   'var cur=window;'
                    'for(var j=1;j<seg.length;j++){var k=seg[j];'
                    'if(k==="frame0"){cur=window;}'
                    'else if(typeof k==="string"&&k.slice(0,5)==="frame"){cur=window.frames[parseInt(k.slice(5),10)];}'
@@ -1697,7 +2721,7 @@ class ScraplingGrabberGUI:
             finally:
                 if hide:
                     self.ai_float_win.deiconify()
-            img.thumbnail((768, 768))
+            img.thumbnail((512, 512))
             buf = io.BytesIO()
             img.save(buf, 'JPEG', quality=85)
             b64 = base64.b64encode(buf.getvalue()).decode()
@@ -1711,10 +2735,54 @@ class ScraplingGrabberGUI:
         except Exception:
             return None
 
+    def _ai_stop_chat(self):
+        """停止当前AI请求：直接kill llama-server，立即中断"""
+        self._ai_stop_flag = True
+        self._ai_busy = False
+        try:
+            self.ai_progress.stop()
+        except Exception:
+            pass
+        if self.ai_mode_var.get() == 'local' and self.ai_proc and self.ai_proc.poll() is None:
+            try:
+                self.ai_proc.kill()
+                self.ai_proc.wait(timeout=3)
+            except Exception:
+                pass
+            self.ai_proc = None
+            self.ai_ok = False
+            self._ai_update_status('待启动')
+        self._ai_log_chat('resp', '[已停止]')
+
+    def _ai_idle_check(self):
+        """3分钟空闲自动释放llama-server显存"""
+        if getattr(self, '_ai_busy', False):
+            return
+        if self.ai_mode_var.get() != 'local':
+            return
+        if not (self.ai_proc and self.ai_proc.poll() is None):
+            return
+        idle = time.time() - getattr(self, '_ai_last_use', time.time())
+        if idle > 180:
+            try:
+                self.ai_proc.kill()
+                self.ai_proc.wait(timeout=3)
+                self.ai_proc = None
+                self.ai_ok = False
+                self._ai_update_status('待启动')
+                self._log('AI服务: 3分钟空闲，已自动释放显存')
+            except Exception:
+                pass
+
     def _ai_vision_chat(self, user_text, jpg_b64, shot_path):
         """带截图对话：截图+问题 → 模型看图回答，可调用工具（如 ai_adjust_crawl 调整抓取策略）"""
         import requests
+        if getattr(self, '_ai_busy', False):
+            self._ai_log_chat('resp', '[忙] AI正在处理上一个请求，请稍等几秒再发')
+            return
+        self._ai_busy = True
         self._ai_log_chat('req', '[截图识别] %s\n（截图: %s）' % (user_text, shot_path))
+        self._ai_stop_flag = False
         try:
             port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
             ctx = int(self.ai_chat_ctx_var.get() or 12)
@@ -1731,12 +2799,13 @@ class ScraplingGrabberGUI:
                     ]}]
         final = ''
         last_fail = None   # 连续失败保护
+        self._ai_log_chat('resp', '[思考中... 视觉模型识别图片可能需要30-60秒]')
         for _ in range(5):
             try:
                 body = {'messages': messages, 'max_tokens': 1024, 'temperature': 0.3}
-                ok, resp = self._ai_completion(body, timeout=300)
+                ok, resp = self._ai_completion(body, timeout=180)
                 if not ok:
-                    final = '(调用失败)'
+                    final = '(调用失败: %s)' % getattr(self, '_last_ai_error', '未知错误')
                     break
                 content = (resp['choices'][0]['message'].get('content') or '').strip()
             except Exception as e:
@@ -1762,6 +2831,15 @@ class ScraplingGrabberGUI:
             self._ai_chat_history.append({'role': 'user',
                                           'content': user_text + '（基于浏览器截图，截图已保存: %s）' % shot_path})
             self._ai_chat_history.append({'role': 'assistant', 'content': final})
+        self._ai_busy = False
+        # 视觉请求完成后清空llama-server上下文，释放显存KV cache（不重启进程）
+        if self.ai_mode_var.get() == 'local' and self.ai_proc and self.ai_proc.poll() is None:
+            try:
+                import requests as _req
+                port = int(self.ai_port_var.get() or AI_DEFAULT_PORT)
+                _req.post('http://127.0.0.1:%d/reset' % port, timeout=5)
+            except Exception:
+                pass
 
     def _ai_chat_send(self):
         """AI 对话（页签版）：发送用户消息，模型可调用工具操作软件；若已添加截图则走看图识别"""
@@ -2061,11 +3139,16 @@ class ScraplingGrabberGUI:
         """创建界面控件（按照web-grabber布局）"""
         # 主容器
         main_container = ttk.Frame(self.root)
-        main_container.pack(fill='both', expand=True, padx=5, pady=5)
+        main_container.pack(fill='both', expand=True, padx=8, pady=8)
 
-        # 顶部设置区域
-        top_frame = ttk.Frame(main_container)
-        top_frame.pack(fill='x', pady=(0, 5))
+        # 顶部设置区域（卡片式分组）
+        top_frame = ttk.Frame(main_container, style='Card.TFrame')
+        self.top_frame = top_frame
+        top_frame.pack(fill='x', pady=(0, 3), ipadx=8, ipady=3)
+
+        # 底部状态栏（先占住底部，页签再吃剩余空间，避免被挤出窗口）
+        status_bar = ttk.Frame(main_container, style='Card.TFrame')
+        status_bar.pack(side='bottom', fill='x', pady=(6, 0), ipady=4)
 
         # 底部内容区域（任务列表/日志/浏览器 三个页签）
         self.content_notebook = ttk.Notebook(main_container)
@@ -2085,16 +3168,21 @@ class ScraplingGrabberGUI:
         self.browser_host = None
         self.browser_hwnd = None
         # 浏览器提示标签
-        self.browser_hint = ttk.Label(self.browser_frame, text='点击「启动调试浏览器」按钮，浏览器将自动嵌入到这里', font=('Arial', 12))
+        self.browser_hint = ttk.Label(self.browser_frame, style='Muted.TLabel',
+                                      text='点「高级选项 ▾ → 启动调试浏览器」，浏览器会自动嵌入到这里',
+                                      font=(UI_FONT, 12))
         self.browser_hint.pack(expand=True)
 
         # AI 对话页签（可直接与本地模型对话 + 自动记录每次 AI 调用）
         ai_tab = ttk.Frame(self.content_notebook)
         self.content_notebook.add(ai_tab, text='AI对话')
+        self._build_character_tab()
         ai_top = ttk.Frame(ai_tab)
         ai_top.pack(fill='x', pady=2, padx=4)
         ttk.Button(ai_top, text='清除', width=6, command=self._ai_clear_chat).pack(side='left')
-        ttk.Label(ai_top, text='（蓝=发给模型，绿=模型回复，橙=工具执行；可直接提要求操作软件，如"抓取这个站"）', foreground='#999').pack(side='left', padx=8)
+        ttk.Label(ai_top, text='（蓝=发给模型，绿=模型回复，橙=工具执行；可直接提要求操作软件，如"抓取这个站"）', style='Muted.TLabel').pack(side='left', padx=8)
+        self.ai_progress = ttk.Progressbar(ai_tab, mode='indeterminate')
+        self.ai_progress.pack(side='top', fill='x', padx=4)
         self.ai_chat_text = tk.Text(ai_tab, wrap='word', font=('Consolas', 9))
         ai_scroll = ttk.Scrollbar(ai_tab, command=self.ai_chat_text.yview)
         self.ai_chat_text.configure(yscrollcommand=ai_scroll.set)
@@ -2113,6 +3201,12 @@ class ScraplingGrabberGUI:
         self.ai_chat_input.pack(side='top', fill='x')
         self.ai_chat_input.bind('<Return>', lambda e: self._ai_chat_send())
         self.ai_chat_input.bind('<Control-v>', lambda e: self._ai_on_ctrl_v(self.ai_chat_input))
+        try:
+            import windnd
+            windnd.hook_dropfiles(self.ai_chat_input, func=self._ai_on_drop_file)
+            windnd.hook_dropfiles(self.ai_chat_text, func=self._ai_on_drop_file)
+        except Exception:
+            pass
         ai_btn_row = ttk.Frame(ai_input_frame)
         ai_btn_row.pack(side='top', fill='x', pady=(3, 0))
         ttk.Button(ai_btn_row, text='截图给AI', width=8, command=self._ai_add_shot).pack(side='left', padx=(0, 4))
@@ -2120,6 +3214,7 @@ class ScraplingGrabberGUI:
         ttk.Button(ai_btn_row, text='选区', width=6, command=self._ai_region_shot).pack(side='left', padx=(0, 4))
         ttk.Button(ai_btn_row, text='清空', width=6, command=self._ai_clear_chat).pack(side='left', padx=(0, 4))
         ttk.Button(ai_btn_row, text='发送', width=6, command=self._ai_chat_send).pack(side='right')
+        ttk.Button(ai_btn_row, text='停止', width=6, command=self._ai_stop_chat).pack(side='right', padx=(0, 4))
         # Text 最后 pack 吃剩余空间（先 pack 底栏，避免被 expand 挤到右下角）
         ai_scroll.pack(side='right', fill='y')
         self.ai_chat_text.pack(side='left', fill='both', expand=True)
@@ -2129,118 +3224,192 @@ class ScraplingGrabberGUI:
         # ===== 顶部设置区域 =====
         # top_frame已经在上面定义了
 
-        # 网址（带历史记录）
+        # ===== 顶部设置区（精简：2 行常用 + 工具栏 + 可折叠高级选项）=====
+
+        # 行1：网址 + 主操作（开始抓取放最显眼位置）
         url_frame = ttk.Frame(top_frame)
-        url_frame.pack(fill='x', pady=1)
+        url_frame.pack(fill='x', pady=(0, 0))
         ttk.Label(url_frame, text='网址:', width=6).pack(side='left')
         self.url_var = tk.StringVar()
-        self.url_combo = ttk.Combobox(url_frame, textvariable=self.url_var, height=5, width=60)
-        self.url_combo.pack(side='left', padx=3)
-        # 收藏按钮
-        ttk.Button(url_frame, text='收藏', command=self._favorite_url, width=6).pack(side='left', padx=3)
-        # 设置按钮（模型/保存路径等不常改的配置）
-        ttk.Button(url_frame, text='设置', command=self._open_settings, width=6).pack(side='left', padx=3)
+        self.url_combo = ttk.Combobox(url_frame, textvariable=self.url_var, height=5)
+        self.url_combo.pack(side='left', fill='x', expand=True, padx=(0, 6))
+        ttk.Button(url_frame, text='收藏', command=self._favorite_url, width=6).pack(side='left', padx=(0, 4))
+        ttk.Button(url_frame, text='设置', command=self._open_settings, width=6).pack(side='left', padx=(0, 4))
+        # 「高级选项」跟在「设置」后面（低频开关 + 功能入口都收进这个可展开面板）
+        self.adv_toggle_btn = ttk.Button(url_frame, text='高级选项 ▾', command=self._toggle_advanced)
+        self.adv_toggle_btn.pack(side='left', padx=(0, 8))
+        self.start_btn = ttk.Button(url_frame, text='开始抓取', style='Accent.TButton', command=self._start_crawl)
+        self.start_btn.pack(side='left')
         self._load_url_history()
 
-        # 保存目录（只读显示，修改在设置窗口）
-        dir_frame = ttk.Frame(top_frame)
-        dir_frame.pack(fill='x', pady=1)
-        ttk.Label(dir_frame, text='保存到:', width=6).pack(side='left')
-        self.dir_var = tk.StringVar(value=os.path.join(os.getcwd(), 'downloads'))
-        ttk.Label(dir_frame, textvariable=self.dir_var, foreground='#555').pack(side='left')
 
-        self.smart_filter_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(dir_frame, text='智能过滤', variable=self.smart_filter_var).pack(side='left', padx=5)
-        # 下载视频开关
-        self.download_video_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(dir_frame, text='下载视频', variable=self.download_video_var).pack(side='left', padx=5)
+        # 运行控制行（暂停/停止/重试失败）：默认整行隐藏，开始抓取时自动出现，任务结束自动收起
+        self.btn_frame = ttk.Frame(top_frame)
+        btn_frame = self.btn_frame
+        self._run_bar_visible = False
+        self.pause_btn = ttk.Button(btn_frame, text='暂停', style='Row.TButton', command=self._toggle_pause, state='disabled')
+        self.pause_btn.pack(side='left')
+        self.stop_btn = ttk.Button(btn_frame, text='停止', style='Row.Danger.TButton', command=self._stop_crawl, state='disabled')
+        self.stop_btn.pack(side='left', padx=4)
+        self.retry_btn = ttk.Button(btn_frame, text='重试失败', style='Row.TButton', command=self._retry_failed, state='disabled')
+        self.retry_btn.pack(side='left')
 
-        self.incremental_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(dir_frame, text='增量扫描', variable=self.incremental_var).pack(side='left', padx=5)
+        # ===== 可折叠高级选项面板（默认收起：抓取参数 + 功能入口 + 低频配置都在这里）=====
+        adv_frame = ttk.Frame(top_frame)
+        self.adv_frame = adv_frame
+        self._adv_packed = False
 
-        self.force_rescan_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(dir_frame, text='强制重扫', variable=self.force_rescan_var).pack(side='left', padx=5)
-
-        # 磁吸窗按钮（放在保存目录行右侧空白）
-        ttk.Button(dir_frame, text='AI对话', width=10, command=self._toggle_ai_float_window).pack(side='left', padx=(10, 4))
-        ttk.Button(dir_frame, text='游戏修改', width=10, command=self._toggle_game_mod_window).pack(side='left')
-        # 预约抢购辅助：资料库 + 一键自动填写（工行/农行纪念币预约等表单）
-        ttk.Button(dir_frame, text='预约资料', width=8, command=self._open_appt_window).pack(side='left', padx=(10, 2))
-        ttk.Button(dir_frame, text='自动填写', width=8, command=self._appt_fill).pack(side='left')
-
-        # 选项行
-        opt_frame = ttk.Frame(top_frame)
-        opt_frame.pack(fill='x', pady=2)
-
+        # 面板第 1 排：抓取参数（原先挤在工具行右侧，现收进面板）
+        opt_frame = ttk.Frame(adv_frame)
+        self.opt_frame = opt_frame
+        ttk.Label(opt_frame, text='抓取参数:', style='Muted.TLabel').pack(side='left', padx=(0, 8))
         ttk.Label(opt_frame, text='模式:').pack(side='left')
         self.grab_mode_var = tk.StringVar(value='单页')
-        mode_combo = ttk.Combobox(opt_frame, textvariable=self.grab_mode_var, width=6, state='readonly')
+        mode_combo = ttk.Combobox(opt_frame, textvariable=self.grab_mode_var, width=5,
+                                  state='readonly', style='Row.TCombobox')
         mode_combo['values'] = ('单页', '全站')
         mode_combo.pack(side='left', padx=(2, 10))
-
         ttk.Label(opt_frame, text='范围:').pack(side='left')
         self.post_range_var = tk.StringVar(value='20')
-        ttk.Entry(opt_frame, textvariable=self.post_range_var, width=6).pack(side='left', padx=(2, 10))
-        ttk.Label(opt_frame, text='页码(0=全部):').pack(side='left')
+        ttk.Entry(opt_frame, textvariable=self.post_range_var, width=4,
+                  style='Row.TEntry').pack(side='left', padx=(2, 10))
+        ttk.Label(opt_frame, text='页码:').pack(side='left')
         self.page_num_var = tk.StringVar(value='0')
-        ttk.Entry(opt_frame, textvariable=self.page_num_var, width=4).pack(side='left', padx=(2, 10))
-        # （已去掉页码输入框）
-
-        ttk.Label(opt_frame, text='最小图(KB):').pack(side='left')
-        self.min_size_var = tk.IntVar(value=0)
-        ttk.Spinbox(opt_frame, from_=0, to=10000, textvariable=self.min_size_var, width=5).pack(side='left', padx=(2, 10))
-
-        ttk.Label(opt_frame, text='线程:').pack(side='left')
-        self.threads_var = tk.IntVar(value=8)
-        ttk.Spinbox(opt_frame, from_=1, to=32, textvariable=self.threads_var, width=4).pack(side='left', padx=(2, 10))
-
-        ttk.Label(opt_frame, text='超时:').pack(side='left')
-        self.timeout_var = tk.IntVar(value=15)
-        ttk.Spinbox(opt_frame, from_=5, to=60, textvariable=self.timeout_var, width=4).pack(side='left', padx=(2, 10))
-
+        ttk.Entry(opt_frame, textvariable=self.page_num_var, width=3,
+                  style='Row.TEntry').pack(side='left', padx=(2, 10))
         ttk.Label(opt_frame, text='抓取:').pack(side='left')
         self.render_mode_var = tk.StringVar(value='直连模式')
-        render_combo = ttk.Combobox(opt_frame, textvariable=self.render_mode_var, width=12, state='readonly')
+        render_combo = ttk.Combobox(opt_frame, textvariable=self.render_mode_var, width=13,
+                                    state='readonly', style='Row.TCombobox')
         render_combo['values'] = ('直连模式', '浏览器渲染', '浏览器模式(CDP)')
         render_combo.pack(side='left', padx=(2, 10))
+        ttk.Label(opt_frame, text='浏览器:').pack(side='left')
+        self.browser_choice_var = tk.StringVar(value='Chrome')
+        browser_combo = ttk.Combobox(opt_frame, textvariable=self.browser_choice_var, width=7,
+                                     state='readonly', style='Row.TCombobox')
+        browser_combo['values'] = ('Chrome', 'Edge')
+        browser_combo.pack(side='left', padx=(2, 0))
+        opt_frame.pack(fill='x', padx=(10, 10), pady=(2, 0))   # 面板第 1 排
+        # 「独立窗口 / 启动调试浏览器 / 切换浅色」也在本面板（见下方 E 行）
+        # 保存目录在「设置」窗口里配置，主界面不再重复展示
+        self.dir_var = tk.StringVar(value=os.path.join(os.getcwd(), 'downloads'))
 
-        # AI 操作行（模型路径等配置在设置窗口）
-        ai_opt = ttk.Frame(top_frame)
-        ai_opt.pack(fill='x', pady=1)
-        self.ai_filter_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ai_opt, text='启用AI过滤', variable=self.ai_filter_var).pack(side='left')
-        self.ai_prompt_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ai_opt, text='AI生成提示词', variable=self.ai_prompt_var).pack(side='left', padx=(8, 0))
-        self.ai_auto_stop_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ai_opt, text='抓取完自动停止', variable=self.ai_auto_stop_var).pack(side='left', padx=(8, 0))
-        self.ai_prescreen_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ai_opt, text='下载前AI预筛', variable=self.ai_prescreen_var).pack(side='left', padx=(8, 0))
-        ttk.Label(ai_opt, text='模型:').pack(side='left', padx=(10, 2))
-        self.ai_preset_var = tk.StringVar(value='内置4B（6G显存）')
-        preset_combo = ttk.Combobox(ai_opt, textvariable=self.ai_preset_var, width=24, state='readonly')
-        preset_combo['values'] = list(AI_MODEL_PRESETS.keys())
-        preset_combo.pack(side='left', padx=2)
-        preset_combo.bind('<<ComboboxSelected>>', lambda e: self._ai_apply_preset())
-        self.ai_toggle_btn = ttk.Button(ai_opt, text='启动AI服务', command=self._ai_toggle_server, width=12)
-        self.ai_toggle_btn.pack(side='left', padx=6)
-        self.ai_status_var = tk.StringVar(value=self._ai_state)
-        ttk.Label(ai_opt, textvariable=self.ai_status_var, foreground='#888').pack(side='left')
+        def _dir_display(*_args):
+            d = self.dir_var.get().strip()
+            if d and d not in getattr(self, '_dir_history', []):
+                self._dir_remember(d)
+        self.dir_var.trace_add('write', _dir_display)
 
-        # 格式转换行：下载时 WEBP/AVIF 自动转 JPG（可选）
-        conv_opt = ttk.Frame(top_frame)
-        conv_opt.pack(fill='x', pady=1)
-        self.convert_webp_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(conv_opt, text='WEBP转JPG', variable=self.convert_webp_var).pack(side='left')
-        self.convert_avif_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(conv_opt, text='AVIF转JPG', variable=self.convert_avif_var).pack(side='left', padx=(8, 0))
-        ttk.Label(conv_opt, text='JPG品质(1-100):').pack(side='left', padx=(10, 2))
-        self.jpg_quality_var = tk.IntVar(value=90)
-        ttk.Spinbox(conv_opt, from_=1, to=100, textvariable=self.jpg_quality_var, width=4).pack(side='left')
+        # E 行：功能入口 + 浏览器工具（原先挤在工具行右侧，现统一收进这里）
+        adv_e = ttk.Frame(adv_frame)
+        adv_e.pack(fill='x', padx=(10, 10), pady=(10, 0))
+        ttk.Label(adv_e, text='功能入口:', style='Muted.TLabel').pack(side='left', padx=(0, 6))
+        # 按钮统一靠右排列、加大加粗（左边只留标题，看着不挤也更醒目）
+        grp_tools = ttk.Frame(adv_e)
+        grp_tools.pack(side='right')
+        grp_entry = ttk.Frame(adv_e)
+        grp_entry.pack(side='right', padx=(0, 24))
+        for txt, cmd in (('AI对话', self._toggle_ai_float_window),
+                         ('酒馆', self._open_sillytavern),
+                         ('游戏修改', self._toggle_game_mod_window),
+                         ('预约资料', self._open_appt_window),
+                         ('自动填写', self._appt_fill)):
+            ttk.Button(grp_entry, text=txt, style='Feature.TButton',
+                       command=cmd).pack(side='left', padx=(0, 8))
+        self.independent_btn = ttk.Button(grp_tools, text='独立窗口', style='Feature.TButton',
+                                          command=self._open_independent_browser)
+        self.independent_btn.pack(side='left', padx=(0, 8))
+        self.browser_btn = ttk.Button(grp_tools, text='启动调试浏览器', style='Feature.TButton',
+                                      command=self._launch_debug_browser)
+        self.browser_btn.pack(side='left', padx=(0, 8))
+        self.theme_btn = ttk.Button(grp_tools, style='Feature.TButton',
+                                    text='切换浅色' if self.theme_name == 'dark' else '切换深色',
+                                    command=self._toggle_theme)
+        self.theme_btn.pack(side='left')
+
+        # 分组分隔线：上面是「常用入口」，下面才是抓取选项
+        adv_sep1 = ttk.Separator(adv_frame, orient='horizontal')
+        adv_sep1.pack(fill='x', padx=(10, 10), pady=(10, 0))
+        # A 行：过滤与翻页
+        adv_a = ttk.Frame(adv_frame)
+        adv_a.pack(fill='x', padx=(10, 10), pady=(10, 0))
+        self.smart_filter_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(adv_a, text='智能过滤', variable=self.smart_filter_var).pack(side='left')
+        self.download_video_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(adv_a, text='下载视频', variable=self.download_video_var).pack(side='left', padx=(18, 0))
+        self.incremental_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(adv_a, text='增量扫描', variable=self.incremental_var).pack(side='left', padx=(18, 0))
+        self.force_rescan_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(adv_a, text='强制重扫', variable=self.force_rescan_var).pack(side='left', padx=(18, 0))
         self.auto_page_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(conv_opt, text='自动翻页抓全部(N.html)', variable=self.auto_page_var).pack(side='left', padx=(12, 0))
-        ttk.Label(conv_opt, text='最多页:').pack(side='left', padx=(8, 2))
+        ttk.Checkbutton(adv_a, text='自动翻页抓全部', variable=self.auto_page_var).pack(side='left', padx=(18, 0))
+        ttk.Label(adv_a, text='最多页:').pack(side='left', padx=(20, 4))
         self.auto_page_max_var = tk.IntVar(value=100)
-        ttk.Spinbox(conv_opt, from_=2, to=999, textvariable=self.auto_page_max_var, width=5).pack(side='left')
+        ttk.Spinbox(adv_a, from_=2, to=999, textvariable=self.auto_page_max_var, width=5).pack(side='left')
+        # B 行：AI 选项（开关一排）
+        adv_b = ttk.Frame(adv_frame)
+        adv_b.pack(fill='x', padx=(10, 10), pady=(10, 0))
+        self.ai_filter_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(adv_b, text='启用AI过滤', variable=self.ai_filter_var).pack(side='left')
+        self.ai_prompt_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(adv_b, text='AI生成提示词', variable=self.ai_prompt_var).pack(side='left', padx=(18, 0))
+        self.ai_auto_stop_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(adv_b, text='抓取完自动停止', variable=self.ai_auto_stop_var).pack(side='left', padx=(18, 0))
+        self.ai_prescreen_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(adv_b, text='下载前AI预筛', variable=self.ai_prescreen_var).pack(side='left', padx=(18, 0))
+
+        # B2 行：AI 模型与服务（单独一排，别挤在开关后面）
+        adv_b2 = ttk.Frame(adv_frame)
+        adv_b2.pack(fill='x', padx=(10, 10), pady=(10, 0))
+        ttk.Label(adv_b2, text='模型:').pack(side='left', padx=(24, 4))
+        self.ai_preset_var = tk.StringVar(value='内置4B（无审查·6G显存）')
+        preset_combo = ttk.Combobox(adv_b2, textvariable=self.ai_preset_var, width=26, state='readonly')
+        preset_combo['values'] = list(AI_MODEL_PRESETS.keys())
+        preset_combo.pack(side='left', padx=(0, 10))
+        preset_combo.bind('<<ComboboxSelected>>', lambda e: self._ai_apply_preset())
+        self.ai_toggle_btn = ttk.Button(adv_b2, text='启动AI服务', command=self._ai_toggle_server, width=12)
+        self.ai_toggle_btn.pack(side='left', padx=(0, 12))
+        self.ai_status_var = tk.StringVar(value=self._ai_state)
+        # AI 服务状态灯：绿=运行中 黄=启动中 红=异常 灰=已停止
+        self.ai_status_light = tk.Canvas(adv_b2, width=16, height=16,
+                                         highlightthickness=0, bg=self.palette['surface'])
+        self.ai_status_light.pack(side='left', padx=(4, 6))
+        self._ai_light_ball = self.ai_status_light.create_oval(2, 2, 14, 14,
+                                                                fill='#9e9e9e', outline='#555555')
+        ttk.Label(adv_b2, textvariable=self.ai_status_var, style='Muted.TLabel').pack(side='left')
+        # C 行：格式转换与性能
+        adv_c = ttk.Frame(adv_frame)
+        adv_c.pack(fill='x', padx=(10, 10), pady=(10, 0))
+        self.convert_webp_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(adv_c, text='WEBP转JPG', variable=self.convert_webp_var).pack(side='left')
+        self.convert_avif_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(adv_c, text='AVIF转JPG', variable=self.convert_avif_var).pack(side='left', padx=(18, 0))
+        ttk.Label(adv_c, text='JPG品质(1-100):').pack(side='left', padx=(20, 4))
+        self.jpg_quality_var = tk.IntVar(value=90)
+        ttk.Spinbox(adv_c, from_=1, to=100, textvariable=self.jpg_quality_var, width=4).pack(side='left')
+        ttk.Label(adv_c, text='最小图(KB):').pack(side='left', padx=(18, 4))
+        self.min_size_var = tk.IntVar(value=0)
+        ttk.Spinbox(adv_c, from_=0, to=10000, textvariable=self.min_size_var, width=5).pack(side='left')
+        ttk.Label(adv_c, text='线程:').pack(side='left', padx=(18, 4))
+        self.threads_var = tk.IntVar(value=8)
+        ttk.Spinbox(adv_c, from_=1, to=32, textvariable=self.threads_var, width=4).pack(side='left')
+        ttk.Label(adv_c, text='超时:').pack(side='left', padx=(18, 4))
+        self.timeout_var = tk.IntVar(value=15)
+        ttk.Spinbox(adv_c, from_=5, to=60, textvariable=self.timeout_var, width=4).pack(side='left')
+        # 分组分隔线：上面是抓取选项，下面是浏览器模式
+        adv_sep2 = ttk.Separator(adv_frame, orient='horizontal')
+        adv_sep2.pack(fill='x', padx=(10, 10), pady=(10, 0))
+        # D 行：浏览器与保存路径
+        adv_d = ttk.Frame(adv_frame)
+        adv_d.pack(fill='x', padx=(10, 10), pady=(10, 0))
+        self.browser_mode_var = tk.BooleanVar(value=False)
+        def _on_browser_mode_change():
+            if self.browser_mode_var.get():
+                self.render_mode_var.set('浏览器模式(CDP)')
+            else:
+                self.render_mode_var.set('直连模式')
+        ttk.Checkbutton(adv_d, text='浏览器模式', variable=self.browser_mode_var, command=_on_browser_mode_change).pack(side='left')
+        ttk.Label(adv_d, text='（勾选后自动切到CDP抓取）', style='Muted.TLabel').pack(side='left', padx=(8, 0))
 
         # AI 模型/服务路径变量（控件在设置窗口）
         self.ai_model_var = tk.StringVar()
@@ -2263,35 +3432,6 @@ class ScraplingGrabberGUI:
         self.ai_api_adv_var = tk.BooleanVar(value=False)
         self.ai_api_temperature_var = tk.DoubleVar(value=0.3)
         self.ai_api_max_tokens_var = tk.IntVar(value=1024)
-
-        # 按钮行
-        btn_frame = ttk.Frame(top_frame)
-        btn_frame.pack(fill='x', pady=2)
-        self.start_btn = ttk.Button(btn_frame, text='开始抓取', command=self._start_crawl)
-        self.start_btn.pack(side='left', padx=3)
-        self.pause_btn = ttk.Button(btn_frame, text='暂停', command=self._toggle_pause, state='disabled')
-        self.pause_btn.pack(side='left', padx=3)
-        self.stop_btn = ttk.Button(btn_frame, text='停止', command=self._stop_crawl, state='disabled')
-        self.stop_btn.pack(side='left', padx=3)
-        self.retry_btn = ttk.Button(btn_frame, text='重试失败', command=self._retry_failed, state='disabled')
-        self.retry_btn.pack(side='left', padx=3)
-        self.browser_mode_var = tk.BooleanVar(value=False)
-        def _on_browser_mode_change():
-            if self.browser_mode_var.get():
-                self.render_mode_var.set('浏览器模式(CDP)')
-            else:
-                self.render_mode_var.set('直连模式')
-        browser_check = ttk.Checkbutton(btn_frame, text='浏览器模式', variable=self.browser_mode_var, command=_on_browser_mode_change)
-        browser_check.pack(side='left', padx=3)
-        ttk.Label(btn_frame, text='浏览器:').pack(side='left', padx=(10, 2))
-        self.browser_choice_var = tk.StringVar(value='Chrome')
-        browser_combo = ttk.Combobox(btn_frame, textvariable=self.browser_choice_var, width=6, state='readonly')
-        browser_combo['values'] = ('Chrome', 'Edge')
-        browser_combo.pack(side='left', padx=2)
-        self.browser_btn = ttk.Button(btn_frame, text='启动调试浏览器', command=self._launch_debug_browser)
-        self.browser_btn.pack(side='left', padx=3)
-        self.independent_btn = ttk.Button(btn_frame, text='独立窗口打开(登录/装插件)', command=self._open_independent_browser)
-        self.independent_btn.pack(side='left', padx=3)
 
         # ===== 任务列表区域 =====
         task_frame = ttk.Frame(task_tab)
@@ -2376,9 +3516,8 @@ class ScraplingGrabberGUI:
         # 左侧统计信息
         self.task_stat_var = tk.StringVar(value='共0个 | 成功0 | 失败0 | 等待0 | 下载中0 | 总速度: 0 KB/s')
         ttk.Label(bottom_frame, textvariable=self.task_stat_var).pack(side='left', padx=5)
-        # 用时显示
+        # 用时显示（改到底部状态栏，避免重复）
         self.timer_var = tk.StringVar(value='用时: 00:00')
-        ttk.Label(bottom_frame, textvariable=self.timer_var).pack(side='left', padx=10)
         # 全局统计
         # 中间占位（让翻页控件往中间移动）
         ttk.Frame(bottom_frame, width=100).pack(side='right')
@@ -2388,16 +3527,23 @@ class ScraplingGrabberGUI:
         # ===== 日志区域 =====
         log_frame = ttk.Frame(log_tab)
         log_frame.pack(fill='both', expand=True, padx=5, pady=5)
-        self.log_text = tk.Text(log_frame, wrap='word')
+        self.log_text = tk.Text(log_frame, wrap='word', font=FONT_MONO)
         self.log_text.pack(side='left', fill='both', expand=True)
         log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         log_scroll.pack(side='right', fill='y')
         self.log_text.config(yscrollcommand=log_scroll.set)
 
-        # （已去掉右下角的进度条和状态显示，但保留变量定义供代码引用）
         self.progress_var = tk.DoubleVar(value=0)
         self.stat_var = tk.StringVar(value='就绪')
         self.speed_var = tk.StringVar(value='')
+
+        # ===== 底部状态栏 =====
+        ttk.Label(status_bar, textvariable=self.stat_var, style='Muted.TLabel').pack(side='left', padx=(10, 0))
+        ttk.Label(status_bar, textvariable=self.speed_var, style='Muted.TLabel').pack(side='right', padx=(0, 10))
+        ttk.Label(status_bar, textvariable=self.timer_var, style='Muted.TLabel').pack(side='right', padx=(0, 14))
+        # 构建完成后再统一上一次色（构建过程中新建的原生控件也跟上）
+        self._apply_widget_theme()
+        # 顶部已收成一行：抓取参数进了「高级选项」面板，运行控制行按需显隐，不再需要宽度自适应
 
     def _refresh_task_list(self):
         """刷新任务列表显示（直接显示所有任务）"""
@@ -2446,24 +3592,6 @@ class ScraplingGrabberGUI:
                 self.clipboard_clear()
                 self.clipboard_append(url)
                 self._log('已复制帖子链接: %s' % url)
-
-    def _open_save_dir(self):
-        """打开保存目录"""
-        import os
-        # 优先使用当前选中任务的保存目录
-        selected = self.task_tree.selection()
-        if selected:
-            item = selected[0]
-            vals = self.task_tree.item(item, 'values')
-            if len(vals) > 5 and vals[5] and os.path.exists(vals[5]):
-                os.startfile(vals[5])
-                return
-        # 如果没有选中任务或任务保存目录不存在，使用全局保存目录
-        save_dir = self.dir_var.get().strip()
-        if save_dir and os.path.exists(save_dir):
-            os.startfile(save_dir)
-        else:
-            self._log('保存目录不存在: %s' % save_dir)
 
     def _get_progress_file(self, save_dir):
         """进度文件放在软件数据目录（保存目录外），清空保存目录不影响断点续传"""
@@ -2570,84 +3698,43 @@ class ScraplingGrabberGUI:
         self.task_stat_var.set('共%d个 | 成功%d | 失败%d | 等待%d | 下载中%d | 总速度: %s' % (total, success, fail, waiting, downloading, total_speed_str))
 
     def _open_independent_browser(self):
-        """独立窗口打开浏览器（用于登录/装插件）"""
+        """独立窗口打开浏览器（用于登录/装插件；不嵌入软件窗口）"""
         import subprocess
-        import os
-        import shutil
 
-        # 先清理残留进程，确保9222端口能正常监听
+        # 先清理残留进程并等端口释放，确保9222端口能正常监听
         self._kill_stale_debug_browser()
-        import time
-        time.sleep(1)
+        self._wait_debug_port_free()
 
-        user_data_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'debug_profile')
+        user_data_dir = self._debug_profile_dir()
         os.makedirs(user_data_dir, exist_ok=True)
+        self._prepare_debug_profile(user_data_dir)
 
-        # 清理上次异常退出留下的会话残留（避免弹"Chrome未正确关闭"恢复条）
+        browser_path, browser_name = self._find_browser_exe()
+        if not browser_path:
+            self._log('未找到 Chrome 或 Edge 浏览器')
+            return
+
         try:
-            for f in ('Last Session', 'Last Tabs', 'Current Session', 'Current Tabs'):
-                p = os.path.join(user_data_dir, f)
-                if os.path.exists(p):
-                    os.remove(p)
-            for sd in (os.path.join(user_data_dir, 'Default', 'Session'),
-                       os.path.join(user_data_dir, 'Default', 'Snapshots')):
-                if os.path.exists(sd):
-                    shutil.rmtree(sd, ignore_errors=True)
-        except Exception:
-            pass
-
-        # 尝试启动Chrome
-        chrome_paths = [
-            r'C:\Program Files\Google\Chrome\Application\chrome.exe',
-            r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
-            os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        ]
-
-        for chrome_path in chrome_paths:
-            if os.path.exists(chrome_path):
-                subprocess.Popen([
-                    chrome_path,
-                    '--remote-debugging-port=9222',
-                    '--remote-allow-origins=*',
-                    '--no-first-run',
-                    '--no-default-browser-check',
-                    '--disable-session-crashed-bubble',
-                    '--disable-features=InfiniteSessionRestore',
-                    '--disable-gpu',
-                    '--disable-gpu-compositing',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--user-data-dir=' + user_data_dir,
-                ])
-                self._log('已独立窗口启动 Chrome（9222端口），可登录/装插件')
-                return
-
-        # 尝试启动Edge
-        edge_paths = [
-            r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
-            r'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
-        ]
-
-        for edge_path in edge_paths:
-            if os.path.exists(edge_path):
-                subprocess.Popen([
-                    edge_path,
-                    '--remote-debugging-port=9222',
-                    '--remote-allow-origins=*',
-                    '--no-first-run',
-                    '--no-default-browser-check',
-                    '--disable-session-crashed-bubble',
-                    '--disable-features=InfiniteSessionRestore',
-                    '--disable-gpu',
-                    '--disable-gpu-compositing',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--user-data-dir=' + user_data_dir,
-                ])
-                self._log('已独立窗口启动 Edge（9222端口），可登录/装插件')
-                return
-
-        self._log('未找到 Chrome 或 Edge 浏览器')
+            subprocess.Popen([
+                browser_path,
+                '--remote-debugging-port=9222',
+                '--remote-allow-origins=*',
+                '--no-first-run',
+                '--no-default-browser-check',
+                '--disable-session-crashed-bubble',
+                '--disable-features=InfiniteSessionRestore',
+                '--disable-gpu',
+                '--disable-gpu-compositing',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--user-data-dir=' + user_data_dir,
+            ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 独立窗口是给用户自己操作（登录/装插件）的，不代表软件内的调试浏览器，
+            # 清掉 PID 以免之后「启动调试浏览器」拿它来嵌入
+            self._debug_browser_pid = None
+            self._log('已独立窗口启动 %s（9222端口），可登录/装插件' % browser_name)
+        except Exception as e:
+            self._log('独立窗口启动浏览器失败: %s' % e)
 
     def _open_appt_window(self):
         """预约资料库窗口：姓名/身份证/手机/地址/数量，保存后供「自动填写」使用"""
@@ -2698,7 +3785,8 @@ class ScraplingGrabberGUI:
 
         ttk.Button(btns, text='保存', width=6, command=_save).pack(side='left')
         ttk.Button(btns, text='保存并填写当前页', width=13, command=_fill_cur).pack(side='left', padx=4)
-        ttk.Label(btns, text='（填写功能需浏览器模式已启动）', foreground='#888').pack(side='left')
+        ttk.Label(btns, text='（填写功能需浏览器模式已启动）', style='Muted.TLabel').pack(side='left')
+        self._apply_widget_theme(win)
 
     def _appt_fill(self):
         """用预约资料自动填写当前浏览器页面的表单（工行/农行等预约页）"""
@@ -2809,6 +3897,31 @@ class ScraplingGrabberGUI:
         directory = filedialog.askdirectory(title='选择保存目录', initialdir=init)
         if directory:
             self.dir_var.set(os.path.normpath(directory))
+            self._save_settings()
+            self._dir_refresh_combo()
+
+    def _open_save_dir(self, _event=None):
+        """打开保存目录：优先用任务列表里选中那条的目录，否则用全局保存目录（不存在则先创建）"""
+        d = ''
+        # 优先：任务列表里选中那一条的保存目录
+        try:
+            selected = self.task_tree.selection()
+            if selected:
+                vals = self.task_tree.item(selected[0], 'values')
+                if len(vals) > 5 and str(vals[5]).strip():
+                    d = str(vals[5]).strip()
+        except Exception:
+            pass
+        if not d:
+            d = self.dir_var.get().strip()
+        if not d:
+            return
+        try:
+            os.makedirs(d, exist_ok=True)
+            os.startfile(d)
+        except Exception as e:
+            import tkinter.messagebox as _mb
+            _mb.showwarning('提示', '无法打开目录：%s\n%s' % (d, e))
 
     def _open_screenshots_dir(self):
         """打开临时截图目录"""
@@ -2857,8 +3970,13 @@ class ScraplingGrabberGUI:
         r1 = ttk.Frame(gen)
         r1.pack(fill='x', padx=6, pady=3)
         ttk.Label(r1, text='保存目录:').pack(side='left')
-        ttk.Entry(r1, textvariable=self.dir_var, width=60).pack(side='left', padx=2)
+        # 下拉=历史目录（可手输），历史由 _dir_remember 维护、存 cfg['save_dirs']
+        self.dir_combo = ttk.Combobox(r1, textvariable=self.dir_var, width=56)
+        self.dir_combo.pack(side='left', padx=2)
+        self.dir_combo.bind('<<ComboboxSelected>>', lambda e: self._on_dir_pick())
         ttk.Button(r1, text='浏览', width=5, command=self._browse_dir).pack(side='left')
+        ttk.Button(r1, text='打开', width=5, command=self._open_save_dir).pack(side='left', padx=(4, 0))
+        self._dir_refresh_combo()
         r2 = ttk.Frame(gen)
         r2.pack(fill='x', padx=6, pady=3)
         ttk.Label(r2, text='临时截图:').pack(side='left')
@@ -2984,8 +4102,10 @@ class ScraplingGrabberGUI:
         r12.pack(fill='x', padx=6, pady=2)
         ttk.Button(r12, text='检查更新', width=10, command=self._check_core_update).pack(side='left')
         self.core_update_status_var = tk.StringVar(value='')
-        ttk.Label(r12, textvariable=self.core_update_status_var, foreground='#c00').pack(side='left', padx=6)
-        ttk.Label(r12, text='（检查核心引擎是否出新版，有则一键升级+重打包）', foreground='#888').pack(side='left', padx=6)
+        ttk.Label(r12, textvariable=self.core_update_status_var, style='Danger.TLabel').pack(side='left', padx=6)
+        ttk.Label(r12, text='（检查核心引擎是否出新版，有则一键升级+重打包）', style='Muted.TLabel').pack(side='left', padx=6)
+        # 新建的子窗口控件也要跟上主题
+        self._apply_widget_theme(win)
 
     def _ai_provider_changed(self, e=None):
         """服务商预设：选中后自动填入 API 地址"""
@@ -3078,6 +4198,7 @@ class ScraplingGrabberGUI:
         lb.bind('<Double-Button-1>', pick)
         win.bind('<Escape>', lambda e: win.destroy())
         win.bind('<Return>', fill)
+        self._apply_widget_theme(win)
 
     def _ai_toggle_key_show(self):
         """API Key 显示/掩码切换"""
@@ -3356,7 +4477,7 @@ class ScraplingGrabberGUI:
             # 4. 覆盖 L 盘存档
             upd('更新中(3/3)：同步L盘存档...')
             try:
-                l_dst = r'L:\工作流\小工具\%s\v3.0.0' % APP_NAME
+                l_dst = r'L:\工作流\小工具\%s\%s' % (APP_NAME, APP_VERSION)
                 os.makedirs(l_dst, exist_ok=True)
                 if os.path.isdir(l_dst):
                     shutil.copy2(dist_exe, os.path.join(l_dst, exe_name))
@@ -3465,11 +4586,31 @@ class ScraplingGrabberGUI:
         ttk.Entry(top, textvariable=self.ec_value_var, width=9).pack(side='left', padx=3)
         ttk.Button(top, text='首次扫描', width=7, command=self._ec_first_scan).pack(side='left', padx=1)
         ttk.Button(top, text='再次扫描', width=7, command=self._ec_next_scan).pack(side='left', padx=1)
+        # 数据类型下拉
+        self.ec_type_var = tk.StringVar(value='自动')
+        ttk.Label(top, text='类型:').pack(side='left', padx=(8,2))
+        ttk.Combobox(top, textvariable=self.ec_type_var, values=['自动','整数','浮点','字符串'], width=5, state='readonly').pack(side='left')
         top2 = ttk.Frame(win)
         top2.pack(fill='x', padx=6, pady=(0, 4))
         ttk.Button(top2, text='清除结果', width=7, command=self._ec_clear).pack(side='left')
+        ttk.Button(top2, text='未知初值', width=7, command=self._ec_unknown_scan).pack(side='left', padx=1)
+        ttk.Button(top2, text='未变动', width=6, command=lambda: self._ec_diff_scan('unchanged')).pack(side='left', padx=1)
+        ttk.Button(top2, text='已变动', width=6, command=lambda: self._ec_diff_scan('changed')).pack(side='left', padx=1)
+        ttk.Button(top2, text='增加', width=6, command=lambda: self._ec_diff_scan('increased')).pack(side='left', padx=1)
+        ttk.Button(top2, text='减少', width=6, command=lambda: self._ec_diff_scan('decreased')).pack(side='left', padx=1)
         self.ec_count_var = tk.StringVar(value='尚未扫描')
-        ttk.Label(top2, textvariable=self.ec_count_var, foreground='#888').pack(side='left', padx=8)
+        ttk.Label(top2, textvariable=self.ec_count_var, style='Muted.TLabel').pack(side='left', padx=8)
+        # WASM 线性内存：与 JS 变量扫描合并进同一流程（勾选即参与首次/再次/变动扫描）
+        top3 = ttk.Frame(win)
+        top3.pack(fill='x', padx=6, pady=(0, 2))
+        self.ec_wasm_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top3, text='WASM内存', variable=self.ec_wasm_var).pack(side='left')
+        self.ec_wasm_type_var = tk.StringVar(value='i32+f32')
+        ttk.Combobox(top3, textvariable=self.ec_wasm_type_var, width=7, state='readonly',
+                     values=['i32+f32', 'i32', 'f32', 'i32+f64', 'f64',
+                             'u32', 'i16', 'u16', 'i8', 'u8', '全部']).pack(side='left', padx=2)
+        ttk.Button(top3, text='高级', width=4, command=self._create_wasm_win).pack(side='left', padx=2)
+        ttk.Label(top3, text='扫内存用', style='Muted.TLabel').pack(side='left', padx=4)
 
         # 上/下可拖拽分栏（PanedWindow，默认对半分）
         pane = ttk.PanedWindow(win, orient='vertical')
@@ -3532,6 +4673,8 @@ class ScraplingGrabberGUI:
         win.bind('<Configure>', self._on_game_win_configure)
         # 打开时自动恢复上次扫描结果与锁定
         self.root.after(400, self._ec_restore_state)
+        self._apply_widget_theme(win)
+
     def _on_game_win_configure(self, e):
         """窗口独立拖动/缩放：放大时路径列伸展；松手在边缘100px内自动吸回；拖远自由"""
         try:
@@ -3611,6 +4754,12 @@ class ScraplingGrabberGUI:
         self.ai_float_input.pack(side='left', fill='x', expand=True)
         self.ai_float_input.bind('<Return>', lambda e: self._ai_chat_send_from(self.ai_float_input))
         self.ai_float_input.bind('<Control-v>', lambda e: self._ai_on_ctrl_v(self.ai_float_input))
+        try:
+            import windnd
+            windnd.hook_dropfiles(self.ai_float_input, func=self._ai_on_drop_file)
+            windnd.hook_dropfiles(self.ai_float_text, func=self._ai_on_drop_file)
+        except Exception:
+            pass
         ttk.Button(bottom, text='截图给AI', width=8,
                    command=self._ai_add_shot).pack(side='left', padx=(4, 0))
         ttk.Button(bottom, text='发送', width=6,
@@ -3647,6 +4796,7 @@ class ScraplingGrabberGUI:
             txt.insert('1.0', self.ai_chat_text.get('1.0', 'end'))
         except Exception:
             pass
+        self._apply_widget_theme(win)
 
     def _ai_float_close(self):
         """X 关闭 = 隐藏（贴合窗口复用）"""
@@ -3735,6 +4885,9 @@ class ScraplingGrabberGUI:
                 self.ec_count_var.set('已恢复，但路径全部失效（页面可能已变），请重新扫描')
         if locks:
             restored = 0
+            # 含 WASM 地址时先注入内存读写助手，否则锁定脚本找不到 __wgWrite
+            if any(self._ec_is_wasm(list(lk.get('segs', []))) for lk in locks):
+                self._wasm_boot()
             for lk in locks:
                 try:
                     segs = list(lk.get('segs', []))
@@ -3751,42 +4904,185 @@ class ScraplingGrabberGUI:
                 self._ec_locks_refresh()
                 self._log('EC锁定恢复: %d 项' % restored)
 
+    def _ec_is_wasm(self, segs):
+        """该路径段是否为 WASM 内存地址 ['__wasm', memIdx, type, offset]"""
+        return bool(segs) and str(segs[0]) == '__wasm'
+
+    def _ec_label(self, segs):
+        """结果列表显示文本：WASM 显示地址，JS 显示变量路径"""
+        if self._ec_is_wasm(segs) and len(segs) >= 4:
+            return self._wasm_label(segs[1], segs[2], segs[3])
+        return '.'.join(str(s) for s in segs)
+
+    def _ec_wasm_types(self):
+        """按界面选择返回要扫描的 WASM 数据类型"""
+        if not getattr(self, 'ec_wasm_var', None) or not self.ec_wasm_var.get():
+            return []
+        sel = ''
+        if getattr(self, 'ec_wasm_type_var', None):
+            sel = (self.ec_wasm_type_var.get() or '').strip()
+        return {'i32+f32': ['i32', 'f32'], 'i32+f64': ['i32', 'f64'],
+                '全部': list(WASM_TYPES)}.get(sel, [sel if sel in WASM_TYPES else 'i32'])
+
+    def _ec_scan_wasm(self, value, prev_wasm=None, compare=None, unknown=False):
+        """扫描 WASM 线性内存（所有内存块 × 选中类型），返回 [(segs, value)]，与 JS 变量结果同构"""
+        types = self._ec_wasm_types()
+        if prev_wasm:
+            # 过滤/对比模式：只处理上次命中过的类型，且忽略界面的开关
+            types = sorted({str(s[2]) for (s, _v) in prev_wasm if str(s[2]) in WASM_TYPE_SIZE})
+        elif not types:
+            return []
+        mems, _err = self._wasm_boot()
+        if not mems:
+            return []
+        sample = 3000 if unknown else 20000
+        out = []
+        for (mi, _n, _k) in mems:
+            for wt in types:
+                if prev_wasm:
+                    prev_t = [(int(s[3]), v) for (s, v) in prev_wasm
+                              if int(s[1]) == int(mi) and str(s[2]) == wt]
+                    if not prev_t:
+                        continue
+                else:
+                    prev_t = None
+                meta, res = self._wasm_scan(mi, wt, value=value, prev=prev_t, compare=compare,
+                                            unknown=unknown, limit=800, sample=sample)
+                if meta is None or not res:
+                    continue
+                for (o, v) in res:
+                    out.append((self._wasm_segs(mi, wt, o), v))
+            if len(out) >= 3000:
+                break
+        return out
+
     def _ec_fill(self, hits):
+        """填充结果列表（JS 变量路径 + WASM 地址混排，用 iid→segs 映射保证选中可还原）"""
         for i in self.ec_tree.get_children():
             self.ec_tree.delete(i)
+        self.ec_tree_segs = {}
         if not hits:
             self.ec_count_var.set('无匹配')
             return
         for segs, v in hits[:300]:
-            self.ec_tree.insert('', 'end', values=('.'.join(segs), v))
-        self.ec_count_var.set('命中 %d 个' % len(hits))
+            label = self._ec_label(segs)
+            if self._ec_is_wasm(segs):
+                v = self._wasm_fmt_val(v, segs[2])
+            iid = self.ec_tree.insert('', 'end', values=(label, v))
+            self.ec_tree_segs[iid] = list(segs)
+        nw = sum(1 for (s, _v) in hits if self._ec_is_wasm(s))
+        txt = '命中 %d 个' % len(hits)
+        if nw:
+            txt += '（WASM %d）' % nw
+        self.ec_count_var.set(txt)
 
     def _ec_do_scan(self, first):
-        try:
-            value = float(self.ec_value_var.get().strip())
-        except Exception:
-            import tkinter.messagebox as _mb
-            _mb.showwarning('提示', '请输入有效数值', parent=self.game_win)
+        """统一扫描：JS 变量搜索 + WASM 线性内存搜索，结果合并进同一列表"""
+        if getattr(self, '_ec_scanning', False):
             return
-        if first:
-            hits = self._ai_ec_scan(value)
-            if hits is None:
-                import tkinter.messagebox as _mb
-                _mb.showwarning('提示', '调试浏览器未运行，请先启动浏览器模式', parent=self.game_win)
+        self._ec_scanning = True
+        try:
+            import tkinter.messagebox as _mb
+            try:
+                value = float(self.ec_value_var.get().strip())
+            except Exception:
+                _mb.showwarning('提示', '请输入有效数值', parent=self.game_win)
                 return
-            self.ec_scan_state = [s for s, v in hits]
-            self._ec_fill(hits)
-        else:
+            if first:
+                self.ec_count_var.set('扫描中…')
+                try:
+                    self.game_win.update_idletasks()
+                except Exception:
+                    pass
+                hits = self._ai_ec_scan(value)
+                if hits is None:
+                    _mb.showwarning('提示', '调试浏览器未运行，请先启动浏览器模式', parent=self.game_win)
+                    return
+                merged = [(list(s), v) for (s, v) in hits]
+                w_hits = self._ec_scan_wasm(value)
+                if w_hits:
+                    merged += w_hits
+                    self._log('WASM内存命中 %d 个地址' % len(w_hits))
+                self.ec_scan_state = merged
+                self._ec_fill(merged)
+            else:
+                if not self.ec_scan_state:
+                    _mb.showwarning('提示', '请先「首次扫描」', parent=self.game_win)
+                    return
+                prev = self.ec_scan_state
+                js_prev = [(s, v) for (s, v) in prev if not self._ec_is_wasm(s)]
+                w_prev = [(s, v) for (s, v) in prev if self._ec_is_wasm(s)]
+                merged = []
+                if js_prev:
+                    r = self._ai_ec_scan(value, js_prev)
+                    if r:
+                        merged += [(list(s), v) for (s, v) in r]
+                if w_prev:
+                    merged += self._ec_scan_wasm(value, prev_wasm=w_prev)
+                # 增量过滤为空时，自动全量重扫（游戏重建对象后旧路径会失效）
+                if not merged:
+                    r = self._ai_ec_scan(value) or []
+                    merged = [(list(s), v) for (s, v) in r]
+                    merged += self._ec_scan_wasm(value)
+                self.ec_scan_state = merged
+                self._ec_fill(merged)
+        finally:
+            self._ec_scanning = False
+        self._ec_save_state()
+
+    def _ec_diff_scan(self, compare):
+        """变动过滤：JS 变量与 WASM 地址一起对比"""
+        if getattr(self, '_ec_scanning', False):
+            return
+        self._ec_scanning = True
+        try:
+            import tkinter.messagebox as _mb
             if not self.ec_scan_state:
-                import tkinter.messagebox as _mb
                 _mb.showwarning('提示', '请先「首次扫描」', parent=self.game_win)
                 return
-            hits = self._ai_ec_scan(value, self.ec_scan_state)
-            if hits is None:
+            prev = self.ec_scan_state
+            js_prev = [(s, v) for (s, v) in prev if not self._ec_is_wasm(s)]
+            w_prev = [(s, v) for (s, v) in prev if self._ec_is_wasm(s)]
+            merged = []
+            if js_prev:
+                r = self._ai_ec_scan(0, js_prev, compare=compare)
+                if r:
+                    merged += [(list(s), v) for (s, v) in r]
+            if w_prev:
+                merged += self._ec_scan_wasm(None, prev_wasm=w_prev, compare=compare)
+            if not merged:
+                _mb.showinfo('结果', '变动过滤后无结果（游戏可能重建了对象）\n请重新「首次扫描」当前数值',
+                             parent=self.game_win)
                 return
-            self.ec_scan_state = [s for s, v in hits]
-            self._ec_fill(hits)
-        self._ec_save_state()
+            self.ec_scan_state = merged
+            self._ec_fill(merged)
+            self._ec_save_state()
+        finally:
+            self._ec_scanning = False
+
+    def _ec_unknown_scan(self):
+        """未知初值：JS 变量枚举 + WASM 均匀采样，一起记录"""
+        if getattr(self, '_ec_scanning', False):
+            return
+        self._ec_scanning = True
+        try:
+            import tkinter.messagebox as _mb
+            self.ec_count_var.set('扫描中…')
+            try:
+                self.game_win.update_idletasks()
+            except Exception:
+                pass
+            hits = self._ai_ec_scan(None, unknown=True)
+            if hits is None:
+                _mb.showwarning('提示', '调试浏览器未运行，请先启动浏览器模式', parent=self.game_win)
+                return
+            merged = [(list(s), v) for (s, v) in hits]
+            merged += self._ec_scan_wasm(None, unknown=True)
+            self.ec_scan_state = merged
+            self._ec_fill(merged)
+            self._ec_save_state()
+        finally:
+            self._ec_scanning = False
 
     def _ec_first_scan(self):
         self._ec_do_scan(True)
@@ -3800,7 +5096,19 @@ class ScraplingGrabberGUI:
             import tkinter.messagebox as _mb
             _mb.showwarning('提示', '请先在列表中选中一个变量', parent=self.game_win)
             return None
+        segs = getattr(self, 'ec_tree_segs', {}).get(sel[0])
+        if segs is not None:
+            return list(segs)
+        # 兜底：从显示文本反解（兼容旧数据）
         path = self.ec_tree.item(sel[0], 'values')[0]
+        if path.startswith('W#') and ' 0x' in path:
+            try:
+                head, addr = path.split(' 0x')
+                mi = int(head.split(' ')[0][2:])
+                wt = head.split(' ')[1]
+                return ['__wasm', mi, wt, int(addr, 16)]
+            except Exception:
+                return None
         return ['window'] + path.split('.')[1:]
 
     def _ec_edit_selected(self):
@@ -3813,6 +5121,8 @@ class ScraplingGrabberGUI:
             import tkinter.messagebox as _mb
             _mb.showwarning('提示', '请输入有效数值', parent=self.game_win)
             return
+        if self._ec_is_wasm(segs):
+            self._wasm_boot()   # 确保 WASM 读写助手已注入
         ok, msg = self._ai_ec_edit(segs, value)
         import tkinter.messagebox as _mb
         _mb.showinfo('结果', msg, parent=self.game_win)
@@ -3828,6 +5138,8 @@ class ScraplingGrabberGUI:
             import tkinter.messagebox as _mb
             _mb.showwarning('提示', '请输入有效数值', parent=self.game_win)
             return
+        if self._ec_is_wasm(segs):
+            self._wasm_boot()
         enabled = self.ec_lock_on_add_var.get()
         key = '.'.join(str(s) for s in segs)
         for item in self.ec_locks:
@@ -3899,6 +5211,8 @@ class ScraplingGrabberGUI:
         try:
             item['value'] = v
             if item.get('enabled', True):
+                if self._ec_is_wasm(item['segs']):
+                    self._wasm_boot()
                 self._ai_ec_lock(item['segs'], v, True, item['key'])
             self._ec_locks_refresh()
             self._log('EC锁定值修改: %s = %s' % (item['key'], v))
@@ -3919,6 +5233,8 @@ class ScraplingGrabberGUI:
             import tkinter.messagebox as _mb
             _mb.showwarning('提示', '请输入有效数值', parent=self.game_win)
             return
+        if self._ec_is_wasm(segs):
+            self._wasm_boot()
         key = '.'.join(str(s) for s in segs)
         for item in self.ec_locks:
             if item['key'] == key:
@@ -3998,6 +5314,8 @@ class ScraplingGrabberGUI:
             return
         item = self.ec_locks[idx]
         item['enabled'] = not item.get('enabled', True)
+        if item['enabled'] and self._ec_is_wasm(item['segs']):
+            self._wasm_boot()
         if item['enabled']:
             self._ai_ec_lock(item['segs'], item['value'], True, item['key'])
         else:
@@ -4029,8 +5347,636 @@ class ScraplingGrabberGUI:
         self._ec_locks_refresh()
         self._ec_save_state()
 
+    # ==================================================================
+    # WASM 线性内存扫描（Unity WebGL / Emscripten / Go / Rust 等网页游戏）
+    # CE 风格：首次扫描 → 再次扫描/变动过滤 → 写入 / 锁定
+    # 地址用 segs=['__wasm', memIdx, type, offset] 表示，
+    # 写入与锁定复用 _ec_assign_expr / _ai_ec_edit / _ai_ec_lock 同一套机制
+    # ==================================================================
+    def _wasm_exec_js(self, code, timeout=30):
+        """CDP 执行 JS 并返回结构化 value（与 _ai_execute_js 不同：返回原始对象而非文本）"""
+        import json as _json
+        try:
+            import urllib.request as _ur
+            import websocket as _ws
+            pages = _json.loads(_ur.urlopen('http://127.0.0.1:9222/json/list', timeout=5).read())
+            pages = [t for t in pages if t.get('type') == 'page']
+            if not pages:
+                return False, None, '调试浏览器没有打开的网页'
+            active = next((t for t in pages if t.get('active')), pages[0])
+            ws = _ws.create_connection('ws://127.0.0.1:9222/devtools/page/%s' % active['id'], timeout=timeout)
+            ws.send(_json.dumps({'id': 1, 'method': 'Runtime.evaluate',
+                                 'params': {'expression': code, 'returnByValue': True, 'awaitPromise': False}}))
+            resp = _json.loads(ws.recv())
+            try:
+                ws.close()
+            except Exception:
+                pass
+        except Exception as e:
+            return False, None, '连接调试浏览器失败: %s' % e
+        if 'error' in resp:
+            return False, None, '执行失败: %s' % resp['error'].get('message', '?')
+        r = resp.get('result', {})
+        if 'exceptionDetails' in r:
+            return False, None, 'JS异常: %s' % str(r['exceptionDetails'].get('exception', {}).get(
+                'description', r['exceptionDetails'].get('text', '?')))[:300]
+        return True, r.get('result', {}).get('value'), ''
+
+    def _wasm_boot(self):
+        """注入探测脚本并列出线性内存。返回 ([(idx, bytes, kind)], err)；失败首项为 None"""
+        ok, _v, err = self._wasm_exec_js(WASM_BOOT_JS, timeout=20)
+        if not ok:
+            return None, err
+        ok2, val, err2 = self._wasm_exec_js(
+            '(function(){var W=window.__wgMem();var out=[];'
+            'for(var i=0;i<W.m.length;i++){var e=W.m[i];var b=null;'
+            'try{b=e.m?e.m.buffer:e.ab;}catch(err){}'
+            'out.push({i:i,n:b?b.byteLength:0,k:e.m?"wasm":"buf"});}'
+            'return out;})()', timeout=20)
+        if not ok2:
+            return None, err2
+        return [(x.get('i', 0), x.get('n', 0), x.get('k', '?')) for x in (val or [])], ''
+
+    def _wasm_scan_js(self, mem_idx, wtype, value=None, prev=None, compare=None,
+                      unknown=False, byte_step=False, limit=2000, sample=20000):
+        """构造扫描/过滤用的 JS（独立出来便于单独调试）"""
+        import json as _json
+        size = WASM_TYPE_SIZE[wtype]
+        prevj = _json.dumps([{'o': int(o), 'v': v} for (o, v) in (prev or [])])
+        tv = 'null' if (value is None or unknown) else _json.dumps(value)
+        js = (
+            '(function(){'
+            'var W=window.__wgMem();'
+            'var mi=%d,t=%s,unk=%s,limit=%d,sample=%d,size=%d,step1=%s,eps=%s;'
+            'var prev=%s;var cmp=%s;var target=%s;'
+            'var e=W.m[mi];'
+            'if(!e)return {err:"内存索引不存在，请点刷新内存"};'
+            'var b=null;try{b=e.m?e.m.buffer:e.ab;}catch(err){}'
+            'if(!b||!b.byteLength)return {err:"内存已失效（页面可能已刷新），请点刷新内存"};'
+            'var len=b.byteLength,dv=new DataView(b);'
+            'function get(o){try{switch(t){'
+            'case "i8":return dv.getInt8(o);'
+            'case "u8":return dv.getUint8(o);'
+            'case "i16":return dv.getInt16(o,true);'
+            'case "u16":return dv.getUint16(o,true);'
+            'case "i32":return dv.getInt32(o,true);'
+            'case "u32":return dv.getUint32(o,true);'
+            'case "f32":return dv.getFloat32(o,true);'
+            'case "f64":return dv.getFloat64(o,true);}}catch(err){return null;}return null;}'
+            'function eq(v){if(v===null||v===undefined)return false;'
+            'if(t==="f32"||t==="f64"){if(!isFinite(v)||!isFinite(target))return false;'
+            'return Math.abs(v-target)<=eps*Math.max(1,Math.abs(target));}'
+            'return v===target;}'
+            'var out=[];'
+            'if(prev.length){'
+            ' for(var i=0;i<prev.length;i++){'
+            '  var o=prev[i].o,old=prev[i].v,cur=get(o);'
+            '  if(cur===null||cur===undefined)continue;'
+            '  var keep=false;'
+            '  if(cmp){switch(cmp){'
+            '   case "unchanged":keep=(cur===old);break;'
+            '   case "changed":keep=(cur!==old);break;'
+            '   case "increased":keep=(cur>old);break;'
+            '   case "decreased":keep=(cur<old);break;}}'
+            '  else{keep=eq(cur);}'
+            '  if(keep)out.push({o:o,v:cur});'
+            '  if(out.length>=limit)break;}'
+            ' return {len:len,scanned:prev.length,out:out,mode:"filter",step:0};}'
+            'var step=step1?1:size;'
+            'if(unk){'
+            ' var span=Math.floor((len-size)/sample)+1;'
+            ' if(span>size){step=Math.floor(span/size)*size;}'
+            ' if(step<size)step=size;'
+            ' var total=0;'
+            ' for(var o=0;o+size<=len&&out.length<sample;o+=step){'
+            '  var v=get(o);if(v!==null)out.push({o:o,v:v});total++;}'
+            ' return {len:len,scanned:total,out:out,mode:"sample",step:step};}'
+            'var cnt=0;'
+            'for(var o=0;o+size<=len;o+=step){cnt++;var v=get(o);'
+            ' if(eq(v)){out.push({o:o,v:v});if(out.length>=limit)break;}}'
+            'return {len:len,scanned:cnt,out:out,mode:"full",step:step};})()'
+            % (int(mem_idx), _json.dumps(str(wtype)), 'true' if unknown else 'false',
+               int(limit), int(sample), int(size), 'true' if byte_step else 'false',
+               '1e-3', prevj, _json.dumps(compare or ''), tv))
+        return js
+
+    def _wasm_scan(self, mem_idx, wtype, value=None, prev=None, compare=None,
+                   unknown=False, byte_step=False, limit=2000, sample=20000):
+        """扫描/过滤 WASM 线性内存。
+        prev: [(off, oldval)] 上次结果（含旧值，供变动对比）
+        compare: None(精确) / unchanged / changed / increased / decreased
+        unknown: 未知初值 → 均匀采样（内存太大无法全量保存）
+        返回 (meta, hits)；hits=[(off, val)]；失败返回 (None, 错误文本)"""
+        import json as _json
+        if wtype not in WASM_TYPE_SIZE:
+            return None, '不支持的数据类型: %s' % wtype
+        js = self._wasm_scan_js(mem_idx, wtype, value=value, prev=prev, compare=compare,
+                                unknown=unknown, byte_step=byte_step, limit=limit, sample=sample)
+        ok, val, err = self._wasm_exec_js(js, timeout=30)
+        if not ok:
+            return None, err
+        if not isinstance(val, dict):
+            return None, '扫描返回异常（内存可能已被释放）'
+        if val.get('err'):
+            return None, str(val.get('err'))
+        hits = [(h.get('o', 0), h.get('v')) for h in (val.get('out') or [])]
+        meta = {'len': val.get('len', 0), 'scanned': val.get('scanned', 0),
+                'mode': val.get('mode', ''), 'step': val.get('step', 0)}
+        return meta, hits
+
+    def _wasm_segs(self, mem_idx, wtype, off):
+        """WASM 地址 → 统一路径段（供写入/锁定复用）"""
+        return ['__wasm', int(mem_idx), str(wtype), int(off)]
+
+    def _wasm_label(self, mem_idx, wtype, off):
+        return 'W#%d %s 0x%08X' % (int(mem_idx), wtype, int(off))
+
+    def _wasm_fmt_val(self, v, wtype):
+        try:
+            if v is None:
+                return ''
+            if wtype in ('f32', 'f64'):
+                s = '%.6f' % float(v)
+                return s.rstrip('0').rstrip('.') if '.' in s else s
+            f = float(v)
+            return str(int(f)) if f.is_integer() else str(v)
+        except Exception:
+            return str(v)
+
+    def _create_wasm_win(self):
+        """WASM 线性内存扫描窗口（独立于 JS 变量修改器，互不干扰）"""
+        import tkinter.messagebox as _mb
+        if getattr(self, 'wasm_win', None) is not None:
+            try:
+                if self.wasm_win.winfo_exists():
+                    self.wasm_win.deiconify()
+                    self.wasm_win.lift()
+                    self.wasm_win.focus_set()
+                    return
+            except Exception:
+                pass
+        win = tk.Toplevel(self.root)
+        self.wasm_win = win
+        win.title('WASM 内存扫描')
+        win.geometry('660x640+340+40')
+        self.wasm_mems = getattr(self, 'wasm_mems', []) or []
+        self.wasm_hits = getattr(self, 'wasm_hits', []) or []
+        self.wasm_locks = getattr(self, 'wasm_locks', []) or []
+
+        # ---- 第一行：内存选择 ----
+        f1 = ttk.Frame(win)
+        f1.pack(fill='x', padx=6, pady=(6, 3))
+        ttk.Label(f1, text='线性内存:').pack(side='left')
+        self.wasm_mem_var = tk.StringVar(value='未检测')
+        self.wasm_mem_cb = ttk.Combobox(f1, textvariable=self.wasm_mem_var, width=26, state='readonly')
+        self.wasm_mem_cb.pack(side='left', padx=3)
+        ttk.Button(f1, text='刷新内存', width=8, command=lambda: self._wasm_refresh_mem()).pack(side='left', padx=2)
+        ttk.Button(f1, text='重新注入', width=8,
+                   command=lambda: self._wasm_refresh_mem(force=True)).pack(side='left', padx=2)
+
+        # ---- 第二行：类型 + 数值 + 首次/再次 ----
+        f2 = ttk.Frame(win)
+        f2.pack(fill='x', padx=6, pady=2)
+        ttk.Label(f2, text='类型:').pack(side='left')
+        self.wasm_type_var = tk.StringVar(value='i32')
+        ttk.Combobox(f2, textvariable=self.wasm_type_var, values=list(WASM_TYPES),
+                     width=5, state='readonly').pack(side='left', padx=2)
+        ttk.Label(f2, text='数值:').pack(side='left', padx=(8, 0))
+        self.wasm_value_var = tk.StringVar(value='100')
+        ttk.Entry(f2, textvariable=self.wasm_value_var, width=11).pack(side='left', padx=2)
+        ttk.Button(f2, text='首次扫描', width=8, command=lambda: self._wasm_do_scan('first')).pack(side='left', padx=2)
+        ttk.Button(f2, text='再次扫描', width=8, command=lambda: self._wasm_do_scan('next')).pack(side='left', padx=2)
+
+        # ---- 第三行：未知初值 / 变动过滤 ----
+        f3 = ttk.Frame(win)
+        f3.pack(fill='x', padx=6, pady=2)
+        ttk.Button(f3, text='未知初值', width=8, command=lambda: self._wasm_do_scan('unknown')).pack(side='left')
+        ttk.Button(f3, text='未变动', width=6, command=lambda: self._wasm_do_scan('cmp', 'unchanged')).pack(side='left', padx=1)
+        ttk.Button(f3, text='已变动', width=6, command=lambda: self._wasm_do_scan('cmp', 'changed')).pack(side='left', padx=1)
+        ttk.Button(f3, text='增加', width=5, command=lambda: self._wasm_do_scan('cmp', 'increased')).pack(side='left', padx=1)
+        ttk.Button(f3, text='减少', width=5, command=lambda: self._wasm_do_scan('cmp', 'decreased')).pack(side='left', padx=1)
+        self.wasm_step_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f3, text='逐字节', variable=self.wasm_step_var).pack(side='left', padx=6)
+        ttk.Button(f3, text='清空', width=5, command=self._wasm_clear).pack(side='left', padx=2)
+
+        self.wasm_status_var = tk.StringVar(value='尚未扫描')
+        ttk.Label(win, textvariable=self.wasm_status_var, style='Muted.TLabel').pack(anchor='w', padx=8, pady=(2, 0))
+
+        # ---- 结果列表 ----
+        mid = ttk.Frame(win)
+        mid.pack(fill='both', expand=True, padx=6, pady=(3, 0))
+        self.wasm_tree = ttk.Treeview(mid, columns=('addr', 'type', 'value'), show='headings', height=14)
+        self.wasm_tree.heading('addr', text='地址')
+        self.wasm_tree.heading('type', text='类型')
+        self.wasm_tree.heading('value', text='当前值')
+        self.wasm_tree.column('addr', width=120, anchor='w')
+        self.wasm_tree.column('type', width=50, anchor='center')
+        self.wasm_tree.column('value', width=140, anchor='center')
+        vsb = ttk.Scrollbar(mid, orient='vertical', command=self.wasm_tree.yview)
+        self.wasm_tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side='right', fill='y')
+        self.wasm_tree.pack(side='left', fill='both', expand=True)
+        self.wasm_tree.bind('<Double-1>', lambda e: self._wasm_add_lock(True))
+
+        # ---- 锁定列表 ----
+        lf = ttk.LabelFrame(win, text='锁定条目（点启用列切换启用/暂停，双击改值）')
+        lf.pack(fill='both', expand=True, padx=6, pady=(4, 0))
+        self.wasm_lock_tree = ttk.Treeview(lf, columns=('addr', 'value'), show='tree headings', height=5)
+        self.wasm_lock_tree.heading('#0', text='启用')
+        self.wasm_lock_tree.heading('addr', text='地址')
+        self.wasm_lock_tree.heading('value', text='锁定值')
+        self.wasm_lock_tree.column('#0', width=46, anchor='center')
+        self.wasm_lock_tree.column('addr', width=150)
+        self.wasm_lock_tree.column('value', width=110, anchor='center')
+        self.wasm_lock_tree.pack(fill='both', expand=True)
+        self.wasm_lock_tree.bind('<Button-1>', self._wasm_toggle_lock_click)
+        self.wasm_lock_tree.bind('<Double-1>', self._wasm_edit_lock_value)
+
+        # ---- 底部：新值 + 写入/锁定 ----
+        bot = ttk.Frame(win)
+        bot.pack(fill='x', padx=6, pady=5)
+        ttk.Label(bot, text='新值:').pack(side='left')
+        self.wasm_newval_var = tk.StringVar(value='999999')
+        ttk.Entry(bot, textvariable=self.wasm_newval_var, width=10).pack(side='left', padx=2)
+        ttk.Button(bot, text='写入', width=5, command=self._wasm_write_selected).pack(side='left', padx=1)
+        ttk.Button(bot, text='锁定', width=5, command=lambda: self._wasm_add_lock(True)).pack(side='left', padx=1)
+        ttk.Button(bot, text='解锁选中', width=8, command=self._wasm_unlock_selected).pack(side='left', padx=1)
+        self.wasm_lock_var = tk.StringVar(value='未锁定')
+        ttk.Label(bot, textvariable=self.wasm_lock_var, foreground='#c0392b').pack(side='left', padx=6)
+
+        win.protocol('WM_DELETE_WINDOW', self._wasm_close)
+        self._apply_widget_theme(win)
+        self.root.after(300, self._wasm_restore_state)
+
+    def _wasm_refresh_mem(self, force=False, silent=False):
+        """探测并列出页面里的 WASM 线性内存（silent=True 时不弹窗，用于后台自动探测）"""
+        import tkinter.messagebox as _mb
+        if force:
+            try:
+                self._wasm_exec_js('window.__wgWasm=null;true;', timeout=10)
+            except Exception:
+                pass
+        mems, err = self._wasm_boot()
+        if mems is None:
+            self.wasm_mems = []
+            try:
+                self.wasm_mem_cb['values'] = []
+                self.wasm_mem_var.set('未检测到 WASM 内存')
+            except Exception:
+                pass
+            if silent:
+                return []
+            _mb.showwarning('提示',
+                            '未检测到 WASM 内存：%s\n\n'
+                            '请先启动浏览器模式并打开网页游戏，再点「刷新内存」。\n'
+                            '（部分 Unity/Emscripten 游戏需等加载完成再探测）' % err,
+                            parent=self.wasm_win)
+            return []
+        self.wasm_mems = mems
+        labels = ['#%d · %s · %.1f MB' % (i, ('WASM' if k == 'wasm' else 'Buffer'), n / 1048576.0)
+                  for (i, n, k) in mems]
+        try:
+            self.wasm_mem_cb['values'] = labels
+            cur = self.wasm_mem_cb.current()
+            if cur < 0 or cur >= len(labels):
+                self.wasm_mem_cb.current(0)
+        except Exception:
+            pass
+        self._log('WASM内存探测: %d 块' % len(mems))
+        return mems
+
+    def _wasm_cur_mem_idx(self):
+        idx = None
+        try:
+            i = self.wasm_mem_cb.current()
+            if 0 <= i < len(self.wasm_mems):
+                idx = self.wasm_mems[i][0]
+        except Exception:
+            idx = None
+        if idx is None and self.wasm_mems:
+            idx = self.wasm_mems[0][0]
+        return idx
+
+    def _wasm_do_scan(self, mode, compare=None):
+        """mode: first / next / unknown / cmp（cmp 需给 compare）"""
+        import tkinter.messagebox as _mb
+        if getattr(self, '_wasm_scanning', False):
+            return
+        self._wasm_scanning = True
+        try:
+            if not getattr(self, 'wasm_mems', None):
+                if not self._wasm_refresh_mem(silent=True):
+                    _mb.showwarning('提示',
+                                    '未检测到 WASM 内存。\n请先启动浏览器模式、打开网页游戏，再点「刷新内存」。',
+                                    parent=self.wasm_win)
+                    return
+            mi = self._wasm_cur_mem_idx()
+            if mi is None:
+                _mb.showwarning('提示', '请先选择要扫描的内存块', parent=self.wasm_win)
+                return
+            wt = self.wasm_type_var.get().strip()
+            byte_step = bool(self.wasm_step_var.get())
+            value, unknown, prev = None, False, None
+            if mode == 'unknown':
+                unknown = True
+            else:
+                txt = (self.wasm_value_var.get() or '').strip()
+                if txt:
+                    try:
+                        value = float(txt)
+                        if wt not in ('f32', 'f64') and float(value).is_integer():
+                            value = int(value)
+                    except Exception:
+                        value = None
+                if mode != 'cmp' and value is None:
+                    _mb.showwarning('提示', '请输入要搜索的数值', parent=self.wasm_win)
+                    return
+            if mode == 'next' or mode == 'cmp':
+                if not self.wasm_hits:
+                    _mb.showwarning('提示', '请先做一次「首次扫描」或「未知初值」', parent=self.wasm_win)
+                    return
+                prev = [(h[2], h[3]) for h in self.wasm_hits]
+            self.wasm_status_var.set('扫描中…')
+            try:
+                self.wasm_win.update_idletasks()
+            except Exception:
+                pass
+            meta, res = self._wasm_scan(mi, wt, value=value, prev=prev, compare=compare,
+                                        unknown=unknown, byte_step=byte_step)
+            if meta is None:
+                self.wasm_status_var.set('扫描失败')
+                _mb.showwarning('提示', '扫描失败：%s' % res, parent=self.wasm_win)
+                return
+            self.wasm_hits = [(mi, wt, int(o), v) for (o, v) in res]
+            self._wasm_fill()
+            extra = ''
+            if meta.get('mode') == 'sample':
+                extra = '（均匀采样，步长%d字节，请继续用变动过滤收敛）' % meta.get('step', 0)
+            elif meta.get('mode') == 'full' and len(res) >= 2000:
+                extra = '（结果已达 2000 上限，请用「再次扫描」继续收敛）'
+            self.wasm_status_var.set('命中 %d 个 / 扫描 %d 个地址%s'
+                                     % (len(res), meta.get('scanned', 0), extra))
+            self._wasm_save_state()
+        finally:
+            self._wasm_scanning = False
+
+    def _wasm_fill(self):
+        try:
+            for i in self.wasm_tree.get_children():
+                self.wasm_tree.delete(i)
+            for (mi, wt, o, v) in self.wasm_hits[:3000]:
+                self.wasm_tree.insert('', 'end', values=('0x%08X' % o, wt, self._wasm_fmt_val(v, wt)))
+        except Exception:
+            pass
+
+    def _wasm_selected(self):
+        import tkinter.messagebox as _mb
+        sel = self.wasm_tree.selection()
+        if not sel:
+            _mb.showwarning('提示', '请先在结果列表中选中一个地址', parent=self.wasm_win)
+            return None
+        try:
+            row = self.wasm_tree.index(sel[0])
+        except Exception:
+            row = -1
+        if row < 0 or row >= len(self.wasm_hits):
+            _mb.showwarning('提示', '结果已失效，请重新扫描', parent=self.wasm_win)
+            return None
+        return self.wasm_hits[row]
+
+    def _wasm_read_newval(self, wtype):
+        txt = (self.wasm_newval_var.get() or '').strip()
+        try:
+            v = float(txt)
+            if wtype not in ('f32', 'f64') and float(v).is_integer():
+                v = int(v)
+            return v
+        except Exception:
+            return None
+
+    def _wasm_write_selected(self):
+        import tkinter.messagebox as _mb
+        h = self._wasm_selected()
+        if not h:
+            return
+        mi, wt, off, _old = h
+        value = self._wasm_read_newval(wt)
+        if value is None:
+            _mb.showwarning('提示', '请输入有效的新值', parent=self.wasm_win)
+            return
+        self._wasm_boot()
+        ok, msg = self._ai_ec_edit(self._wasm_segs(mi, wt, off), value)
+        self._log('WASM写入 %s = %s → %s' % (self._wasm_label(mi, wt, off), value, msg))
+        _mb.showinfo('结果', msg, parent=self.wasm_win)
+
+    def _wasm_add_lock(self, enable=True):
+        """把选中地址加入/更新锁定（每 50ms 重写，抗游戏每帧覆盖）"""
+        import tkinter.messagebox as _mb
+        h = self._wasm_selected()
+        if not h:
+            return
+        mi, wt, off, _old = h
+        value = self._wasm_read_newval(wt)
+        if value is None:
+            _mb.showwarning('提示', '请输入有效的锁定值', parent=self.wasm_win)
+            return
+        self._wasm_boot()
+        segs = self._wasm_segs(mi, wt, off)
+        key = '__wasm.%d.%s.%d' % (mi, wt, off)
+        label = self._wasm_label(mi, wt, off)
+        for item in self.wasm_locks:
+            if item['key'] == key:
+                item['value'] = value
+                item['enabled'] = enable
+                self._ai_ec_lock(segs, value, enable, key)
+                break
+        else:
+            self.wasm_locks.append({'mi': mi, 't': wt, 'off': off, 'segs': segs,
+                                    'value': value, 'key': key, 'label': label, 'enabled': enable})
+            self._ai_ec_lock(segs, value, enable, key)
+        self._wasm_locks_refresh()
+        self._log('WASM锁定 %s = %s（%s，共%d项）'
+                  % (label, value, '已启用' if enable else '已暂停', len(self.wasm_locks)))
+        self._wasm_save_state()
+
+    def _wasm_locks_refresh(self):
+        try:
+            for i in self.wasm_lock_tree.get_children():
+                self.wasm_lock_tree.delete(i)
+            if not self.wasm_locks:
+                self.wasm_lock_var.set('未锁定')
+                return
+            self._ec_check_images()
+            for item in self.wasm_locks:
+                img = self._chk_on if item.get('enabled', True) else self._chk_off
+                self.wasm_lock_tree.insert('', 'end', image=img,
+                                           values=(item.get('label', item['key']), item['value']))
+            active = sum(1 for x in self.wasm_locks if x.get('enabled', True))
+            self.wasm_lock_var.set('已锁定 %d/%d 项' % (active, len(self.wasm_locks)))
+        except Exception:
+            pass
+
+    def _wasm_lock_idx_by_iid(self, iid):
+        if not iid:
+            return -1
+        try:
+            rows = self.wasm_lock_tree.get_children()
+            if iid in rows:
+                return rows.index(iid)
+            return int(iid[1:]) - 1
+        except Exception:
+            return -1
+
+    def _wasm_toggle_lock_click(self, e):
+        row = self.wasm_lock_tree.identify_row(e.y)
+        col = self.wasm_lock_tree.identify_column(e.x)
+        if not row or col != '#0':
+            return
+        idx = self._wasm_lock_idx_by_iid(row)
+        if idx < 0 or idx >= len(self.wasm_locks):
+            return
+        item = self.wasm_locks[idx]
+        item['enabled'] = not item.get('enabled', True)
+        if item['enabled']:
+            self._wasm_boot()
+        self._ai_ec_lock(item['segs'], item['value'], item['enabled'], item['key'])
+        self._wasm_locks_refresh()
+        self._wasm_save_state()
+
+    def _wasm_edit_lock_value(self, e=None):
+        import tkinter.simpledialog as _sd
+        import tkinter.messagebox as _mb
+        try:
+            if e is None:
+                sel = self.wasm_lock_tree.selection()
+                if not sel:
+                    return
+                iid = sel[0]
+            else:
+                if self.wasm_lock_tree.identify_column(e.x) == '#0':
+                    return
+                iid = self.wasm_lock_tree.identify_row(e.y)
+                if not iid:
+                    return
+            idx = self._wasm_lock_idx_by_iid(iid)
+            if idx < 0 or idx >= len(self.wasm_locks):
+                return
+            item = self.wasm_locks[idx]
+            newv = _sd.askstring('修改锁定值',
+                                 '地址: %s（%s）\n当前锁定值: %s\n\n新锁定值:'
+                                 % (item.get('label', item['key']), item['t'], item['value']),
+                                 initialvalue=str(item['value']), parent=self.wasm_win)
+            if newv is None:
+                return
+            try:
+                v = float(newv.strip())
+                if item['t'] not in ('f32', 'f64') and float(v).is_integer():
+                    v = int(v)
+            except Exception:
+                _mb.showwarning('提示', '请输入有效数值', parent=self.wasm_win)
+                return
+            item['value'] = v
+            if item.get('enabled', True):
+                self._wasm_boot()
+                self._ai_ec_lock(item['segs'], v, True, item['key'])
+            self._wasm_locks_refresh()
+            self._wasm_save_state()
+            self._log('WASM锁定值修改: %s = %s' % (item.get('label', item['key']), v))
+        except Exception as ex:
+            self._log('WASM改值失败: %s' % ex)
+
+    def _wasm_unlock_selected(self):
+        import tkinter.messagebox as _mb
+        sel = self.wasm_lock_tree.selection()
+        if not sel:
+            _mb.showinfo('提示', '请先在下方锁定列表中选中要解锁的条目', parent=self.wasm_win)
+            return
+        idx = self._wasm_lock_idx_by_iid(sel[0])
+        if idx < 0 or idx >= len(self.wasm_locks):
+            return
+        item = self.wasm_locks.pop(idx)
+        self._ai_ec_lock(item['segs'], item['value'], False, item['key'])
+        self._wasm_locks_refresh()
+        self._wasm_save_state()
+        self._log('WASM解锁: %s（剩余%d项）' % (item.get('label', item['key']), len(self.wasm_locks)))
+
+    def _wasm_clear(self):
+        self.wasm_hits = []
+        self._wasm_fill()
+        self.wasm_status_var.set('已清空')
+        try:
+            self.cfg.pop('wasm_hits', None)
+            save_config(self.cfg)
+        except Exception:
+            pass
+
+    def _wasm_close(self):
+        """关闭=隐藏，锁定继续生效"""
+        try:
+            self.wasm_win.withdraw()
+        except Exception:
+            pass
+
+    def _wasm_save_state(self):
+        try:
+            if self.wasm_hits:
+                self.cfg['wasm_hits'] = [[int(m), str(t), int(o), v] for (m, t, o, v) in self.wasm_hits[:3000]]
+            else:
+                self.cfg.pop('wasm_hits', None)
+            if self.wasm_locks:
+                self.cfg['wasm_locks'] = [{'mi': int(x['mi']), 't': str(x['t']), 'off': int(x['off']),
+                                           'value': x['value'], 'enabled': bool(x.get('enabled', True))}
+                                          for x in self.wasm_locks]
+            else:
+                self.cfg.pop('wasm_locks', None)
+            save_config(self.cfg)
+        except Exception:
+            pass
+
+    def _wasm_restore_state(self):
+        """重开窗口时恢复上次结果与锁定（页面刷新后需先探测内存）"""
+        try:
+            hits = self.cfg.get('wasm_hits') or []
+            self.wasm_hits = []
+            for h in hits:
+                try:
+                    self.wasm_hits.append((int(h[0]), str(h[1]), int(h[2]), h[3]))
+                except Exception:
+                    pass
+            locks = self.cfg.get('wasm_locks') or []
+            self.wasm_locks = []
+            if locks:
+                self._wasm_boot()
+            for lk in locks:
+                try:
+                    mi, wt, off = int(lk['mi']), str(lk['t']), int(lk['off'])
+                    segs = self._wasm_segs(mi, wt, off)
+                    val = lk.get('value', 0)
+                    enabled = bool(lk.get('enabled', True))
+                    key = '__wasm.%d.%s.%d' % (mi, wt, off)
+                    if enabled:
+                        self._ai_ec_lock(segs, val, True, key)
+                    self.wasm_locks.append({'mi': mi, 't': wt, 'off': off, 'segs': segs,
+                                            'value': val, 'key': key,
+                                            'label': self._wasm_label(mi, wt, off), 'enabled': enabled})
+                except Exception:
+                    pass
+            self._wasm_fill()
+            self._wasm_locks_refresh()
+            if self.wasm_hits:
+                self.wasm_status_var.set('已恢复 %d 个地址 / %d 个锁定' % (len(self.wasm_hits), len(self.wasm_locks)))
+            self.wasm_mems = getattr(self, 'wasm_mems', []) or []
+            if not self.wasm_mems:
+                self._wasm_refresh_mem(silent=True)
+        except Exception:
+            pass
+
     def _close_settings(self):
         """关闭设置窗口并保存设置"""
+        try:
+            self._dir_remember(self.dir_var.get())
+        except Exception:
+            pass
         self._save_settings()
         if self.settings_win is not None:
             try:
@@ -4038,6 +5984,7 @@ class ScraplingGrabberGUI:
             except Exception:
                 pass
         self.settings_win = None
+        self.dir_combo = None
 
     def _log(self, msg):
         """输出日志"""
@@ -4103,10 +6050,7 @@ class ScraplingGrabberGUI:
             # 保存设置
             self._save_settings()
 
-            # 如果勾选了浏览器模式，确保抓取模式是CDP
-            if self.browser_mode_var.get():
-                self.render_mode_var.set('浏览器模式(CDP)')
-            # CDP模式下自动检测并启动调试浏览器（无论通过复选框还是下拉框选择）
+            # CDP模式下自动检测并启动调试浏览器（尊重用户在下拉框的选择）
             if self.render_mode_var.get() == '浏览器模式(CDP)':
                 if not self._is_debug_browser_running():
                     self._log('未检测到调试浏览器，正在自动启动...')
@@ -4127,6 +6071,7 @@ class ScraplingGrabberGUI:
             self.pause_btn.config(state='normal', text='暂停')
             self.stop_btn.config(state='normal')
             self.pause_flag.clear()  # 清除暂停标志
+            self._show_run_bar(True)  # 运行控制行随抓取一起出现
             self.log_text.delete('1.0', 'end')
             self._log('开始抓取...')
 
@@ -4193,6 +6138,7 @@ class ScraplingGrabberGUI:
     def _fetch_page(self, url, timeout=15):
         """抓取网页，支持直连、浏览器渲染、CDP浏览器模式，返回 (html, page)"""
         render_mode = self.render_mode_var.get()
+        self._log('抓取模式: %s' % render_mode)
         html = ''
         if render_mode == '浏览器模式(CDP)':
             # CDP浏览器模式：连接调试浏览器（9222端口），自动启动，导航到URL后获取HTML
@@ -4552,7 +6498,7 @@ class ScraplingGrabberGUI:
         else:
             import requests
             import re
-            resp = requests.get(url, headers=BROWSER_HEADERS, timeout=timeout, verify=False)
+            resp = http_get(url, headers=BROWSER_HEADERS, timeout=timeout)
             # 优先从HTML meta标签中提取编码
             html_content = resp.content
             detected_encoding = None
@@ -4698,6 +6644,7 @@ class ScraplingGrabberGUI:
         self.stop_flag.clear()
         self.start_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
+        self._show_run_bar(True)  # 重试时同样要让运行控制行出现
 
         save_dir = self.dir_var.get().strip()
         max_threads = int(self.threads_var.get() or '8')
@@ -4754,6 +6701,123 @@ class ScraplingGrabberGUI:
         except Exception:
             return False
 
+    def _debug_profile_dir(self):
+        """调试浏览器专用的 user-data-dir（与日常 Chrome 隔离，否则 Chrome 136+ 调试端口不生效）"""
+        return os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'debug_profile')
+
+    def _prepare_debug_profile(self, user_data_dir):
+        """清理上次异常退出留下的会话残留（避免下次启动弹「Chrome 未正确关闭/恢复页面」）"""
+        import shutil
+        try:
+            for f in ('Last Session', 'Last Tabs', 'Current Session', 'Current Tabs'):
+                p = os.path.join(user_data_dir, f)
+                if os.path.exists(p):
+                    os.remove(p)
+            for sd in (os.path.join(user_data_dir, 'Default', 'Session'),
+                       os.path.join(user_data_dir, 'Default', 'Snapshots')):
+                if os.path.exists(sd):
+                    shutil.rmtree(sd, ignore_errors=True)
+        except Exception as e:
+            self._log('清理会话残留失败: %s' % e)
+
+    def _find_browser_exe(self, choice='Chrome'):
+        """按用户选择返回 (可执行文件路径, 浏览器名)；两个都没装则返回 (None, None)"""
+        chrome_paths = [
+            r'C:\Program Files\Google\Chrome\Application\chrome.exe',
+            r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
+            os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        ]
+        edge_paths = [
+            r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+            r'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
+        ]
+        # 用户选的那个优先，没装则退回另一个
+        order = ([('Edge', edge_paths), ('Chrome', chrome_paths)] if choice == 'Edge'
+                 else [('Chrome', chrome_paths), ('Edge', edge_paths)])
+        for name, paths in order:
+            for p in paths:
+                if os.path.exists(p):
+                    return p, name
+        return None, None
+
+    def _debug_browser_root_pids(self):
+        """本程序自己启动的调试浏览器「主进程」PID 集合。
+        按 debug_profile 目录识别（与「独立窗口」「清理残留」用的是同一标记），排除 --type= 子进程。"""
+        import re as _re
+        import subprocess
+        try:
+            ps = (
+                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR Name='msedge.exe'\" | "
+                "Where-Object { $_.CommandLine -like '*WebGrabber*debug_profile*' -and $_.CommandLine -notlike '*--type=*' } | "
+                "ForEach-Object { 'PID:' + $_.ProcessId }"
+            )
+            r = subprocess.run(['powershell', '-NoProfile', '-Command', ps],
+                               timeout=12, capture_output=True)
+            # 直接按字节抽取，避免 PowerShell 输出编码（GBK/UTF-8）不一致
+            return set(int(x) for x in _re.findall(rb'PID:(\d+)', r.stdout))
+        except Exception:
+            return set()
+
+    def _top_level_window_pids(self):
+        """桌面上所有「可见」顶层窗口所属的 PID 集合"""
+        import ctypes
+        from ctypes import wintypes
+        pids = set()
+        try:
+            EnumWindows = ctypes.windll.user32.EnumWindows
+            EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            IsWindowVisible = ctypes.windll.user32.IsWindowVisible
+            GetWindowThreadProcessId = ctypes.windll.user32.GetWindowThreadProcessId
+
+            def cb(hwnd, lParam):
+                if IsWindowVisible(hwnd):
+                    pid = wintypes.DWORD()
+                    GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    pids.add(pid.value)
+                return True
+
+            EnumWindows(EnumWindowsProc(cb), 0)
+        except Exception:
+            pass
+        return pids
+
+    def _debug_browser_visible_pid(self):
+        """本程序的调试浏览器「确实有可见窗口」时返回其主进程 PID，否则 None。
+        用来区分「真的可用」和「端口被残留进程占着、但窗口根本看不见」——后者会让
+        「启动调试浏览器」误判成已在运行而静默返回（用户感觉点了没反应）。"""
+        pids = self._debug_browser_root_pids()
+        if not pids:
+            return None
+        hit = sorted(pids & self._top_level_window_pids())
+        return hit[0] if hit else None
+
+    def _embedded_browser_alive(self):
+        """本程序当前嵌入的浏览器窗口是否仍然有效且可见。
+        注意：嵌入后它是本程序的子窗口，不再是「顶层窗口」，所以不能用
+        _debug_browser_visible_pid()（那只找桌面上的顶层窗口）来判断，否则
+        会把「已经正常嵌入、用得好好的」误判成残留而反复重启。"""
+        import ctypes
+        hwnd = getattr(self, 'browser_hwnd', None)
+        if not hwnd:
+            return False
+        try:
+            user32 = ctypes.windll.user32
+            if not user32.IsWindow(hwnd):
+                return False
+            return bool(user32.IsWindowVisible(hwnd))
+        except Exception:
+            return False
+
+    def _wait_debug_port_free(self, timeout=8):
+        """等待 9222 端口释放（刚杀完进程时 Chrome 还要一点时间才真正退出）"""
+        import time
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if not self._is_debug_browser_running():
+                return True
+            time.sleep(0.4)
+        return False
+
     def _kill_stale_debug_browser(self):
         """杀掉占用debug_profile目录但未开启调试端口的残留Chrome进程"""
         import subprocess
@@ -4774,84 +6838,47 @@ class ScraplingGrabberGUI:
             return False
 
     def _launch_debug_browser(self):
-        """启动调试浏览器（9222端口）"""
+        """启动调试浏览器（9222端口）并嵌入到软件里"""
         import subprocess
-        import os
         import shutil
-
-        # 先检测是否已经在运行
-        if self._is_debug_browser_running():
-            self._log('调试浏览器已经在运行（9222端口），无需重复启动')
-            return
-
-        # 9222未监听时，先杀掉占用调试配置目录的残留Chrome进程（避免复用旧进程导致调试端口不生效）
-        self._kill_stale_debug_browser()
         import time
-        time.sleep(1)
+
+        # ===== 「已在运行」不能只看端口 =====
+        # 端口通只能说明有东西在监听 9222。若上次运行（或另一个实例）留下的调试浏览器
+        # 退出得不干净，会占着端口、窗口却看不见——这时直接 return，用户就是「点了没反应」。
+        # 所以：必须「有可见窗口」才复用，否则清掉残留重新启动。这与用户手工先点一下
+        # 「独立窗口」再点本按钮的效果一致，但不需要他手动做。
+        if self._is_debug_browser_running():
+            # a) 已经嵌进本程序、窗口也还在 → 名副其实的「无需重复启动」，什么都不做
+            if self._embedded_browser_alive():
+                self._log('调试浏览器已在运行（已嵌入本程序），无需重复启动')
+                return
+            # b) 桌面上有它的独立可见窗口（例如之前用「独立窗口」开的）→ 拉进本程序
+            pid = self._debug_browser_visible_pid()
+            if pid:
+                self._debug_browser_pid = pid
+                self._embed_retry = 0
+                self._log('调试浏览器已在运行（PID=%d），正在把它嵌入到软件窗口...' % pid)
+                self._embed_browser()
+                return
+            # c) 端口通、但窗口完全看不见（上次退出的残留）→ 清理重启
+            self._log('9222 端口被占用但没有可见的调试浏览器窗口（多为上次退出后的残留），正在清理并重启...')
+
+        # 清掉占用调试配置目录的残留进程，并等端口真正释放
+        # （刚杀完进程时端口不会立刻空出来，直接启动新实例会因端口冲突起不来 → 又变成「没反应」）
+        self._kill_stale_debug_browser()
+        if not self._wait_debug_port_free():
+            self._log('9222 端口仍被其他程序占用，调试浏览器可能无法正常工作')
 
         # 使用独立的调试配置目录（Chrome 136+使用默认User Data目录时调试端口不生效）
-        user_data_dir = os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'WebGrabber', 'debug_profile')
+        user_data_dir = self._debug_profile_dir()
         os.makedirs(user_data_dir, exist_ok=True)
-
-        # 清理上次异常退出留下的会话残留（否则下次启动弹"Chrome未正确关闭/恢复页面"并恢复旧标签）
-        try:
-            for f in ('Last Session', 'Last Tabs', 'Current Session', 'Current Tabs'):
-                p = os.path.join(user_data_dir, f)
-                if os.path.exists(p):
-                    os.remove(p)
-            sess_dir = os.path.join(user_data_dir, 'Default', 'Session')
-            if os.path.exists(sess_dir):
-                shutil.rmtree(sess_dir, ignore_errors=True)
-            # 同步会话文件（Chrome 新版本会话数据可能放这里）
-            snap_dir = os.path.join(user_data_dir, 'Default', 'Snapshots')
-            if os.path.exists(snap_dir):
-                shutil.rmtree(snap_dir, ignore_errors=True)
-            self._log('已清理调试浏览器会话残留（避免恢复旧标签/崩溃提示）')
-        except Exception as e:
-            self._log('清理会话残留失败: %s' % e)
+        self._prepare_debug_profile(user_data_dir)
 
         # 获取用户选择的浏览器
         browser_choice = getattr(self, 'browser_choice_var', None)
         choice = browser_choice.get() if browser_choice else 'Chrome'
-
-        # Chrome路径
-        chrome_paths = [
-            r'C:\Program Files\Google\Chrome\Application\chrome.exe',
-            r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
-            os.path.join(os.path.expanduser('~'), 'AppData', 'Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        ]
-
-        # Edge路径
-        edge_paths = [
-            r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
-            r'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
-        ]
-
-        # 根据用户选择确定启动顺序
-        if choice == 'Chrome':
-            browser_paths = chrome_paths
-        elif choice == 'Edge':
-            browser_paths = edge_paths
-        else:
-            browser_paths = chrome_paths + edge_paths
-
-        browser_path = None
-        browser_name = None
-
-        # 优先用Chrome
-        for path in chrome_paths:
-            if os.path.exists(path):
-                browser_path = path
-                browser_name = 'Chrome'
-                break
-
-        # 其次用Edge
-        if not browser_path:
-            for path in edge_paths:
-                if os.path.exists(path):
-                    browser_path = path
-                    browser_name = 'Edge'
-                    break
+        browser_path, browser_name = self._find_browser_exe(choice)
 
         if not browser_path:
             self._log('未找到Chrome或Edge浏览器，请手动启动调试浏览器')
@@ -4867,9 +6894,9 @@ class ScraplingGrabberGUI:
             '--disable-session-crashed-bubble',
             '--disable-features=InfiniteSessionRestore',
             '--disable-gpu',
-                    '--disable-gpu-compositing',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
+            '--disable-gpu-compositing',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
             '--user-data-dir=%s' % user_data_dir,
         ]
 
@@ -4900,11 +6927,14 @@ class ScraplingGrabberGUI:
         except Exception as e:
             self._log('自动加载油猴失败: %s（可在调试浏览器里手动安装油猴）' % e)
 
-        # 启动浏览器
+        # 启动浏览器（不带 CREATE_NEW_CONSOLE：那是多余的黑色控制台窗口，且打包成
+        # 无控制台的 exe 后标准句柄无效，容易让 Popen 直接失败；显式重定向到 DEVNULL 更稳）
         self._log('正在启动%s调试浏览器（9222端口）...' % browser_name)
         try:
-            proc = subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self._debug_browser_pid = proc.pid
+            self._embed_retry = 0
             self._log('%s调试浏览器已启动（PID=%d），正在嵌入...' % (browser_name, proc.pid))
             # 延迟嵌入浏览器窗口
             self.root.after(3000, lambda: self._embed_browser())
@@ -4930,18 +6960,27 @@ class ScraplingGrabberGUI:
             browser_choice = getattr(self, 'browser_choice_var', None)
             choice = browser_choice.get() if browser_choice else 'Chrome'
             target_pid = getattr(self, '_debug_browser_pid', None)
+            # 没有 PID 时（复用已在运行的浏览器）先查出自家调试浏览器的进程号，
+            # 否则下面的标题匹配可能把「用户日常浏览器的窗口」嵌进来
+            own_pids = set()
+            if not target_pid:
+                own_pids = self._debug_browser_root_pids()
 
             def enum_callback(hwnd, lParam):
                 nonlocal found_hwnd
                 if not IsWindowVisible(hwnd):
                     return True
+                pid = wintypes.DWORD()
+                GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                hpid = pid.value
                 # 优先按启动时的 PID 精确匹配（最可靠，不依赖窗口标题）
                 if target_pid:
-                    pid = wintypes.DWORD()
-                    GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                    if pid.value == target_pid:
+                    if hpid == target_pid:
                         found_hwnd = hwnd
                         return False
+                    return True
+                # 只能按标题匹配时，先把范围限定在自家调试浏览器的进程内
+                if own_pids and hpid not in own_pids:
                     return True
                 length = GetWindowTextLength(hwnd)
                 if length == 0:
@@ -4969,10 +7008,18 @@ class ScraplingGrabberGUI:
             EnumWindows(EnumWindowsProc(enum_callback), 0)
 
             if not found_hwnd:
-                self._log('未找到浏览器窗口，稍后重试...')
-                self.root.after(2000, self._embed_browser)
+                # 加次数上限：原来会每 2 秒无限重试，用户点了没窗口出现就一直静默刷日志
+                self._embed_retry = getattr(self, '_embed_retry', 0) + 1
+                if self._embed_retry <= 6:
+                    self._log('未找到调试浏览器窗口，稍后重试...（%d/6）' % self._embed_retry)
+                    self.root.after(2000, self._embed_browser)
+                else:
+                    self._embed_retry = 0
+                    self._log('始终没找到调试浏览器窗口。若浏览器没出现，请点「独立窗口」启动一次，'
+                              '或确认 9222 端口未被其他程序占用')
                 return
 
+            self._embed_retry = 0
             self.browser_hwnd = found_hwnd
 
             # 获取宿主窗口句柄
@@ -5542,7 +7589,7 @@ class ScraplingGrabberGUI:
                 self._update_task(task_id, progress='0/%d' % len(img_urls))
 
                 if img_urls:
-                    success, fail, skipped = self._download_image_list(img_urls, post_save_dir, max_threads, min_size, task_id)
+                    success, fail, skipped = self._download_image_list(img_urls, post_save_dir, max_threads, min_size, task_id, referer=post_url)
                     with count_lock:
                         success_count += success
                         fail_count += fail
@@ -5930,8 +7977,8 @@ class ScraplingGrabberGUI:
             self._log('智能过滤: 已开启，过滤目录: %s' % ', '.join(SKIP_DIRS[:5]))
         return list(img_urls)
 
-    def _download_image_list(self, img_urls, save_dir, max_threads, min_size, task_id=None):
-        """下载图片列表，返回 (成功数, 失败数, 跳过数)"""
+    def _download_image_list(self, img_urls, save_dir, max_threads, min_size, task_id=None, referer=None):
+        """下载图片列表，返回 (成功数, 失败数, 跳过数)；referer 用作防盗链来源页"""
         # 统一过滤无效URL（about:blank、模板残留、非图片静态资源等）
         _NON_IMG_EXT = ('.js', '.css', '.html', '.htm', '.php', '.json', '.xml', '.woff', '.woff2', '.ttf', '.ico')
         def _looks_like_img(u):
@@ -6001,7 +8048,8 @@ class ScraplingGrabberGUI:
             for retry in range(max_retries):
                 try:
                     # 去掉stream=True，直接用resp.content
-                    resp = requests.get(img_url, headers=BROWSER_HEADERS, timeout=30, verify=False)
+                    # 走统一通道：直连优先（忽略注册表里的失效代理）+ 图片专用请求头
+                    resp = http_get(img_url, headers=IMAGE_HEADERS, timeout=30, referer=referer)
                     # HTTP状态码检查
                     if resp.status_code != 200:
                         if retry < max_retries - 1:
@@ -6192,7 +8240,7 @@ class ScraplingGrabberGUI:
         if task_id:
             self._update_task(task_id, status='下载中')
 
-        success, fail, skipped = self._download_image_list(img_urls, save_dir, max_threads, min_size, task_id)
+        success, fail, skipped = self._download_image_list(img_urls, save_dir, max_threads, min_size, task_id, referer=url)
 
         # AI 智能过滤（可选，未启用或服务未启动则自动跳过）
         if self.ai_filter_var.get():
@@ -6216,6 +8264,11 @@ class ScraplingGrabberGUI:
         self.pause_btn.config(state='disabled', text='暂停')
         self.stop_btn.config(state='disabled')
         self.pause_flag.clear()
+        # 任务结束：没有待重试的失败任务就收起运行控制行（稍等一拍，等失败统计落到按钮状态上）
+        try:
+            self.root.after(300, self._sync_run_bar)
+        except Exception:
+            pass
         if self.stop_flag.is_set():
             self.stat_var.set('已停止')
         # 可选：抓取完成后自动停止 AI 服务，释放显存/内存
@@ -6238,6 +8291,19 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
