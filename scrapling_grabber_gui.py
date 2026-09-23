@@ -165,6 +165,43 @@ def split_legacy_range(text, default_end=20):
     return parse_range_pair('1', t, default_end)
 
 
+# ===== 「页码」输入框解析（v3.1.14：与「范围」同款，拆成起始/终止两个框）=====
+def parse_page_range(start_text, end_text):
+    """把「页码」两个框解析成 (起始页, 终止页)，1-based、闭区间；终止页 0 表示「不限」。
+
+    与 parse_range_pair 的区别只有一点：终止框留空（或填 0 / 非法值）= 不限制，
+    保持老用户「自动一路翻到底」的习惯；起始框留空按第 1 页算。
+    填反了（起始 > 终止）自动对调，免得一个页都抓不到。
+    """
+    def _num(text, default):
+        try:
+            v = int(str(text).strip())
+        except Exception:
+            return default
+        return v if v > 0 else default
+
+    s_text = str(start_text).strip()
+    e_text = str(end_text).strip()
+    # 兼容：把老的 "3-8" 整段粘进起始框
+    if '-' in s_text and not e_text:
+        a, _, b = s_text.partition('-')
+        s_text, e_text = a, b
+    s = _num(s_text, 1)
+    e = 0 if not e_text else _num(e_text, 0)
+    if e and s > e:
+        s, e = e, s
+    return s, e
+
+
+def split_legacy_page_range(text):
+    """旧配置里的单框页码 → (起始, 终止)：'0'/空 → (1, 0) 不限，'5' → (1, 5)，'3-8' → (3, 8)。"""
+    t = str(text or '').strip()
+    if '-' in t:
+        a, _, b = t.partition('-')
+        return parse_page_range(a, b)
+    return parse_page_range('1', t)
+
+
 class HttpSessions:
     """会话池：直连 / 系统代理 两条通道，自动择优并记住上次成功的那条。
 
@@ -238,7 +275,7 @@ def http_get(url, headers=None, timeout=30, referer=None, allow_proxy_fallback=T
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v3.1.13'
+APP_VERSION = 'v3.1.14'
 APP_NAME = '全能网页助手'
 
 # ===== 界面主题（深色科技蓝 / 浅色简约，可一键切换）=====
@@ -970,6 +1007,10 @@ class ScraplingGrabberGUI:
         _rng_s, _rng_e = split_legacy_range(self.cfg.get('post_range', '20'))
         self.post_range_start_var.set(self.cfg.get('post_range_start', _rng_s))
         self.post_range_end_var.set(self.cfg.get('post_range_end', _rng_e))
+        # 页码（v3.1.14 起同样拆成两个框；旧键 page_num 的 '0'=不限 / '5' 自动转换）
+        _pg_s, _pg_e = split_legacy_page_range(self.cfg.get('page_num', '0'))
+        self.page_range_start_var.set(self.cfg.get('page_range_start', _pg_s))
+        self.page_range_end_var.set(self.cfg.get('page_range_end', '' if not _pg_e else _pg_e))
         self.min_size_var.set(self.cfg.get('min_size', 0))
         if hasattr(self, 'convert_webp_var'):
             self.convert_webp_var.set(self.cfg.get('convert_webp', False))
@@ -1016,6 +1057,7 @@ class ScraplingGrabberGUI:
         # 先把当前服务商的 Key/模型配置归档
         self._save_provider_state()
         self.cfg.pop('post_range', None)   # 旧键（单框 "20"/"15-60"）已拆成下面两个
+        self.cfg.pop('page_num', None)     # 旧键（单框 "0"/"5"）已拆成 page_range_*
         self.cfg.update({
             'url': self.url_var.get().strip(),
             'save_dir': os.path.normpath(self.dir_var.get().strip()),
@@ -1028,6 +1070,8 @@ class ScraplingGrabberGUI:
             'grab_mode': self.grab_mode_var.get(),
             'post_range_start': self.post_range_start_var.get(),
             'post_range_end': self.post_range_end_var.get(),
+            'page_range_start': self.page_range_start_var.get(),
+            'page_range_end': self.page_range_end_var.get(),
             'min_size': self.min_size_var.get(),
             'convert_webp': self.convert_webp_var.get(),
             'convert_avif': self.convert_avif_var.get(),
@@ -3407,9 +3451,15 @@ class ScraplingGrabberGUI:
         ttk.Entry(opt_frame, textvariable=self.post_range_end_var, width=4,
                   style='Row.TEntry').pack(side='left', padx=(1, 10))
         ttk.Label(opt_frame, text='页码:').pack(side='left')
-        self.page_num_var = tk.StringVar(value='0')
-        ttk.Entry(opt_frame, textvariable=self.page_num_var, width=3,
-                  style='Row.TEntry').pack(side='left', padx=(2, 10))
+        # 起始 / 终止 两个框（v3.1.14 起，原来是单个框填 "0"=不限 / "5"=翻到第5页）
+        self.page_range_start_var = tk.StringVar(value='1')
+        ttk.Entry(opt_frame, textvariable=self.page_range_start_var, width=3,
+                  style='Row.TEntry').pack(side='left', padx=(2, 1))
+        ttk.Label(opt_frame, text='-', style='Muted.TLabel').pack(side='left')
+        self.page_range_end_var = tk.StringVar(value='')   # 留空 = 不限（自动翻到底）
+        ttk.Entry(opt_frame, textvariable=self.page_range_end_var, width=3,
+                  style='Row.TEntry').pack(side='left', padx=(1, 4))
+        ttk.Label(opt_frame, text='空=不限', style='Muted.TLabel').pack(side='left', padx=(0, 10))
         ttk.Label(opt_frame, text='抓取:').pack(side='left')
         self.render_mode_var = tk.StringVar(value='直连模式')
         render_combo = ttk.Combobox(opt_frame, textvariable=self.render_mode_var, width=13,
@@ -7412,6 +7462,13 @@ class ScraplingGrabberGUI:
         s, e = parse_range_pair(self.post_range_start_var.get(), self.post_range_end_var.get())
         return s - 1, e
 
+    def _page_range_values(self):
+        """读取「页码」两个框 → (起始页, 终止页)，都是 1-based；终止页 0 表示「不限」。
+
+        留空/非法值走 parse_page_range 的默认（起始 1、终止不限），填反自动对调。
+        """
+        return parse_page_range(self.page_range_start_var.get(), self.page_range_end_var.get())
+
     def _crawl_worker(self, url, save_dir):
         """抓取工作线程"""
         try:
@@ -7661,18 +7718,18 @@ class ScraplingGrabberGUI:
         all_post_links = []
         current_url = url
         page_num = 1
-        max_pages = 50  # 最多翻50页
 
-        # 如果指定了页码，就只翻到指定页码
-        page_filter_num = 0
-        try:
-            if hasattr(self, 'page_num_var') and self.page_num_var:
-                page_filter_num = int(self.page_num_var.get() or '0')
-        except Exception:
-            page_filter_num = 0
-        if page_filter_num > 0:
-            max_pages = page_filter_num
-            self._log('指定只抓取第%d页' % page_filter_num)
+        # 页码范围（v3.1.14：两个框 = 起始 / 终止 列表页码；终止留空 = 不限）
+        page_start, page_end = self._page_range_values()
+        max_pages = page_end if page_end > 0 else 50   # 不限时沿用旧的 50 页硬上限
+        if page_start > max_pages:
+            max_pages = page_start   # 起始页比上限还大时，至少得翻到起始页
+        if page_end > 0:
+            self._log('页码: 第%d-%d页（区间外的帖子不计入）' % (page_start, page_end))
+        elif page_start > 1:
+            self._log('页码: 从第%d页开始，翻到底（最多%d页）' % (page_start, max_pages))
+        else:
+            self._log('页码: 不限（自动翻到底，最多%d页）' % max_pages)
 
         while current_url and page_num <= max_pages:
             if self.stop_flag.is_set():
@@ -7733,13 +7790,11 @@ class ScraplingGrabberGUI:
                     self._log('警告：当前页没有识别到任何帖子链接，可能是网站结构不匹配')
                     break
 
-            # 将当前页的帖子链接添加到总列表
-            all_post_links.extend(post_links)
-
-            # 如果指定了页码，只抓取指定页，不翻页
-            if page_filter_num > 0:
-                self._log('指定只抓取第%d页，停止翻页' % page_filter_num)
-                break
+            # 将当前页的帖子链接添加到总列表（只收页码区间内的页）
+            if page_num < page_start:
+                self._log('  第%d页在页码范围之前，只翻过不收集' % page_num)
+            else:
+                all_post_links.extend(post_links)
 
             # 提取下一页链接
             next_url = self._extract_next_page(page, current_url)
@@ -7808,6 +7863,12 @@ class ScraplingGrabberGUI:
                 # 否则会把列表页当帖子再抓一遍封面图（没新内容时的正确行为就是什么都不做）
                 self._log('识别到 %d 个帖子，均已抓过（增量扫描跳过 %d 个）。要重抓请勾选「强制重扫」。'
                           % (len(all_post_links), skipped_count))
+                return
+            if page_start > 1 and not all_post_links:
+                # 页码区间起点超过了列表实际页数：识别/翻页都正常，只是区间内一条帖子都没有，
+                # 这时同样不能回退单页抓取（会把列表页当帖子抓封面图）
+                self._log('页码范围第%d页起没有取到任何帖子（共翻了 %d 页），请确认起始页码是否超出列表实际页数。'
+                          % (page_start, page_num))
                 return
             self._log('未识别到帖子链接，回退为单页抓取')
             self._crawl_single_page(url, save_dir, max_threads, timeout, min_size, task_id=None)

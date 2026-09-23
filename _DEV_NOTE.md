@@ -1,4 +1,40 @@
-# Scrapling 图片爬虫 - 开发交接笔记（截至 v3.1.13）
+# Scrapling 图片爬虫 - 开发交接笔记（截至 v3.1.14）
+
+## v3.1.14 新增（「页码」拆成起始/终止两个输入框）
+
+**需求**：用户「页码也弄个范围和前面帖子那个一样」。开工前用 AskUserQuestion 定了两个口径：
+**终止留空 = 不限**（保持老的「一路翻到底」默认行为）、**只收区间内的帖子**（区间之前的页只翻过、不收集）。
+
+**改法**
+- UI（`opt_frame` 第 1 排）：页码单框 `Entry(width=3)` 换成 起始框 `width=3` + `Muted.TLabel('-')` + 终止框 `width=3`
+  + 灰色提示 `Muted.TLabel('空=不限')`（终止框留空很容易被误读成「漏填」）。
+  变量 `page_num_var` → `page_range_start_var`（默认 `'1'`）/ `page_range_end_var`（默认 `''`）。
+  实测这排最右端 747px（可用 964），面板 reqwidth 仍 882，不影响 980 默认窗口。
+- 解析集中在模块级两个纯函数：
+  - `parse_page_range(start_text, end_text)` → `(起始页, 终止页)`，**终止 0 = 不限**；
+    起始留空按 1、填反自动对调、兼容把 `3-8` 整段粘进起始框。
+  - `split_legacy_page_range(text)`：旧单框值 → 两值（`'0'`/空 → `(1, 0)` 不限、`'5'` → `(1, 5)`、`'3-8'` → `(3, 8)`）。
+  与 `parse_range_pair` 的唯一区别是「终止为空」的语义（范围框留空回退 20，页码框留空 = 不限），所以没强行复用。
+- 类内 `_page_range_values()` 供 `_crawl_whole_site` 使用。
+- 翻页逻辑（`_crawl_whole_site`）：`max_pages = page_end or 50`，再 `max(max_pages, page_start)`
+  （起始页比 50 还大时至少翻到起始页）；循环里 `if page_num < page_start:` **只翻过不收集**，否则才 `all_post_links.extend(...)`。
+  顺带删掉老的 `page_filter_num`：原实现 `max_pages = page_filter_num` 之后立刻 `break`，
+  等于「填任何页码都只抓第一页」，这次一并改正。
+- 新增兜底分支：`if page_start > 1 and not all_post_links:` → 提示「页码范围第N页起没有取到任何帖子（共翻了 M 页）」
+  并 return，**不回退单页抓取**（同 v3.1.12 的教训：回退会把列表页当帖子抓一遍封面图）。
+- 配置：存 `page_range_start` / `page_range_end`；加载优先新键、缺失就用 `split_legacy_page_range(cfg['page_num'])` 拆；
+  保存时 `self.cfg.pop('page_num', None)` 清旧键。
+
+**验证**
+- `_v3114_unit.py`：`parse_page_range` 14 例、`split_legacy_page_range` 7 例、真 GUI 配置往返（旧 `page_num='0'` 载入 → 1/空；
+  改 4/9 存盘 → 重载 4/9；旧键已清理；顺手回归「范围」仍是 (14,60)）+
+  **桩网络实跑 `_crawl_whole_site`** 5 个场景（1-不限收 6 条、2-不限收 4 条、2-3 收 4 条、3-3 收 2 条、
+  9-12 超页数给提示且不回退）→ 全部通过。
+- `_v3114_layout.py`：980 与 1936 两档、暗/浅色共 4 张截图；第 1 排最右端 747 ≤ 964、`adv_frame.reqwidth=882` 不变。
+- `_codecheck_v3114.py`：exe 内嵌代码 **59 项全过**（含 `page_num_var` / `page_filter_num` / 「指定只抓取第%d页」已消失）；
+  `_v3114_exe_smoke.py`：真实点击展开面板、截图确认两个页码框 + 「空=不限」可见。
+  - ⚠ 核对脚本**不要拿代码注释当检查项**（注释不进 `co_consts`，必然误报 ❌）：本次把注释
+    「留空 = 不限（自动翻到底）」写成了检查项，白报一次差异，改成 docstring 里的句子后通过。
 
 ## v3.1.13 新增（「范围」拆成起始/终止两个输入框）
 
@@ -114,7 +150,7 @@
 （桩网络 18 项：命中原图/回 200+HTML 回退/404 回退/关开关/异常换候选/过小跳过/普通地址不变），
 `_origreal.py` 真机下 8 张：**8/8 全部 1800×2400、合计 2802KB（对照组预览图 228KB，12.3 倍）**。
 
-## v3.x 交接补充（v3.0.0 → v3.1.13）
+## v3.x 交接补充（v3.0.0 → v3.1.14）
 
 > 仓库 git 历史里 v3.1.x 的逐版细节没留（只有 v3.0.0 两条提交 + 最后一次 v3.1.10），这里按「发布版本 → 实际改动」补齐；
 > 依据是各版 exe 的内嵌代码解包核对（逐版探测标志性方法/常量存在性）+ 改造过程记录，不是回忆推测。
@@ -134,8 +170,9 @@
 - **v3.1.11**：抓取原图（`orig_url_candidates` / `looks_like_media` / `_cdp_fallback` + 「抓取原图」勾选框），详见上节
 - **v3.1.12**：列表页自动进帖子抓内容图（`url_shape` / `_extract_card_links` / `_expand_post_pages` + 卡片判据替换形态规则 + 增量短路 bug 修复），详见上节
 - **v3.1.13**：「范围」拆成起始/终止两个输入框（`parse_range_pair` / `split_legacy_range` / `_post_range_values` + 配置键拆成 `post_range_start`/`post_range_end`），详见上节
+- **v3.1.14**：「页码」也拆成起始/终止两个输入框（`parse_page_range` / `split_legacy_page_range` / `_page_range_values` + 配置键拆成 `page_range_start`/`page_range_end`，终止留空 = 不限；顺带修掉老实现「填任何页码都只抓第一页」），详见上节
 
-### 当前顶部结构（v3.1.13）
+### 当前顶部结构（v3.1.14）
 `url_frame`（行1：网址 + 收藏 / 设置 / 高级选项 ▾ / 开始抓取）→ `btn_frame`（**默认不 pack**：暂停/停止/重试失败）→ `adv_frame`（可折叠面板：抓取参数 / 功能入口 / 智能过滤 / AI / 转换+性能 / 浏览器模式）。
 标签条高度约 36px 由 `TNotebook.Tab` 的 `padding=(14,6)` 决定，改 `tabmargins` 或 `TNotebook.padding` 对标签条高度无效。
 
@@ -146,6 +183,7 @@
 - 原图推导（v3.1.11）：`_ORIG_SUFFIX_RE` / `orig_url_candidates` / `looks_like_media` / `_download_image_list._cdp_fallback`
 - 列表页/帖子（v3.1.12）：`url_shape` / `_extract_card_links` / `_extract_post_links` / `_expand_post_pages` / `_crawl_whole_site` / `crawl_single_post` 内的调用
 - 「范围」解析（v3.1.13）：`parse_range_pair` / `split_legacy_range` / `_post_range_values`（`_crawl_worker` 与 `_crawl_whole_site` 共用）
+- 「页码」解析（v3.1.14）：`parse_page_range` / `split_legacy_page_range` / `_page_range_values`（`_crawl_whole_site` 的翻页收集用它；终止 0 = 不限）
 - 调试浏览器：`_launch_debug_browser` / `_open_independent_browser` / `_embed_browser` / `_debug_browser_visible_pid` / `_embedded_browser_alive` / `_prepare_debug_profile` / `_find_browser_exe` / `_wait_debug_port_free`
 - 游戏修改：`_open_game_mod_window` / `_ai_ec_scan` / `_ai_ec_edit` / `_ai_ec_lock` / `_wasm_boot` / `_ec_assign_expr`
 - 目录历史：`_dir_remember` / `_dir_refresh_combo` / `_on_dir_pick` / `cfg['save_dirs']`
