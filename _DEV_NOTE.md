@@ -1,6 +1,37 @@
-# Scrapling 图片爬虫 - 开发交接笔记（截至 v3.1.10）
+# Scrapling 图片爬虫 - 开发交接笔记（截至 v3.1.11）
 
-## v3.x 交接补充（v3.0.0 → v3.1.10）
+## v3.1.11 新增（抓取原图：缩略图地址 → 原图地址）
+
+**问题**：用户发现抓下来的图比浏览器「另存为」小很多。实测原因：相册页只暴露缩略图地址，
+如 `https://img.xchina.io/photos2/<id>/0001_600x0.webp`（600×800 / 49KB），
+同目录 `0001.jpg` 才是原图（1800×2400 / 519KB）。页面 HTML 里根本没有原图地址（照片是
+`<div role="img" style="background-image:url(...)">`），只能按命名规律猜。
+
+**改法**（`_download_image_list` 内 `download_one`）：
+- 新增模块级 `_ORIG_SUFFIX_RE` + `orig_url_candidates(url)`：把 `xxx_<宽>x<高>.<ext>` 形式的
+  预览地址扩成候选列表 `[xxx.jpg, xxx.<原格式>, 原地址]`。宽 ≥30 且（高 ≥30 或 高==0，
+  站点用 0 表示高度自适应）；base 末段为空/尺寸不合理时不动原地址。
+- `download_one` 从 `candidates[0]` 开始试，每个候选最多 3 次重试，全试完才判这张失败；
+  取到原图失败就自动回退预览，**不会因为猜错而整批失败**。已确认是"明确否定"的响应
+  （404/403、200 但内容不是图片）直接换下一个候选，不再傻等 3 次重试（原来每个候选重试
+  3 次会让整批慢很多）。
+- 新增模块级 `looks_like_media(data)`（文件头魔数：JPEG/PNG/GIF/BMP/RIFF+WEBP/ftyp/TIFF）。
+  **这个必须有**：这类 CDN 对不存在的文件返回 **200 + 一小段 HTML**（实测
+  `/photos2/<id>/0001.webp` 就是 200 + text/html），只看状态码会把 HTML 当图片存下来。
+- 失败兜底修复：原来的浏览器通道兜底（`_cdp_download_image`）因为引用了尚未赋值的
+  `filepath`，`NameError` 被 `except: pass` 吞掉，等于从来没生效过。现在抽成局部函数
+  `_cdp_fallback(url, idx)`（自己按后缀算文件名），HTTP 通道的失败/异常两条路径都会调用它。
+- UI：高级面板 C 行最前面加勾选框「抓取原图」（`orig_img_var`，默认 True，存 `cfg['orig_img']`）。
+  关掉就退回 v3.1.10 行为（只下预览图）。C 行最右端 800px、面板 reqwidth 仍 882（功能入口那排
+  仍是最宽的），980 默认窗口放得下。
+- 日志：每张图会打「原图不可用(原因)，回退预览图: <url>」，下载末尾汇总一行
+  「原图替换: N 张取到原图[，M 张原图地址不可用已回退预览图]」。
+
+**验证**：`_origtest.py`（候选规则 9 例 + 文件头 10 例 + 真站探测）、`_orige2e.py`
+（桩网络 18 项：命中原图/回 200+HTML 回退/404 回退/关开关/异常换候选/过小跳过/普通地址不变），
+`_origreal.py` 真机下 8 张：**8/8 全部 1800×2400、合计 2802KB（对照组预览图 228KB，12.3 倍）**。
+
+## v3.x 交接补充（v3.0.0 → v3.1.11）
 
 > 仓库 git 历史里 v3.1.x 的逐版细节没留（只有 v3.0.0 两条提交 + 最后一次 v3.1.10），这里按「发布版本 → 实际改动」补齐；
 > 依据是各版 exe 的内嵌代码解包核对（逐版探测标志性方法/常量存在性）+ 改造过程记录，不是回忆推测。
@@ -17,8 +48,9 @@
 - **v3.1.8**：参数行并入面板（`opt_frame` 变成 `adv_frame` 的子控件）；运行控制行按需出现（`_show_run_bar` / `_sync_run_bar`，`_finish_crawl` → `after(300, _sync_run_bar)`）；**删除**整套宽度自适应机制（`_apply_opt_layout` / `_measure_inline_need` / `_pack_opt_row` / `_opt_need_width` / `opt_sep` 等）
 - **v3.1.9**：顶部留白收紧（`top_frame.pady/ipady`、`url_frame.pady`、`TNotebook.tabmargins` 三处）
 - **v3.1.10**：面板排版放宽（行距/分隔条/AI 开关拆两排）+ 新样式 `Feature.TButton` + 功能入口按钮右对齐
+- **v3.1.11**：抓取原图（`orig_url_candidates` / `looks_like_media` / `_cdp_fallback` + 「抓取原图」勾选框），详见下节
 
-### 当前顶部结构（v3.1.10）
+### 当前顶部结构（v3.1.11）
 `url_frame`（行1：网址 + 收藏 / 设置 / 高级选项 ▾ / 开始抓取）→ `btn_frame`（**默认不 pack**：暂停/停止/重试失败）→ `adv_frame`（可折叠面板：抓取参数 / 功能入口 / 智能过滤 / AI / 转换+性能 / 浏览器模式）。
 标签条高度约 36px 由 `TNotebook.Tab` 的 `padding=(14,6)` 决定，改 `tabmargins` 或 `TNotebook.padding` 对标签条高度无效。
 
@@ -26,6 +58,7 @@
 - 主题：`_apply_widget_theme` / `THEMES` / `_apply_theme`（切换主题要重新 `.configure(text=...)` 手动改过文案的按钮）
 - 顶部布局：`_toggle_advanced` / `_show_run_bar` / `_sync_run_bar`
 - 下载：`IMAGE_HEADERS` / `HttpSessions` / `http_get` / `_download_image_list` / `_cdp_download_image`
+- 原图推导（v3.1.11）：`_ORIG_SUFFIX_RE` / `orig_url_candidates` / `looks_like_media` / `_download_image_list._cdp_fallback`
 - 调试浏览器：`_launch_debug_browser` / `_open_independent_browser` / `_embed_browser` / `_debug_browser_visible_pid` / `_embedded_browser_alive` / `_prepare_debug_profile` / `_find_browser_exe` / `_wait_debug_port_free`
 - 游戏修改：`_open_game_mod_window` / `_ai_ec_scan` / `_ai_ec_edit` / `_ai_ec_lock` / `_wasm_boot` / `_ec_assign_expr`
 - 目录历史：`_dir_remember` / `_dir_refresh_combo` / `_on_dir_pick` / `cfg['save_dirs']`

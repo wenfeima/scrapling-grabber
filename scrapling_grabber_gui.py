@@ -1,6 +1,7 @@
 ﻿# -*- coding: utf-8 -*-
 """Scrapling 图片爬虫 - GUI 版本"""
 import os
+import re
 import sys
 import time
 import threading
@@ -43,6 +44,70 @@ IMAGE_HEADERS = {
     'Sec-Fetch-Mode': 'no-cors',
     'Sec-Fetch-Site': 'same-site',
 }
+
+# ===== 原图地址推导（v3.1.11）=====
+# 不少相册页只暴露缩略图地址，形如 https://img.xchina.io/photos2/<id>/0001_600x0.webp，
+# 而同一目录下的 0001.jpg 才是原图（实测 1800x2400 / 520KB，预览只有 600x800 / 49KB）。
+# 页面里拿不到原图地址，只能按命名规律猜，所以必须允许回退。
+_ORIG_SUFFIX_RE = re.compile(
+    r'^(?P<base>.+?)[_-](?P<w>\d{1,5})x(?P<h>\d{1,5})'
+    r'(?P<ext>\.(?:jpe?g|png|webp|avif|gif|bmp))$', re.IGNORECASE)
+
+
+def orig_url_candidates(url):
+    """把「预览图地址」扩成按优先级排的候选列表：原图.jpg → 原图(原格式) → 原地址（兜底）。
+
+    猜出来的原图不保证存在（别的站点可能只有预览版），调用方必须按顺序回退。
+    """
+    fallback = [url]
+    try:
+        sp = urllib.parse.urlsplit(url)
+        m = _ORIG_SUFFIX_RE.match(sp.path)
+        if not m:
+            return fallback
+        base = m.group('base')
+        if not base.rsplit('/', 1)[-1]:
+            return fallback
+        w, h = int(m.group('w')), int(m.group('h'))
+        # 尺寸要像个真实尺寸：宽 >=30，高 >=30 或 0（站点用 0 表示"高度自适应"）
+        if w < 30 or (h != 0 and h < 30):
+            return fallback
+        cands = []
+        for ext in ('.jpg', m.group('ext')):
+            cand = urllib.parse.urlunsplit((sp.scheme, sp.netloc, base + ext, sp.query, ''))
+            if cand not in cands and cand != url:
+                cands.append(cand)
+        cands.append(url)
+        return cands
+    except Exception:
+        return fallback
+
+
+def looks_like_media(data):
+    """按文件头判断是不是图片/视频。
+
+    猜原图地址猜错时，这类 CDN 常回 **200 + 一小段 HTML**（实测 xchina 的
+    /photos2/<id>/0001.webp 就是 200 + text/html），只看状态码会把 HTML 当图片存下来，
+    所以必须验魔数。MP4/AVIF/HEIC 都是 ftyp 开头（视频会被后面的伪装嗅探改名 .mp4）。
+    """
+    if not data or len(data) < 12:
+        return False
+    head = data[:16]
+    if head[:2] == b'\xff\xd8':                         # JPEG
+        return True
+    if head[:8] == b'\x89PNG\r\n\x1a\n':                # PNG
+        return True
+    if head[:6] in (b'GIF87a', b'GIF89a'):              # GIF
+        return True
+    if head[:2] == b'BM':                               # BMP
+        return True
+    if head[:4] == b'RIFF' and data[8:12] == b'WEBP':   # WebP
+        return True
+    if head[4:8] == b'ftyp':                            # AVIF / HEIC / MP4
+        return True
+    if head[:4] in (b'II*\x00', b'MM\x00*'):            # TIFF
+        return True
+    return False
 
 
 class HttpSessions:
@@ -118,7 +183,7 @@ def http_get(url, headers=None, timeout=30, referer=None, allow_proxy_fallback=T
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v3.1.10'
+APP_VERSION = 'v3.1.11'
 APP_NAME = '全能网页助手'
 
 # ===== 界面主题（深色科技蓝 / 浅色简约，可一键切换）=====
@@ -852,6 +917,8 @@ class ScraplingGrabberGUI:
             self.convert_webp_var.set(self.cfg.get('convert_webp', False))
             self.convert_avif_var.set(self.cfg.get('convert_avif', False))
             self.jpg_quality_var.set(self.cfg.get('jpg_quality', 90))
+        if hasattr(self, 'orig_img_var'):
+            self.orig_img_var.set(self.cfg.get('orig_img', True))
         # AI 过滤设置（旧预设名自动回退到新默认）
         preset = self.cfg.get('ai_preset', '内置4B（无审查·6G显存）')
         if preset not in AI_MODEL_PRESETS:
@@ -905,6 +972,7 @@ class ScraplingGrabberGUI:
             'convert_webp': self.convert_webp_var.get(),
             'convert_avif': self.convert_avif_var.get(),
             'jpg_quality': self.jpg_quality_var.get(),
+            'orig_img': getattr(self, 'orig_img_var', None) and self.orig_img_var.get(),
             # AI 过滤设置
             'ai_filter': self.ai_filter_var.get(),
             'ai_prompt': self.ai_prompt_var.get(),
@@ -3380,8 +3448,11 @@ class ScraplingGrabberGUI:
         # C 行：格式转换与性能
         adv_c = ttk.Frame(adv_frame)
         adv_c.pack(fill='x', padx=(10, 10), pady=(10, 0))
+        # 抓取原图：页面只给缩略图时改猜同目录原图地址（0001_600x0.webp → 0001.jpg），猜不到自动回退
+        self.orig_img_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(adv_c, text='抓取原图', variable=self.orig_img_var).pack(side='left')
         self.convert_webp_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(adv_c, text='WEBP转JPG', variable=self.convert_webp_var).pack(side='left')
+        ttk.Checkbutton(adv_c, text='WEBP转JPG', variable=self.convert_webp_var).pack(side='left', padx=(18, 0))
         self.convert_avif_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(adv_c, text='AVIF转JPG', variable=self.convert_avif_var).pack(side='left', padx=(18, 0))
         ttk.Label(adv_c, text='JPG品质(1-100):').pack(side='left', padx=(20, 4))
@@ -8014,10 +8085,29 @@ class ScraplingGrabberGUI:
         fail = 0
         skipped = 0
         total_bytes = 0
+        orig_ok = 0          # 换成原图的张数
+        orig_fallback = 0    # 原图不可用、回退预览图的张数
         start_time = time.time()
 
+        def _cdp_fallback(url, idx):
+            """HTTP 通道彻底失败时的浏览器通道兜底（带代理/登录态）；成功返回文件路径，失败 None"""
+            try:
+                os.makedirs(save_dir, exist_ok=True)
+                _u = url.lower()
+                _ext = '.jpg'
+                for e in ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif']:
+                    if e in _u:
+                        _ext = e
+                        break
+                fp = os.path.join(save_dir, 'img_%03d%s' % (idx + 1, _ext))
+                if self._cdp_download_image(url, fp) and os.path.exists(fp):
+                    return fp
+            except Exception:
+                pass
+            return None
+
         def download_one(idx, img_url):
-            nonlocal success, fail, skipped, total_bytes
+            nonlocal success, fail, skipped, total_bytes, orig_ok, orig_fallback
             if self.stop_flag.is_set():
                 return
             # 保存原始URL
@@ -8043,38 +8133,83 @@ class ScraplingGrabberGUI:
             # xchina 站：视频/大图真实在 img.xchina.io CDN，页面里写的 xchina.co 路径是错的
             if img_url.startswith('https://xchina.co/') and ('/photos/' in img_url or '.mp4' in img_url):
                 img_url = 'https://img.xchina.io/' + img_url[len('https://xchina.co/'):]
-            # 重试机制：最多重试3次
+            # ===== v3.1.11：预览图地址 → 先试同目录原图（0001_600x0.webp → 0001.jpg），失败自动回退预览 =====
+            try:
+                want_orig = bool(self.orig_img_var.get())
+            except Exception:
+                want_orig = True
+            preview_url = img_url
+            candidates = orig_url_candidates(img_url) if want_orig else [img_url]
+            had_origs = len(candidates) > 1
+            cand_idx = 0
+            img_url = candidates[0]        # 从原图候选开始试
+            # 重试机制：每个候选最多重试3次；候选（原图 → 预览）逐个试，全试完才判这张图失败
             max_retries = 3
-            for retry in range(max_retries):
+            retry = 0
+            while retry < max_retries:
                 try:
                     # 去掉stream=True，直接用resp.content
                     # 走统一通道：直连优先（忽略注册表里的失效代理）+ 图片专用请求头
                     resp = http_get(img_url, headers=IMAGE_HEADERS, timeout=30, referer=referer)
-                    # HTTP状态码检查
+                    content = resp.content
+                    # 状态码 / 文件头 / 尺寸 三道检查
+                    # ⚠ 猜错原图地址时 CDN 会回 200 + 一段 HTML（实测 xchina 就是这样），只看状态码会把网页存成图片
                     if resp.status_code != 200:
-                        if retry < max_retries - 1:
+                        code = resp.status_code
+                        reason = 'HTTP %d' % code
+                        # 404/403 这种"明确的否定"直接换候选；5xx/429 才值得重试
+                        transient = (code >= 500 or code in (408, 425, 429))
+                    elif not looks_like_media(content):
+                        reason = '非图片内容(可能是HTML)'
+                        transient = False
+                    elif min_size > 0 and len(content) < min_size * 1024:
+                        reason = '过小 %.1fKB' % (len(content) / 1024)
+                        transient = True   # 可能只是没下完，值得重试
+                    else:
+                        reason = ''
+                        transient = False
+                    if reason:
+                        # 同一个候选先重试（可能是下载不完整/服务端抖动）
+                        if transient and retry < max_retries - 1:
+                            retry += 1
                             time.sleep(1)
                             continue
-                        else:
-                            fail += 1
-                            self._log('下载失败[HTTP %d][%d/%d]: %s' % (resp.status_code, success + fail + skipped, len(img_urls), img_url[:80]))
+                        # 原图都小于下限 → 换成更小的预览图没有意义，直接跳过这张
+                        if reason.startswith('过小'):
+                            skipped += 1
+                            self._log('跳过[过小 %.1fKB < %dKB][%d/%d]: %s' % (len(content)/1024, min_size, success + fail + skipped, len(img_urls), img_url[:80]))
+                            # 更新任务进度（跳过的也算处理过）
                             if task_id:
                                 self._update_task(task_id, progress='%d/%d' % (success + fail + skipped, len(img_urls)))
                             return
-                    content = resp.content
-                    # 最小图片过滤
-                    if min_size > 0 and len(content) < min_size * 1024:
-                        # 图片太小，先重试一次，确认是不是下载不完整
-                        if retry < max_retries - 1:
-                            time.sleep(1)
+                        # 还有候选 → 换下一个（原图取不到就回退预览图）
+                        nxt = cand_idx + 1
+                        if nxt < len(candidates):
+                            self._log('原图不可用(%s)，回退预览图: %s' % (reason, img_url[:90]))
+                            cand_idx = nxt
+                            img_url = candidates[nxt]
+                            retry = 0
                             continue
-                        # 重试后还是很小，才跳过
-                        skipped += 1
-                        self._log('跳过[过小 %.1fKB < %dKB][%d/%d]: %s' % (len(content)/1024, min_size, success + fail + skipped, len(img_urls), img_url[:80]))
-                        # 更新任务进度（跳过的也算处理过）
+                        # 候选全试完 → 浏览器通道兜底（原图地址常需登录态/防盗链，HTTP 通道会 403）
+                        fp = _cdp_fallback(img_url, idx)
+                        if fp:
+                            success += 1
+                            total_bytes += os.path.getsize(fp)
+                            self._log('浏览器通道下载成功[%d/%d]: %s' % (success + fail + skipped, len(img_urls), img_url[:80]))
+                            if task_id:
+                                self._update_task(task_id, progress='%d/%d' % (success + fail + skipped, len(img_urls)))
+                            return
+                        fail += 1
+                        self._log('下载失败[%s][%d/%d]: %s' % (reason, success + fail + skipped, len(img_urls), img_url[:80]))
                         if task_id:
                             self._update_task(task_id, progress='%d/%d' % (success + fail + skipped, len(img_urls)))
                         return
+                    # 取到可用内容：统计原图替换情况（换到原图的张数 / 回退预览的张数）
+                    if had_origs:
+                        if img_url != preview_url:
+                            orig_ok += 1
+                        else:
+                            orig_fallback += 1
                     # 确定扩展名
                     ext = '.jpg'
                     url_lower = img_url.lower()
@@ -8132,27 +8267,32 @@ class ScraplingGrabberGUI:
                 except Exception as e:
                     if retry < max_retries - 1:
                         # 重试前等待1秒
+                        retry += 1
                         time.sleep(1)
                         continue
-                    else:
-                        # 最后一次重试还是失败：尝试走浏览器通道（带代理/登录态）
-                        try:
-                            os.makedirs(save_dir, exist_ok=True)
-                            if self._cdp_download_image(img_url, filepath):
-                                success += 1
-                                total_bytes += os.path.getsize(filepath)
-                                self._log('浏览器通道下载成功[%d/%d]: %s' % (success + fail + skipped, len(img_urls), img_url[:80]))
-                                if task_id:
-                                    self._update_task(task_id, progress='%d/%d' % (success + fail + skipped, len(img_urls)))
-                                return
-                        except Exception:
-                            pass
-                        fail += 1
-                        self._log('下载失败[%d/%d] (重试%d次): %s - %s' % (success + fail + skipped, len(img_urls), max_retries, img_url[:100], str(e)[:150]))
-                        # 更新任务进度
+                    # 网络层异常：先换下一个候选（原图 → 预览图），候选试完再走浏览器通道
+                    nxt = cand_idx + 1
+                    if nxt < len(candidates):
+                        self._log('原图请求异常(%s)，回退预览图: %s' % (str(e)[:60], img_url[:90]))
+                        cand_idx = nxt
+                        img_url = candidates[nxt]
+                        retry = 0
+                        continue
+                    # 最后一次重试还是失败：尝试走浏览器通道（带代理/登录态）
+                    fp = _cdp_fallback(img_url, idx)
+                    if fp:
+                        success += 1
+                        total_bytes += os.path.getsize(fp)
+                        self._log('浏览器通道下载成功[%d/%d]: %s' % (success + fail + skipped, len(img_urls), img_url[:80]))
                         if task_id:
                             self._update_task(task_id, progress='%d/%d' % (success + fail + skipped, len(img_urls)))
                         return
+                    fail += 1
+                    self._log('下载失败[%d/%d] (重试%d次): %s - %s' % (success + fail + skipped, len(img_urls), max_retries, img_url[:100], str(e)[:150]))
+                    # 更新任务进度
+                    if task_id:
+                        self._update_task(task_id, progress='%d/%d' % (success + fail + skipped, len(img_urls)))
+                    return
 
         with ThreadPoolExecutor(max_workers=max_threads) as executor:
             futures = []
@@ -8170,6 +8310,10 @@ class ScraplingGrabberGUI:
                     fail += 1
                     self._log('任务异常: %s' % str(e)[:100])
 
+        if orig_ok or orig_fallback:
+            self._log('原图替换: %d 张取到原图%s' % (
+                orig_ok,
+                ('，%d 张原图地址不可用已回退预览图' % orig_fallback) if orig_fallback else ''))
         self._log('下载完成: 成功 %d, 失败 %d, 跳过 %d, 总计 %d' % (success, fail, skipped, len(img_urls)))
         return success, fail, skipped
 
