@@ -1,4 +1,56 @@
-# Scrapling 图片爬虫 - 开发交接笔记（截至 v3.1.11）
+# Scrapling 图片爬虫 - 开发交接笔记（截至 v3.1.12）
+
+## v3.1.12 新增（列表页自动进帖子抓内容图）
+
+**问题**：用户问「打开一个列表页，能不能自动抓该页所有帖子的内容图，而不是列表上的标题图」。
+软件本来就有「全站」模式（`_crawl_whole_site` = 列表页翻页 + 进详情页抓），但对这个站完全失效。
+
+**站点结构（实测 xchina.co）**
+- 列表页 `/photos/series-<hex>.html`：一页 11 个帖子，分页 `/photos/series-<hex>/<n>.html`（该系列共 63 页）
+- 帖子 `/photo/id-<hex>.html`：**每页只给 15 张**，站内分页 `/photo/id-<hex>/<n>.html`（该帖 8 页 / 109 张）
+- 图片 `img.xchina.io/photos/<id>/00001_600x0.webp` → 原图同目录 `00001.jpg`（v3.1.11 的规则正好能升级）
+- 注意目录有 `photos/` 与 `photos2/` 两种，编号 4 位 / 5 位都出现过
+
+**为什么失效**：`_extract_post_links` 老的 `detail_patterns` 对 `/photo/id-<hex>.html` 命中 **0 个**，
+反而把分页 `/photos/series-xxx/2.html` 当成帖子（命中 `/\d+\.html`）→ 收集不到帖子 →
+回退 `_crawl_single_page` → 抓到的就是列表页上的封面缩略图。
+
+**改法**
+- 新增模块级 `url_shape(path)` + `_URL_SHAPE_ID_RE`：把路径归一化成形态模板
+  （`/photo/id-6a98940bb9a27.html` → `/photo/id-<ID>.html`、`.../2.html` → `/.../<N>.html`）。
+  ⚠ 必须先 `lower()` 再替换，否则 `'<ID>'` 会被 lower 成 `'<id>'`（单测抓出来的）。
+- 新增 `_extract_card_links(page, base_url, html)`：卡片式条目判据，须同时满足 ——
+  ① 同域名 ② 链接自身或内部含图（`<img>` 或 `background-image`）
+  ③ 不在 pager/pagination/menu/nav/footer/header/breadcrumb 容器内
+  ④ 形态在页面出现 ≥3 次（不足放宽到 2）⑤ 形态 ≠ 当前页形态（挡掉「相关分类/同类列表页」）。
+  实测该列表页：精确 11 个帖子、0 误抓；侧栏 88 条 `/photos/series-*.html` 卡片数为 0 → 全被挡掉。
+- `_extract_post_links(page, base_url, html=None)`：**卡片结果优先**，为空才回退老的 URL 形态规则
+  （论坛站列表条目常常没图，卡片判据会失效，老规则必须留着）。调用处 `_crawl_whole_site` 补传 `html`。
+- 新增 `_expand_post_pages(base_url, page, html, timeout, img_urls)`：站内翻页。
+  找「自身分页」链接（路径 == 当前页去 `.html` + `/<数字>.html`）后**取最大页码**
+  （⚠ 分页条只渲染首尾几页，实测只有 1/2/3/8，数链接个数会少算），第 2..N 页逐页抓取合并去重，
+  连续 2 页没有新图就停，另有「最多页」上限兜底。返回**有序**列表（`set` 判重 + `list` 保序，
+  否则下载顺序会乱）。CDP 模式直接返回（`_fetch_page` 内部已按同一开关翻过，避免翻两遍）。
+- `crawl_single_post` 接入 `_expand_post_pages`（放在 `_extract_images_from_page` 之后）。
+  **只在全站模式的帖子任务里翻页**，单页模式不动 —— 否则用户用单页模式打开列表页会一次抓 63 页封面图。
+- `auto_page_var`（「自动翻页抓全部」）默认 `False` → **`True`**，站内翻页由它控制；
+  检测到本页还有后续页但开关关着时打一行「本页还有 N 页…站内翻页未启用」提示。
+- **修一个既有 bug**：增量扫描把帖子全跳过时 `post_links` 会变空，原代码走
+  「未识别到帖子链接，回退为单页抓取」→ 把列表页当单页再抓一遍封面图。现在区分
+  「识别不到」（才回退）与「识别到了但都已抓过」（提示 + 直接结束，要重抓得勾「强制重扫」）。
+- `_extract_images_from_page` 提取阶段新增噪声过滤：第三方统计/广告域名（googletagmanager 等）、
+  `/gtag/`、`/images/sites/`、`/images/empty`、`favicon`、`/qrcode`；无扩展名的兜底分支改用
+  **路径**判断静态资源（`core-state.js?v=…`、`beacon.min.js/v31ed…` 这类以前会被当成图片）。
+  实测一页能少抓十几张无关文件。
+
+**验证**
+- `_v3112_unit.py`：形态归一化 5 例 + 真实列表页 11 帖 + 老规则回归 + 翻页/最多页/无新图即停/
+  CDP 跳过/开关关闭 + 增量短路 + 强制重扫 → **29/29 通过**
+- `_v3112_real.py`：真机跑通完整链路 —— 列表页 11 帖 → 帖子翻 8 页合并 141 张、其中 **109 张**可升级原图、抽查原图 HTTP 200
+- `_v3112_offline.py`：用真机抓下的 HTML 离线验证噪声过滤（29 → 17 张，相册 16 张全保留）
+- `_codecheck_v3112.py`：exe 内嵌代码 **42 项全过**；`_v3112_layout.py`：面板 reqwidth 仍 882、
+  A 行右端 579 ≤ 964、各默认值正确
+- ⚠ 收尾时用户的代理被关（10808/10809 都不通、直连也不通），最后的真机复跑做不了，改用离线 HTML 验证
 
 ## v3.1.11 新增（抓取原图：缩略图地址 → 原图地址）
 
@@ -31,7 +83,7 @@
 （桩网络 18 项：命中原图/回 200+HTML 回退/404 回退/关开关/异常换候选/过小跳过/普通地址不变），
 `_origreal.py` 真机下 8 张：**8/8 全部 1800×2400、合计 2802KB（对照组预览图 228KB，12.3 倍）**。
 
-## v3.x 交接补充（v3.0.0 → v3.1.11）
+## v3.x 交接补充（v3.0.0 → v3.1.12）
 
 > 仓库 git 历史里 v3.1.x 的逐版细节没留（只有 v3.0.0 两条提交 + 最后一次 v3.1.10），这里按「发布版本 → 实际改动」补齐；
 > 依据是各版 exe 的内嵌代码解包核对（逐版探测标志性方法/常量存在性）+ 改造过程记录，不是回忆推测。
@@ -48,9 +100,10 @@
 - **v3.1.8**：参数行并入面板（`opt_frame` 变成 `adv_frame` 的子控件）；运行控制行按需出现（`_show_run_bar` / `_sync_run_bar`，`_finish_crawl` → `after(300, _sync_run_bar)`）；**删除**整套宽度自适应机制（`_apply_opt_layout` / `_measure_inline_need` / `_pack_opt_row` / `_opt_need_width` / `opt_sep` 等）
 - **v3.1.9**：顶部留白收紧（`top_frame.pady/ipady`、`url_frame.pady`、`TNotebook.tabmargins` 三处）
 - **v3.1.10**：面板排版放宽（行距/分隔条/AI 开关拆两排）+ 新样式 `Feature.TButton` + 功能入口按钮右对齐
-- **v3.1.11**：抓取原图（`orig_url_candidates` / `looks_like_media` / `_cdp_fallback` + 「抓取原图」勾选框），详见下节
+- **v3.1.11**：抓取原图（`orig_url_candidates` / `looks_like_media` / `_cdp_fallback` + 「抓取原图」勾选框），详见上节
+- **v3.1.12**：列表页自动进帖子抓内容图（`url_shape` / `_extract_card_links` / `_expand_post_pages` + 卡片判据替换形态规则 + 增量短路 bug 修复），详见上节
 
-### 当前顶部结构（v3.1.11）
+### 当前顶部结构（v3.1.12）
 `url_frame`（行1：网址 + 收藏 / 设置 / 高级选项 ▾ / 开始抓取）→ `btn_frame`（**默认不 pack**：暂停/停止/重试失败）→ `adv_frame`（可折叠面板：抓取参数 / 功能入口 / 智能过滤 / AI / 转换+性能 / 浏览器模式）。
 标签条高度约 36px 由 `TNotebook.Tab` 的 `padding=(14,6)` 决定，改 `tabmargins` 或 `TNotebook.padding` 对标签条高度无效。
 
@@ -59,6 +112,7 @@
 - 顶部布局：`_toggle_advanced` / `_show_run_bar` / `_sync_run_bar`
 - 下载：`IMAGE_HEADERS` / `HttpSessions` / `http_get` / `_download_image_list` / `_cdp_download_image`
 - 原图推导（v3.1.11）：`_ORIG_SUFFIX_RE` / `orig_url_candidates` / `looks_like_media` / `_download_image_list._cdp_fallback`
+- 列表页/帖子（v3.1.12）：`url_shape` / `_extract_card_links` / `_extract_post_links` / `_expand_post_pages` / `_crawl_whole_site` / `crawl_single_post` 内的调用
 - 调试浏览器：`_launch_debug_browser` / `_open_independent_browser` / `_embed_browser` / `_debug_browser_visible_pid` / `_embedded_browser_alive` / `_prepare_debug_profile` / `_find_browser_exe` / `_wait_debug_port_free`
 - 游戏修改：`_open_game_mod_window` / `_ai_ec_scan` / `_ai_ec_edit` / `_ai_ec_lock` / `_wasm_boot` / `_ec_assign_expr`
 - 目录历史：`_dir_remember` / `_dir_refresh_combo` / `_on_dir_pick` / `cfg['save_dirs']`

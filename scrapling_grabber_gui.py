@@ -83,6 +83,25 @@ def orig_url_candidates(url):
         return fallback
 
 
+# ===== 列表页条目形态归一化（v3.1.12）=====
+# 判断"列表页里哪些链接才是同一个列表的条目"时，要先抹掉 ID/页码再比形态：
+#   /photo/id-6a98940bb9a27.html        -> /photo/id-<ID>.html
+#   /photos/series-66600a3a227ee/2.html -> /photos/series-<ID>/<N>.html
+_URL_SHAPE_ID_RE = re.compile(r'[0-9a-f]{8,}', re.IGNORECASE)
+
+
+def url_shape(path):
+    """把 URL 路径归一化成「形态模板」（ID 号段/纯数字都替换成占位符）
+
+    列表页上的帖子条目必然同型（同一个模板反复出现），导航/分页则不然，
+    所以形态既用来「选条目」，也用来「排除与当前页同型的同类列表页」。
+    """
+    p = (path or '').lower()
+    p = _URL_SHAPE_ID_RE.sub('<ID>', p)
+    p = re.sub(r'\d+', '<N>', p)
+    return p
+
+
 def looks_like_media(data):
     """按文件头判断是不是图片/视频。
 
@@ -183,7 +202,7 @@ def http_get(url, headers=None, timeout=30, referer=None, allow_proxy_fallback=T
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v3.1.11'
+APP_VERSION = 'v3.1.12'
 APP_NAME = '全能网页助手'
 
 # ===== 界面主题（深色科技蓝 / 浅色简约，可一键切换）=====
@@ -3409,7 +3428,7 @@ class ScraplingGrabberGUI:
         ttk.Checkbutton(adv_a, text='增量扫描', variable=self.incremental_var).pack(side='left', padx=(18, 0))
         self.force_rescan_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(adv_a, text='强制重扫', variable=self.force_rescan_var).pack(side='left', padx=(18, 0))
-        self.auto_page_var = tk.BooleanVar(value=False)
+        self.auto_page_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(adv_a, text='自动翻页抓全部', variable=self.auto_page_var).pack(side='left', padx=(18, 0))
         ttk.Label(adv_a, text='最多页:').pack(side='left', padx=(20, 4))
         self.auto_page_max_var = tk.IntVar(value=100)
@@ -6601,10 +6620,19 @@ class ScraplingGrabberGUI:
         page = Selector(html)
         return html, page
 
-    def _extract_post_links(self, page, base_url):
-        """从列表页提取帖子链接"""
+    def _extract_post_links(self, page, base_url, html=None):
+        """从列表页提取帖子链接
+
+        优先用「卡片式条目」判据（v3.1.12 新增，对 /photo/id-xxx.html 这类
+        非纯数字 ID 的相册/视频站有效），识别不到时回退下面的 URL 形态规则。
+        """
         import re
         from urllib.parse import urljoin, urlparse
+
+        # ===== 1) 卡片式条目：带图 + 同型反复出现 =====
+        card_links = self._extract_card_links(page, base_url, html)
+
+        # ===== 2) URL 形态规则（老逻辑，论坛类站点兜底）=====
         links = set()
         base_domain = urlparse(base_url).netloc.replace('www.', '')
 
@@ -6643,7 +6671,88 @@ class ScraplingGrabberGUI:
             elif re.search(r'/\d+', url_lower) and not any(kw in url_lower for kw in ['/page/', '/list/']):
                 links.add(full_url)
 
-        return sorted(list(links))
+        rule_links = sorted(list(links))
+        if card_links:
+            self._log('帖子识别: 卡片式条目 %d 个（形态规则另有 %d 个，按卡片结果取）'
+                      % (len(card_links), len(rule_links)))
+            return card_links
+        return rule_links
+
+    def _extract_card_links(self, page, base_url, html=None, min_repeat=3):
+        """卡片式条目识别：列表页里「带图 + 同型反复出现」的链接才是帖子
+
+        判据（须全部满足）：
+          1. 同域名
+          2. 链接自身或内部含图片（<img> 或 background-image）—— 纯文字导航/分页天然排除
+          3. 不在 pager/pagination/menu/nav/footer/header/breadcrumb 容器内
+          4. 归一化形态在页面上出现 >= min_repeat 次（列表条目必然同型重复）
+          5. 形态与当前页不同（否则「相关分类 / 同类列表页」会被当成帖子，
+             实测某相册站列表页有 88 条 /photos/series-xxx.html 侧栏导航，全靠这条挡掉）
+        识别不到返回 []，由调用方回退老的 URL 形态规则。
+        """
+        import re
+        from urllib.parse import urljoin, urlparse
+        from collections import Counter
+        if not html:
+            html = getattr(page, 'html_content', '') or ''
+        if not html:
+            return []
+        try:
+            from lxml import html as _LH
+            doc = _LH.fromstring(html)
+        except Exception as e:
+            self._log('卡片式识别: HTML 解析失败（忽略）: %s' % str(e)[:80])
+            return []
+        base_domain = urlparse(base_url).netloc.replace('www.', '')
+        cur_shape = url_shape(urlparse(base_url).path)
+        bad_box = re.compile(r'pager|pagination|page-?nav|breadcrumb|footer|header|menu|\bnav\b', re.I)
+
+        rows = []
+        for a in doc.iter('a'):
+            href = (a.get('href') or '').strip()
+            if not href or href.startswith('#') or href.lower().startswith('javascript:'):
+                continue
+            full = urljoin(base_url, href)
+            sp = urlparse(full)
+            if sp.scheme not in ('http', 'https'):
+                continue
+            if sp.netloc.replace('www.', '') != base_domain:
+                continue
+            # 卡片判据：自身或内部含图片
+            card = bool(a.findall('.//img')) or 'background-image' in (a.get('style') or '')
+            if not card:
+                card = bool(a.xpath('.//*[contains(@style,"background-image")]'))
+            if not card:
+                continue
+            # 容器判据：排除导航/分页/页脚等区域里的链接
+            box = ''
+            p = a.getparent()
+            for _i in range(3):
+                if p is None:
+                    break
+                box += ' %s %s' % (p.tag or '', p.get('class') or '')
+                p = p.getparent()
+            if bad_box.search(box):
+                continue
+            rows.append((full, url_shape(sp.path)))
+
+        if not rows:
+            return []
+        counts = Counter(shape for _u, shape in rows)
+
+        def pick(threshold):
+            out = []
+            for u, shape in rows:
+                if shape == cur_shape or counts[shape] < threshold:
+                    continue
+                if u not in out:
+                    out.append(u)
+            return out
+
+        out = pick(min_repeat)
+        if not out:
+            out = pick(2)   # 列表页只有 2 个条目时也认
+        return out
 
     def _update_task(self, task_id, **kwargs):
         """更新任务列表"""
@@ -7401,6 +7510,104 @@ class ScraplingGrabberGUI:
 
         return None
 
+    def _expand_post_pages(self, base_url, page, html, timeout, img_urls):
+        """站内分页：把同一个帖子的后续页也抓全（如 /photo/id-xxx.html → /photo/id-xxx/2.html）
+
+        不少站把「一个帖子」的图分在若干页里（实测某相册站一页只给 15 张，共 8 页 109 张），
+        只抓第一页会误以为帖子就这么点内容。做法：
+          1. 页面上找「自身分页」链接（路径 == 当前页去 .html + /<数字>.html），取最大页码
+             （注意：分页条往往只渲染首尾几页，所以必须取最大值，不能数链接个数）
+          2. 第 2..N 页逐页抓取、合并去重；各页图片照常走原图升级
+          3. 连续 2 页拿不到新图就停（没新的就停止），另有「最多页」上限兜底
+        受「自动翻页抓全部」(auto_page_var) 控制；CDP 浏览器模式在 _fetch_page 内已翻过，这里跳过。
+        返回合并后的图片列表。
+        """
+        import re
+        from urllib.parse import urlparse, urljoin
+        try:
+            if not img_urls:
+                return img_urls
+            # CDP 模式：_fetch_page 内部已按 auto_page_var 翻过页，避免翻两遍
+            try:
+                if self.render_mode_var.get() == '浏览器模式(CDP)':
+                    return img_urls
+            except Exception:
+                pass
+            sp0 = urlparse(base_url)
+            path0 = sp0.path or ''
+            if re.search(r'/\d+\.html$', path0):
+                cur_dir = re.sub(r'/\d+\.html$', '/', path0)
+            elif path0.endswith('.html'):
+                cur_dir = path0[:-5] + '/'
+            else:
+                return img_urls
+            # 找「自身分页」链接，取最大页码
+            maxp = 0
+            pat = re.compile(re.escape(cur_dir) + r'(\d+)\.html$')
+            try:
+                for a in page.css('a'):
+                    href = a.attrib.get('href', '') or ''
+                    if not href:
+                        continue
+                    sub = urlparse(urljoin(base_url, href))
+                    if sub.netloc.replace('www.', '') != sp0.netloc.replace('www.', ''):
+                        continue
+                    m = pat.match(sub.path)
+                    if m:
+                        try:
+                            maxp = max(maxp, int(m.group(1)))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            if maxp < 2:
+                return img_urls
+            # 确认本页还有后续页，此时才提示开关状态，免得用户以为抓全了
+            if not (getattr(self, 'auto_page_var', None) and self.auto_page_var.get()):
+                self._log('  本页还有 %d 页（共 %d 页），站内翻页未启用（高级选项 → 自动翻页抓全部）'
+                          % (maxp - 1, maxp))
+                return img_urls
+            try:
+                limit = int(self.auto_page_max_var.get())
+            except Exception:
+                limit = 100
+            maxp = min(maxp, max(limit, 2))
+            self._log('  站内翻页: 本帖共 %d 页，继续抓第 2-%d 页...' % (maxp, maxp))
+            seen = set(img_urls)
+            ordered = list(img_urls)      # 保留下载顺序（第 1 页在前，后续页按序追加）
+            added_total = 0
+            empty_rounds = 0
+            for n in range(2, maxp + 1):
+                if self.stop_flag.is_set():
+                    self._log('  已停止')
+                    break
+                nxt = '%s://%s%s%d.html' % (sp0.scheme, sp0.netloc, cur_dir, n)
+                try:
+                    sub_html, sub_page = self._fetch_page(nxt, timeout)
+                    sub_imgs = self._extract_images_from_page(sub_page, nxt, sub_html)
+                except Exception as e:
+                    self._log('  第 %d 页抓取失败: %s' % (n, str(e)[:100]))
+                    sub_imgs = []
+                new = [u for u in sub_imgs if u not in seen]
+                for u in new:
+                    seen.add(u)
+                    ordered.append(u)
+                added_total += len(new)
+                self._log('  第 %d 页新增 %d 张（累计 %d 张）' % (n, len(new), len(ordered)))
+                if new:
+                    empty_rounds = 0
+                else:
+                    empty_rounds += 1
+                    if empty_rounds >= 2:
+                        self._log('  连续 %d 页没有新图，停止站内翻页' % empty_rounds)
+                        break
+            if added_total:
+                self._log('  站内翻页完成: 新增 %d 张，合计 %d 张' % (added_total, len(ordered)))
+            return ordered
+        except Exception as e:
+            self._log('  站内翻页出错（忽略）: %s' % e)
+            return img_urls
+
     def _crawl_whole_site(self, url, save_dir, max_threads, timeout, post_range, min_size):
         """全站抓取：列表页翻页+进详情页抓取"""
         from urllib.parse import urlparse
@@ -7453,7 +7660,7 @@ class ScraplingGrabberGUI:
                 self._log('第 %d 页抓取失败: %s' % (page_num, e))
                 break
 
-            post_links = self._extract_post_links(page, current_url)
+            post_links = self._extract_post_links(page, current_url, html)
             self._log('第 %d 页识别到 %d 个帖子链接（累计 %d 个）' % (page_num, len(post_links), len(all_post_links) + len(post_links)))
             if len(post_links) == 0:
                 # ===== AI 辅助分析（规则抓不到时） =====
@@ -7552,6 +7759,7 @@ class ScraplingGrabberGUI:
 
         # 增量扫描：跳过已完成的帖子
         completed_urls = set()
+        skipped_count = 0
         if hasattr(self, 'incremental_var') and self.incremental_var.get() and not (hasattr(self, 'force_rescan_var') and self.force_rescan_var.get()):
             completed_urls = self._load_progress(save_dir)
             if completed_urls:
@@ -7564,6 +7772,12 @@ class ScraplingGrabberGUI:
             self._log('强制重扫: 不跳过已完成的帖子，重新抓取全部')
 
         if not post_links:
+            if all_post_links and skipped_count > 0:
+                # 识别正常、只是都被增量扫描跳过了：这里绝不能回退成单页抓取，
+                # 否则会把列表页当帖子再抓一遍封面图（没新内容时的正确行为就是什么都不做）
+                self._log('识别到 %d 个帖子，均已抓过（增量扫描跳过 %d 个）。要重抓请勾选「强制重扫」。'
+                          % (len(all_post_links), skipped_count))
+                return
             self._log('未识别到帖子链接，回退为单页抓取')
             self._crawl_single_page(url, save_dir, max_threads, timeout, min_size, task_id=None)
             return
@@ -7656,6 +7870,8 @@ class ScraplingGrabberGUI:
                                 self._log('  按模型规律提取失败: %s' % e)
                         else:
                             self._log('  模型未能分析出有效图片规律（可稍后重试）')
+                # ===== 站内分页：同一帖子的后续页也抓全（受「自动翻页抓全部」控制）=====
+                img_urls = self._expand_post_pages(post_url, post_page, post_html, timeout, img_urls)
                 self._log('  提取到 %d 张图片' % len(img_urls))
                 self._update_task(task_id, progress='0/%d' % len(img_urls))
 
@@ -7972,8 +8188,16 @@ class ScraplingGrabberGUI:
             '/uc_server/avatar.php',
         ]
 
+        # 非正文图片：第三方统计/广告脚本、站点图标位、二维码等（实测相册站一页会混进十几张）
+        JUNK_MEDIA = re.compile(
+            r'googletagmanager\.com|google-analytics\.com|googlesyndication\.com|doubleclick\.net'
+            r'|/gtag/|/images/sites/|/images/empty|favicon|/qrcode', re.IGNORECASE)
+
         def try_add(img_url):
             if not img_url or img_url.startswith('data:') or img_url.startswith('about:') or img_url == 'blank':
+                return
+            # 站点自身的资源/统计类 URL（不是正文图片），提取阶段就排掉，省得白跑下载
+            if JUNK_MEDIA.search(img_url):
                 return
             # 过滤模板残留（如 {{src}}、{src}）
             if '{{' in img_url or '}}' in img_url or '{' in img_url or '}' in img_url:
@@ -8003,7 +8227,10 @@ class ScraplingGrabberGUI:
                     return
             # 如果URL没有明确的扩展名，但是在img标签中，且不是html/php等，也认为是图片
             elif not any(url_lower.endswith(ext) for ext in ['.html', '.htm', '.php', '.asp', '.jsp', '.aspx', '.css', '.js']):
-                img_urls.add(full_url)
+                # 带查询串/子路径的静态资源也要排掉（core-state.js?v=… / beacon.min.js/v31ed… 实测会被误当图片）
+                _res_path = url_lower.split('?')[0].split('#')[0]
+                if not re.search(r'\.(?:js|css|json|xml|map|woff2?|ttf|otf|eot)(?:/|$)', _res_path):
+                    img_urls.add(full_url)
 
         # ===== CDP直读原图优先：浏览器模式下已从渲染页面拿到原图列表（srcset最大+去缩略图后缀）=====
         direct = getattr(self, '_cdp_direct_urls', None)
