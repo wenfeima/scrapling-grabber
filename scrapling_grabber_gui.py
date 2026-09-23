@@ -129,6 +129,167 @@ def looks_like_media(data):
     return False
 
 
+# ===== HLS / 视频流（v3.1.15）=====
+# 实测某站把视频放在 HLS（.m3u8）里，而且分片是 AES-128-CBC 加密的。
+# 这类地址不是"文件"而是"清单"，不能交给图片下载器（那样只会存下一段文本），
+# 必须单独走：播放列表 → 密钥 → 并行下分片 → 解密 → 顺序合并。
+STREAM_EXTS = ('.m3u8', '.mpd')
+
+
+def is_stream_url(url):
+    """是不是 HLS/DASH 播放列表地址（带签名 query 的也算）"""
+    if not url:
+        return False
+    path = url.split('?')[0].split('#')[0].lower()
+    return path.endswith(STREAM_EXTS)
+
+
+def _m3u8_attrs(line):
+    """解析 #EXT-X-* 标签里的 KEY=VALUE 属性（自动去引号）"""
+    out = {}
+    body = line.split(':', 1)[1] if ':' in line else ''
+    for m in re.finditer(r'([A-Za-z0-9\-]+)=("[^"]*"|[^,]*)', body):
+        out[m.group(1).upper()] = m.group(2).strip().strip('"')
+    return out
+
+
+def parse_m3u8(text, base_url):
+    """解析 m3u8 → {'kind','variants','segments','key','seq','duration'}
+
+    kind='master' 说明这是清晰度索引，得从 variants 里挑一个再拉一次；
+    'media' 才是真正的分片清单。相对地址一律用 base_url 拼成绝对地址。
+    """
+    lines = [l.strip() for l in (text or '').splitlines() if l.strip()]
+    variants, segments, key, seq, dur = [], [], None, 1, 0.0
+    for i, line in enumerate(lines):
+        if line.startswith('#EXT-X-MEDIA-SEQUENCE'):
+            try:
+                seq = int(line.split(':', 1)[1].strip() or 0)
+            except Exception:
+                seq = 0
+        elif line.startswith('#EXTINF'):
+            try:
+                dur += float(line.split(':', 1)[1].split(',')[0].strip())
+            except Exception:
+                pass
+        elif line.startswith('#EXT-X-KEY'):
+            attrs = _m3u8_attrs(line)
+            method = (attrs.get('METHOD') or 'NONE').upper()
+            if method != 'NONE':
+                key = {'method': method,
+                       'url': urllib.parse.urljoin(base_url, attrs.get('URI') or '') if attrs.get('URI') else '',
+                       'iv': attrs.get('IV') or ''}
+        elif line.startswith('#EXT-X-STREAM-INF'):
+            attrs = _m3u8_attrs(line)
+            for nxt in lines[i + 1:]:
+                if not nxt.startswith('#'):
+                    variants.append((int(attrs.get('BANDWIDTH') or 0), urllib.parse.urljoin(base_url, nxt)))
+                    break
+        elif not line.startswith('#'):
+            segments.append(urllib.parse.urljoin(base_url, line))
+    return {'kind': 'master' if variants else 'media', 'variants': variants,
+            'segments': segments, 'key': key, 'seq': seq, 'duration': dur}
+
+
+def hls_iv(key_iv, seq):
+    """算 AES-128-CBC 的 IV：清单里给了就用它，否则按规范用「媒体序号」大端 16 字节"""
+    if key_iv:
+        t = str(key_iv).strip()
+        if t.lower().startswith('0x'):
+            try:
+                return bytes.fromhex(t[2:].zfill(32))
+            except Exception:
+                pass
+    return int(seq).to_bytes(16, 'big')
+
+
+_BCRYPT_LOCK = threading.Lock()
+_BCRYPT_CACHE = {}
+
+
+def _bcrypt_aes():
+    """取 Windows 自带 bcrypt 的 AES provider（进程内只建一次）。
+
+    用系统库而不是第三方库：exe 是 onefile 打包，多引一个依赖就要多带一份二进制，
+    而 bcrypt.dll 每台 Windows 都有，解密是原生速度（50MB 视频秒级）。
+    """
+    with _BCRYPT_LOCK:
+        if 'obj' in _BCRYPT_CACHE:
+            return _BCRYPT_CACHE['obj']
+        import ctypes
+        import ctypes.wintypes as wt
+        PCHAR = ctypes.POINTER(ctypes.c_char)
+        b = ctypes.windll.bcrypt
+        b.BCryptOpenAlgorithmProvider.argtypes = [ctypes.POINTER(wt.HANDLE), wt.LPCWSTR, wt.LPCWSTR, wt.ULONG]
+        b.BCryptSetProperty.argtypes = [wt.HANDLE, wt.LPCWSTR, PCHAR, wt.ULONG, wt.ULONG]
+        b.BCryptGenerateSymmetricKey.argtypes = [wt.HANDLE, ctypes.POINTER(wt.HANDLE), PCHAR, wt.ULONG,
+                                                 PCHAR, wt.ULONG, wt.ULONG]
+        b.BCryptDecrypt.argtypes = [wt.HANDLE, PCHAR, wt.ULONG, ctypes.c_void_p, PCHAR, wt.ULONG,
+                                    PCHAR, wt.ULONG, ctypes.POINTER(wt.ULONG), wt.ULONG]
+        h = wt.HANDLE()
+        if b.BCryptOpenAlgorithmProvider(ctypes.byref(h), 'AES', None, 0) != 0:
+            raise RuntimeError('BCryptOpenAlgorithmProvider 失败')
+        try:
+            # AES 的默认链模式本来就是 CBC，显式再设一次（失败也继续，默认值是对的）
+            mb = ctypes.create_unicode_buffer('ChainingModeCBC')
+            b.BCryptSetProperty(h, 'ChainingMode', ctypes.cast(mb, PCHAR), ctypes.sizeof(mb), 0)
+        except Exception:
+            pass
+        _BCRYPT_CACHE['obj'] = (ctypes, wt, b, h)
+        return _BCRYPT_CACHE['obj']
+
+
+def aes128cbc_decrypt(key, iv, data):
+    """AES-128/192/256-CBC 解密（走 Windows bcrypt，不引第三方依赖）"""
+    ctypes, wt, b, h = _bcrypt_aes()
+    if not data:
+        return b''
+    if len(data) % 16:
+        data = data[:len(data) - len(data) % 16]
+    kb = ctypes.create_string_buffer(bytes(key), len(key))
+    ivb = ctypes.create_string_buffer(bytes(iv), 16)
+    hk = wt.HANDLE()
+    if b.BCryptGenerateSymmetricKey(h, ctypes.byref(hk), None, 0, kb, len(key), 0) != 0:
+        raise RuntimeError('AES 密钥导入失败')
+    out = ctypes.create_string_buffer(len(data))
+    written = wt.ULONG(0)
+    rc = b.BCryptDecrypt(hk, data, len(data), None, ivb, 16, out, len(data), ctypes.byref(written), 0)
+    try:
+        b.BCryptDestroyKey(hk)
+    except Exception:
+        pass
+    if rc != 0:
+        raise RuntimeError('AES 解密失败（rc=%d）' % rc)
+    return out.raw[:written.value]
+
+
+def strip_pkcs7(data):
+    """去掉 PKCS#7 填充：留着会让 TS 包不对齐（实测该站每个分片尾部正好 12 字节填充）"""
+    if not data:
+        return data
+    n = data[-1]
+    if 1 <= n <= 16 and len(data) >= n and data[-n:] == bytes([n]) * n:
+        return data[:-n]
+    return data
+
+
+def station_page_cap(max_pages, page_end):
+    """算「站内翻页」的上限：页码终止页填了就跟「最多页」取小，留空则只受「最多页」控制。
+
+    v3.1.15 起「页码」不只管列表页，也当站内翻页（/2.html、/3.html…）的上限 ——
+    不然用户填 1-4、程序却按「最多页」100 一路翻，看着就是"页码没生效"。
+    """
+    try:
+        mp = int(max_pages)
+    except Exception:
+        mp = 100
+    try:
+        pe = int(page_end)
+    except Exception:
+        pe = 0
+    return mp if pe <= 0 else min(pe, mp)
+
+
 # ===== 「范围」输入框解析（v3.1.13：原来一个框填 "20" / "15-60"，现拆成起始/终止两个框）=====
 def parse_range_pair(start_text, end_text, default_end=20):
     """把「范围」的两个框解析成 (起始序号, 终止序号)，都是 1-based、闭区间。
@@ -275,7 +436,7 @@ def http_get(url, headers=None, timeout=30, referer=None, allow_proxy_fallback=T
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v3.1.14'
+APP_VERSION = 'v3.1.15'
 APP_NAME = '全能网页助手'
 
 # ===== 界面主题（深色科技蓝 / 浅色简约，可一键切换）=====
@@ -579,6 +740,9 @@ class ScraplingGrabberGUI:
         self.stop_flag = threading.Event()
         self.pause_flag = threading.Event()  # 暂停标志
         self.cfg = load_config()
+        # 「本次取页面」的临时结果（CDP 直读图片列表、页面里的 m3u8 流地址）走线程本地：
+        # 全站模式是多线程并发抓帖的，用实例属性会被别的线程覆盖（v3.1.15 修串图）
+        self._cdp_tls = threading.local()
         # AI 过滤状态
         self.ai_proc = None          # llama-server 进程
         self._ai_busy = False
@@ -6321,8 +6485,13 @@ class ScraplingGrabberGUI:
         if hasattr(self, 'start_btn'):
             self.start_btn.config(state='normal')
 
-    def _fetch_page(self, url, timeout=15):
-        """抓取网页，支持直连、浏览器渲染、CDP浏览器模式，返回 (html, page)"""
+    def _fetch_page(self, url, timeout=15, page_follow=True):
+        """抓取网页，支持直连、浏览器渲染、CDP浏览器模式，返回 (html, page)
+
+        page_follow：CDP 模式下要不要在本层做「站内翻页」（把网址去 .html 后拼 /2.html、/3.html…）。
+        抓列表页时传 False —— 列表翻页由 _crawl_whole_site 的外层循环按「页码」负责，
+        本层再翻一遍既重复又会让「页码」看起来失效（v3.1.15 修）。
+        """
         render_mode = self.render_mode_var.get()
         self._log('抓取模式: %s' % render_mode)
         html = ''
@@ -6565,7 +6734,7 @@ class ScraplingGrabberGUI:
                           // 暴力兜底：整个 HTML 正则扫所有图片+视频 URL（支持相对路径+JSON转义\/）
                           var html = document.documentElement.outerHTML;
                           html = html.replace(/\\\//g, '/');
-                          var re = /[^\s"'<>\\()]+?\.(?:jpg|jpeg|png|webp|avif|mp4|webm|mov|m4v)(?:\?[^\s"'<>\\]*)?/gi;
+                          var re = /[^\s"'<>\\()]+?\.(?:jpg|jpeg|png|webp|avif|mp4|webm|mov|m4v|m3u8|mpd)(?:\?[^\s"'<>\\]*)?/gi;
                           var mm;
                           while((mm=re.exec(html))!==null){ add(mm[0]); }
                           return out;
@@ -6576,9 +6745,14 @@ class ScraplingGrabberGUI:
                         self._cdp_direct_urls = [u for u in durls if isinstance(u, str)]
                         if self._cdp_direct_urls:
                             self._log('CDP直读原图: 从渲染页面提取到 %d 个图片地址（srcset/data-*）' % len(self._cdp_direct_urls))
-                        # ===== 自动翻页抓全部：拼 N.html 逐页访问，合并去重 =====
+                        # ===== 站内翻页：拼 /N.html 逐页访问，合并去重（v3.1.15 起受「页码」约束）=====
+                        # 上限 = 「页码」终止页（填了才生效）与「最多页」取小；页码终止留空则只受「最多页」控制。
+                        # page_follow=False（全站模式抓列表页）时本层不翻 —— 那层的翻页由外层循环按页码负责，
+                        # 两边都翻既重复劳动，又会让人以为「页码」没生效（v3.1.14 就是这个坑）。
                         try:
-                            if getattr(self, 'auto_page_var', None) and self.auto_page_var.get():
+                            if not page_follow:
+                                self._log('站内翻页: 本层不翻（列表页翻页由外层循环按「页码」负责）')
+                            elif getattr(self, 'auto_page_var', None) and self.auto_page_var.get():
                                 import re as _re
                                 if _re.search(r'/\d+\.html$', url):
                                     base = _re.sub(r'/\d+\.html$', '/', url)
@@ -6589,12 +6763,21 @@ class ScraplingGrabberGUI:
                                     _maxp = int(self.auto_page_max_var.get())
                                 except Exception:
                                     _maxp = 100
-                                for n in range(2, _maxp + 1):
+                                _pend = self._page_range_values()[1]
+                                _cap = station_page_cap(_maxp, _pend)
+                                if _cap < 2:
+                                    self._log('站内翻页: 「页码」终止页为 %d，不做站内翻页' % _pend)
+                                elif _pend > 0:
+                                    self._log('站内翻页: 第 2-%d 页（页码终止 %d 与最多页 %d 取小）'
+                                              % (_cap, _pend, _maxp))
+                                else:
+                                    self._log('站内翻页: 第 2-%d 页（页码终止留空，只受「最多页」控制）' % _cap)
+                                for n in range(2, _cap + 1):
                                     if self.stop_flag.is_set():
                                         self._log('已停止')
                                         break
                                     nxt = '%s%d.html' % (base, n)
-                                    self._log('自动翻页: 第 %d 页 %s' % (n, nxt))
+                                    self._log('站内翻页: 第 %d 页 %s' % (n, nxt))
                                     send_cdp(210 + n, 'Page.navigate', {'url': nxt})
                                     for _w in range(8):
                                         if self.stop_flag.is_set():
@@ -6614,7 +6797,7 @@ class ScraplingGrabberGUI:
                                     if added == 0:
                                         break
                         except Exception as _ape:
-                            self._log('自动翻页出错（忽略）: %s' % _ape)
+                            self._log('站内翻页出错（忽略）: %s' % _ape)
                         # ===== 视频轮播：点"下一个"收集同页多个视频（3/3 这种看图器）=====
                         try:
                             for _v in range(10):
@@ -7469,6 +7652,35 @@ class ScraplingGrabberGUI:
         """
         return parse_page_range(self.page_range_start_var.get(), self.page_range_end_var.get())
 
+    # ===== 「本次取页面」的临时结果：线程本地（v3.1.15）=====
+    # 全站模式的帖子是多线程并发抓的。原来 CDP 直读的图片列表挂在实例上，
+    # 两个线程的「取页面」和「提取图片」之间会互相覆盖：A 帖拿到 B 帖的图（串图），
+    # B 的列表被清空 → 退化成 HTML 猜解。取页面和提取图片都在同一个工作线程里，
+    # 所以改成线程本地就彻底隔离了。
+    @property
+    def _cdp_direct_urls(self):
+        """CDP 直读到的图片地址（当前线程、当前页面）"""
+        t = self._cdp_tls
+        if not hasattr(t, 'urls'):
+            t.urls = []
+        return t.urls
+
+    @_cdp_direct_urls.setter
+    def _cdp_direct_urls(self, value):
+        self._cdp_tls.urls = value if isinstance(value, list) else list(value or [])
+
+    @property
+    def _page_stream_urls(self):
+        """当前页面里发现的 HLS/DASH 播放列表地址（当前线程）"""
+        t = self._cdp_tls
+        if not hasattr(t, 'streams'):
+            t.streams = []
+        return t.streams
+
+    @_page_stream_urls.setter
+    def _page_stream_urls(self, value):
+        self._cdp_tls.streams = value if isinstance(value, list) else list(value or [])
+
     def _crawl_worker(self, url, save_dir):
         """抓取工作线程"""
         try:
@@ -7669,8 +7881,11 @@ class ScraplingGrabberGUI:
                 limit = int(self.auto_page_max_var.get())
             except Exception:
                 limit = 100
+            # 「页码」终止页同样当站内翻页上限（v3.1.15，与 CDP 模式一个口径）
+            limit = station_page_cap(limit, self._page_range_values()[1])
             maxp = min(maxp, max(limit, 2))
             self._log('  站内翻页: 本帖共 %d 页，继续抓第 2-%d 页...' % (maxp, maxp))
+            streams_all = list(self._page_stream_urls)   # 子页里的 m3u8 也要收上（v3.1.15）
             seen = set(img_urls)
             ordered = list(img_urls)      # 保留下载顺序（第 1 页在前，后续页按序追加）
             added_total = 0
@@ -7683,6 +7898,7 @@ class ScraplingGrabberGUI:
                 try:
                     sub_html, sub_page = self._fetch_page(nxt, timeout)
                     sub_imgs = self._extract_images_from_page(sub_page, nxt, sub_html)
+                    streams_all.extend(self._page_stream_urls)   # 子页里的 m3u8 也收上
                 except Exception as e:
                     self._log('  第 %d 页抓取失败: %s' % (n, str(e)[:100]))
                     sub_imgs = []
@@ -7701,10 +7917,237 @@ class ScraplingGrabberGUI:
                         break
             if added_total:
                 self._log('  站内翻页完成: 新增 %d 张，合计 %d 张' % (added_total, len(ordered)))
+            self._page_stream_urls = streams_all   # 还原成"本帖所有页"的 m3u8 汇总，供外层取用
             return ordered
         except Exception as e:
             self._log('  站内翻页出错（忽略）: %s' % e)
             return img_urls
+
+    def _find_ffmpeg(self):
+        """找 ffmpeg：PATH → 程序/exe 所在目录 → 该目录下的 ffmpeg\\bin。
+
+        不内置 ffmpeg（会让 exe 从 69MB 涨到 ~100MB）；用户自己装一个或把
+        ffmpeg.exe 丢到程序旁边，就能自动把下好的 .ts 转成 .mp4。
+        """
+        import shutil
+        p = shutil.which('ffmpeg')
+        if p:
+            return p
+        bases = []
+        for cand in (sys.executable, (sys.argv[0] if getattr(sys, 'argv', None) else '')):
+            try:
+                d = os.path.dirname(os.path.abspath(cand))
+                if d and d not in bases:
+                    bases.append(d)
+            except Exception:
+                pass
+        try:
+            d = os.path.dirname(os.path.abspath(__file__))
+            if d not in bases:
+                bases.append(d)
+        except Exception:
+            pass
+        for d in bases:
+            for rel in ('ffmpeg.exe', os.path.join('ffmpeg', 'bin', 'ffmpeg.exe'),
+                        os.path.join('bin', 'ffmpeg.exe')):
+                f = os.path.join(d, rel)
+                if os.path.isfile(f):
+                    return f
+        return None
+
+    def _download_hls_list(self, streams, save_dir, title, task_id, referer, timeout):
+        """把页面里发现的播放列表批量下成视频，返回成功个数（受「下载视频」开关控制）"""
+        if not streams:
+            return 0
+        if not self.download_video_var.get():
+            for u in streams[:3]:
+                self._log('  页面含视频流（m3u8）：%s' % u[:120])
+            self._log('  共 %d 个视频流未下载 —— 勾上「下载视频」才会抓' % len(streams))
+            return 0
+        ok = 0
+        for i, su in enumerate(streams, 1):
+            if self.stop_flag.is_set():
+                self._log('已停止')
+                break
+            if len(streams) > 1:
+                self._log('  视频 %d/%d: %s' % (i, len(streams), su[:110]))
+            name = title if len(streams) == 1 else '%s_%02d' % (title, i)
+            if self._download_hls(su, save_dir, name, task_id, referer, timeout):
+                ok += 1
+        if ok:
+            self._log('  视频完成: 成功 %d/%d 个' % (ok, len(streams)))
+            if task_id:
+                self._update_task(task_id, status='完成(含视频)')
+        return ok
+
+    def _download_hls(self, playlist_url, save_dir, base_name, task_id=None, referer=None, timeout=15):
+        """下载一个 HLS（m3u8）视频：播放列表 → 密钥 → 并行下分片 → 解密 → 顺序合并
+
+        分片多为 AES-128-CBC 加密（实测该站就是，且每片尾部带 PKCS#7 填充），
+        解密走 Windows 自带 bcrypt，不引第三方依赖。本机有 ffmpeg 就顺手转 mp4，
+        没有就留 .ts（MPEG-TS，PotPlayer / VLC 能直接播）。成功返回文件路径。
+        """
+        import shutil
+        headers = dict(BROWSER_HEADERS)
+        if referer:
+            headers['Referer'] = referer
+
+        def _get_bytes(u, hint):
+            try:
+                r = http_get(u, headers=headers, timeout=max(int(timeout), 30))
+            except Exception as e:
+                raise RuntimeError('%s请求失败: %s' % (hint, str(e)[:90]))
+            if getattr(r, 'status_code', 0) != 200:
+                raise RuntimeError('%s返回 %s' % (hint, getattr(r, 'status_code', '?')))
+            return r.content
+
+        try:
+            text = _get_bytes(playlist_url, '播放列表').decode('utf-8', errors='ignore')
+            info = parse_m3u8(text, playlist_url)
+            if info['kind'] == 'master':
+                if not info['variants']:
+                    self._log('    主播放列表里没有可用清晰度')
+                    return None
+                bw, vurl = max(info['variants'], key=lambda x: x[0])
+                self._log('    清晰度 %d 个，选最高（带宽 %s）' % (len(info['variants']), bw or '未知'))
+                text = _get_bytes(vurl, '清晰度列表').decode('utf-8', errors='ignore')
+                playlist_url = vurl
+                info = parse_m3u8(text, playlist_url)
+        except Exception as e:
+            self._log('    播放列表解析失败: %s' % str(e)[:120])
+            return None
+
+        segs = info['segments']
+        if not segs:
+            self._log('    播放列表里没有分片，放弃')
+            return None
+        kinfo = info.get('key') or {}
+        encrypted = (kinfo.get('method') or '').upper().startswith('AES')
+        key = iv = None
+        if encrypted:
+            if not kinfo.get('url'):
+                self._log('    分片是 AES 加密但清单没给密钥地址，无法解密')
+                return None
+            try:
+                key = _get_bytes(kinfo['url'], 'AES 密钥')
+            except Exception as e:
+                self._log('    密钥获取失败: %s' % str(e)[:120])
+                return None
+            if len(key) not in (16, 24, 32):
+                self._log('    密钥长度异常（%d 字节），放弃' % len(key))
+                return None
+            iv = hls_iv(kinfo.get('iv'), info.get('seq') or 0)
+        self._log('    分片 %d 个（约 %d 秒）%s' % (len(segs), int(info.get('duration') or 0),
+                                             '，AES-128 加密' if encrypted else ''))
+
+        tmpdir = os.path.join(save_dir, '.hls_tmp')
+        try:
+            if os.path.isdir(tmpdir):
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            os.makedirs(tmpdir, exist_ok=True)
+        except Exception as e:
+            self._log('    临时目录创建失败: %s' % str(e)[:90])
+            return None
+
+        workers = 4
+        try:
+            workers = max(1, min(int(self.threads_var.get() or 4), 8))
+        except Exception:
+            pass
+        done, fails = [0], []
+        lock = threading.Lock()
+        self._log('    开始下载 %d 个分片（%d 线程）...' % (len(segs), workers))
+        t0 = time.time()
+
+        def _one(idx_url):
+            idx, su = idx_url
+            if self.stop_flag.is_set():
+                return
+            part = os.path.join(tmpdir, '%05d.part' % idx)
+            for attempt in range(3):
+                try:
+                    data = _get_bytes(su, '分片%d' % (idx + 1))
+                    if encrypted:
+                        data = strip_pkcs7(aes128cbc_decrypt(key, iv, data))
+                    if not data[:1] == b'\x47':
+                        raise RuntimeError('解密后不是 MPEG-TS（首字节 %s）' % data[:1].hex())
+                    with open(part, 'wb') as f:
+                        f.write(data)
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        with lock:
+                            fails.append('%d:%s' % (idx + 1, str(e)[:60]))
+                        return
+                    time.sleep(1)
+            with lock:
+                done[0] += 1
+                n = done[0]
+            if task_id and (n % 5 == 0 or n == len(segs)):
+                self._update_task(task_id, progress='视频 %d/%d' % (n, len(segs)))
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(_one, list(enumerate(segs))))
+        except Exception as e:
+            self._log('    分片下载异常: %s' % str(e)[:120])
+        if self.stop_flag.is_set():
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            self._log('    已停止，未合并')
+            return None
+        if fails:
+            self._log('    有 %d 个分片失败（%s），放弃本次视频' % (len(fails), '、'.join(fails[:3])))
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return None
+
+        out_ts = os.path.join(save_dir, base_name + '.ts')
+        total = 0
+        try:
+            with open(out_ts, 'wb') as out:
+                for i in range(len(segs)):
+                    part = os.path.join(tmpdir, '%05d.part' % i)
+                    if not os.path.isfile(part):
+                        raise RuntimeError('分片 %d 缺失' % (i + 1))
+                    with open(part, 'rb') as f:
+                        while True:
+                            buf = f.read(524288)
+                            if not buf:
+                                break
+                            out.write(buf)
+                            total += len(buf)
+        except Exception as e:
+            self._log('    合并失败: %s' % str(e)[:120])
+            try:
+                if os.path.isfile(out_ts):
+                    os.remove(out_ts)
+            except Exception:
+                pass
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return None
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        self._log('    合并完成: %s（%.1f MB，用时 %.0f 秒）'
+                  % (os.path.basename(out_ts), total / 1048576.0, time.time() - t0))
+
+        ff = self._find_ffmpeg()
+        if ff:
+            mp4 = os.path.join(save_dir, base_name + '.mp4')
+            try:
+                cp = subprocess.run([ff, '-y', '-loglevel', 'error', '-i', out_ts, '-c', 'copy', mp4],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900)
+                if cp.returncode == 0 and os.path.isfile(mp4) and os.path.getsize(mp4) > 10240:
+                    try:
+                        os.remove(out_ts)
+                    except Exception:
+                        pass
+                    self._log('    ffmpeg 已转成 mp4: %s' % os.path.basename(mp4))
+                    return mp4
+                self._log('    ffmpeg 转换失败（保留 .ts）: %s'
+                          % (cp.stderr or b'')[:150].decode('utf-8', 'ignore'))
+            except Exception as e:
+                self._log('    ffmpeg 调用失败（保留 .ts）: %s' % str(e)[:90])
+        else:
+            self._log('    未装 ffmpeg，已存为 .ts（PotPlayer/VLC 可直接播；装了 ffmpeg 会自动转 mp4）')
+        return out_ts
 
     def _crawl_whole_site(self, url, save_dir, max_threads, timeout, post_range, min_size):
         """全站抓取：列表页翻页+进详情页抓取"""
@@ -7743,7 +8186,8 @@ class ScraplingGrabberGUI:
 
             self._log('正在分析第 %d 页: %s' % (page_num, current_url))
             try:
-                html, page = self._fetch_page(current_url, timeout)
+                # 列表页的翻页交给下面的外层循环（它才认「页码」），本层不再重复翻
+                html, page = self._fetch_page(current_url, timeout, page_follow=False)
             except Exception as e:
                 self._log('第 %d 页抓取失败: %s' % (page_num, e))
                 break
@@ -7987,6 +8431,11 @@ class ScraplingGrabberGUI:
                         self._mark_post_completed(save_dir, post_url, completed_urls)
                 else:
                     self._update_task(task_id, status='无图片')
+
+                # ===== HLS 视频：m3u8 走流式下载 + 解密 + 合并（受「下载视频」开关控制）=====
+                hls_urls = list(dict.fromkeys(self._page_stream_urls))
+                if hls_urls:
+                    self._download_hls_list(hls_urls, post_save_dir, title, task_id, post_url, timeout)
 
             except Exception as e:
                 self._log('  抓取失败: %s' % e)
@@ -8269,6 +8718,10 @@ class ScraplingGrabberGUI:
         import re
         img_urls = set()
         smart_filter = self.smart_filter_var.get()
+        # 页面里的 HLS/DASH 播放列表单独收（m3u8 是"清单"不是文件，交给 _download_hls）
+        # 线程本地、引用同一个 list，下面 append 就行（并行抓帖时不会互相串）
+        streams = self._page_stream_urls
+        streams.clear()
 
         # 只过滤明确的无关图片目录，不过滤基于关键词的图片（避免误过滤正常图片）
         SKIP_DIRS = [
@@ -8288,6 +8741,9 @@ class ScraplingGrabberGUI:
         def try_add(img_url):
             if not img_url or img_url.startswith('data:') or img_url.startswith('about:') or img_url == 'blank':
                 return
+            # blob:/mediasource: 是浏览器内部句柄，HTTP 拿不到（视频页常混进来，下载必然失败）
+            if img_url.lower().startswith(('blob:', 'mediasource:')):
+                return
             # 站点自身的资源/统计类 URL（不是正文图片），提取阶段就排掉，省得白跑下载
             if JUNK_MEDIA.search(img_url):
                 return
@@ -8301,6 +8757,12 @@ class ScraplingGrabberGUI:
                 for skip_dir in SKIP_DIRS:
                     if skip_dir in url_lower:
                         return
+            # HLS/DASH 播放列表：既不是图片也不是能直接下的文件，单独收集后走 _download_hls
+            _path = url_lower.split('?')[0].split('#')[0]
+            if _path.endswith(('.m3u8', '.mpd')):
+                if full_url not in streams:
+                    streams.append(full_url)
+                return
             # SVG通常是图标，过滤掉
             if url_lower.endswith('.svg'):
                 return
@@ -8323,6 +8785,15 @@ class ScraplingGrabberGUI:
                 _res_path = url_lower.split('?')[0].split('#')[0]
                 if not re.search(r'\.(?:js|css|json|xml|map|woff2?|ttf|otf|eot)(?:/|$)', _res_path):
                     img_urls.add(full_url)
+
+        # 页面里的 m3u8 / mpd（含内联 script 里的播放器配置，如 new VideoPlayer(..., src:'xxx.m3u8')）
+        if html:
+            try:
+                for _m in re.findall(r'''["'\s(]([^"'\s<>\\()]+?\.(?:m3u8|mpd)(?:\?[^"'\s<>\\]*)?)''',
+                                     html, re.IGNORECASE):
+                    try_add(_m)
+            except Exception:
+                pass
 
         # ===== CDP直读原图优先：浏览器模式下已从渲染页面拿到原图列表（srcset最大+去缩略图后缀）=====
         direct = getattr(self, '_cdp_direct_urls', None)
@@ -8691,7 +9162,12 @@ class ScraplingGrabberGUI:
                 and self.render_mode_var.get() == '浏览器模式(CDP)':
             img_urls = self._ai_adjust_extract(url, html, img_urls)
 
+        # 页面里的 HLS 视频（m3u8）：视频页常常只有封面图，所以图片为空也要抓视频
+        hls_urls = list(dict.fromkeys(self._page_stream_urls))
         if not img_urls:
+            if hls_urls:
+                self._download_hls_list(hls_urls, save_dir, title, task_id, url, timeout)
+                return
             self._log('没有找到图片')
             if task_id:
                 self._update_task(task_id, status='无图片')
@@ -8716,6 +9192,10 @@ class ScraplingGrabberGUI:
                 self._update_task(task_id, status='完成')
             else:
                 self._update_task(task_id, status='部分失败')
+
+        # 页面里的 HLS 视频（m3u8）也一并下（图片下完再下视频，状态以视频结果收尾）
+        if hls_urls:
+            self._download_hls_list(hls_urls, save_dir, title, task_id, url, timeout)
 
         self._log('下载完成: 成功 %d, 失败 %d' % (success, fail))
         self.stat_var.set('完成 - 成功 %d/%d' % (success, len(img_urls)))

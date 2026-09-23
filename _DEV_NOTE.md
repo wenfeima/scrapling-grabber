@@ -1,4 +1,51 @@
-# Scrapling 图片爬虫 - 开发交接笔记（截至 v3.1.14）
+# Scrapling 图片爬虫 - 开发交接笔记（截至 v3.1.15）
+
+## v3.1.15 新增（站内翻页受「页码」约束 + HLS/m3u8 视频下载 + 并发串图）
+
+**起因（用户两个 bug 报告）**
+1. 「我设到 1-4 咋都到 20 多页了」。查用户配置：入口 `https://xchina.co/video/id-<hex>.html`、模式全站、渲染 CDP。
+   CDP 模式下 `_fetch_page` 里另有一段「站内翻页」（把网址去 `.html` 后拼 `/2.html`、`/3.html`…），
+   它**只读「最多页」(100)，完全不看「页码」**；「页码」只作用于 `_crawl_whole_site` 的外层列表循环 → 填 1-4 当然拦不住。
+   附带的浪费：全站模式抓列表页时也会触发这段内层翻页（外层本来就在按页码翻），而列表阶段的图是白抓的
+   （第 1 层只收帖子链接，`_cdp_direct_urls` 随后被覆盖），识别不到帖子还会回退单页**再抓一遍**。
+2. 「这个视频抓不下来」。该页视频不是 mp4 直链，而是播放器 JS 里的 HLS：
+   `new VideoPlayer('video-player', { src: 'https://video.xchina.download/m3u8/<id>/720.m3u8?expires=…&md5=…' })`，
+   且清单里 `#EXT-X-KEY:METHOD=AES-128` —— **分片整体 AES-128-CBC 加密**。老的提取只认 `mp4|webm|mov|m4v` 扩展名，
+   `.m3u8` 完全没匹配 → 只拿到 cover/screenshot 两张 webp；内层翻页每页「新增 1 张」抓的其实是别的视频封面。
+
+**改法**
+- 口径（AskUserQuestion 一次问完）：页码终止页当站内翻页上限（不新增界面框）；视频做**完整下载**；输出格式**自动检测 ffmpeg**。
+- 站内翻页：新增模块级 `station_page_cap(max_pages, page_end)` = 页码终止与「最多页」取小（终止空/0 → 只看最多页）；
+  CDP 分支与 `_expand_post_pages` 都改用它。`_fetch_page(url, timeout, page_follow=True)` 新增 `page_follow`，
+  全站模式抓列表页传 `False`（那层由外层循环按页码翻，不重复）。日志「自动翻页: 第 N 页」→「站内翻页: 第 N 页」，
+  循环前再打一行区间来源，跟列表页的「正在分析第 N 页」区分开。
+- HLS：模块级 `is_stream_url` / `parse_m3u8`（master 挑最高带宽、media 收分片，相对地址 urljoin、时长累加）/
+  `hls_iv`（清单 IV 优先，否则媒体序号大端 16 字节）/ `aes128cbc_decrypt` / `strip_pkcs7`。
+  解密走 **Windows 自带 bcrypt.dll**（ctypes）：不引第三方依赖、原生速度。两个坑：
+  ① 参数顺序 `(hKey, pbInput, cbInput, pPaddingInfo, pbIV, cbIV, pbOutput, cbOutput, pcbResult, dwFlags)`，
+  **漏掉 pPaddingInfo 直接返回 0xC000000D(STATUS_INVALID_PARAMETER)**；
+  ② `ChainingMode` 得传宽字符串（`create_unicode_buffer`），传 ASCII 会同样报错 —— 不过 AES 默认链模式本来就是 CBC，不影响结果。
+  实测每片尾部有 12 字节 PKCS#7 填充，**必须去掉** TS 才保持 188 字节对齐（2988272 → 2988260 = 188×15895）。
+  类内 `_download_hls`（并行下分片到临时目录 → 校验首字节 0x47 → 顺序合并成 `.ts` → 有 ffmpeg 就 `-c copy` 转 mp4）、
+  `_download_hls_list`（受「下载视频」控制，未勾选只提示）、`_find_ffmpeg`（PATH → exe 同目录 → `ffmpeg\bin`）。
+  提取侧：m3u8/mpd 单独收进线程本地 `_page_stream_urls`（不混进图片列表），内联 script 里的地址用 `["'\s(]` 前缀的正则扫；
+  CDP 的暴力正则补上 `m3u8|mpd`；同时过滤 `blob:` / `mediasource:`（浏览器内部句柄，HTTP 必然失败）。
+- 并发串图：`_cdp_direct_urls` 从实例属性改成 **threading.local**（用 property 包一层，所有读写点不用改）。
+  取页面与提取图片都在同一工作线程，线程本地即彻底隔离。
+
+**验证**
+- `_v3115_unit.py` 39 项：`station_page_cap` 9 例、`is_stream_url` 5 例、m3u8 media/master 解析、IV 推导、PKCS#7、
+  **NIST SP 800-38A F.2.1 AES-128-CBC 已知向量**、`blob:` 过滤、线程本地隔离（双线程交叉读写）、
+  真实页面 HTML（`_video.html`）里 m3u8 被单独收出且不混进图片列表。
+- `_v3115_e2e.py` 真机：17 个 AES-128 分片 4 线程下载 + 解密 + 合并 → **27.4 MB**，33 秒；校验 188 字节对齐 /
+  首字节 0x47 / 前 20 包同步字全中 / 含 PAT。
+- exe：`_codecheck_v3115.py` **66 项全过**；`_v3115_exe_smoke.py` 起 exe 截图确认能开；
+  `_v3115_layout.py` BAD=[]（这版没动界面，顺带确认面板与两组双框仍正常）。
+
+**踩坑**
+- 站点的页面 HTTP 直抓会被挑战页挡住（只回 11KB），程序本身走 CDP 所以没事；做验证要拿本地存的真实 HTML。
+- 冒烟脚本「点高级选项 → 看面板是否展开」的像素判据会误判：未展开时任务列表区域本身就是卡片色，占比也 > 30%
+  → 面板展开与否用源码态布局自检截图确认更靠谱。
 
 ## v3.1.14 新增（「页码」拆成起始/终止两个输入框）
 
@@ -171,8 +218,9 @@
 - **v3.1.12**：列表页自动进帖子抓内容图（`url_shape` / `_extract_card_links` / `_expand_post_pages` + 卡片判据替换形态规则 + 增量短路 bug 修复），详见上节
 - **v3.1.13**：「范围」拆成起始/终止两个输入框（`parse_range_pair` / `split_legacy_range` / `_post_range_values` + 配置键拆成 `post_range_start`/`post_range_end`），详见上节
 - **v3.1.14**：「页码」也拆成起始/终止两个输入框（`parse_page_range` / `split_legacy_page_range` / `_page_range_values` + 配置键拆成 `page_range_start`/`page_range_end`，终止留空 = 不限；顺带修掉老实现「填任何页码都只抓第一页」），详见上节
+- **v3.1.15**：站内翻页受「页码」约束（`station_page_cap` + `_fetch_page(..., page_follow=False)`）+ HLS/m3u8 完整下载（`is_stream_url` / `parse_m3u8` / `hls_iv` / `aes128cbc_decrypt` / `strip_pkcs7` / `_download_hls` / `_download_hls_list` / `_find_ffmpeg`）+ `_cdp_direct_urls` 改线程本地修串图，详见上节
 
-### 当前顶部结构（v3.1.14）
+### 当前顶部结构（v3.1.15）
 `url_frame`（行1：网址 + 收藏 / 设置 / 高级选项 ▾ / 开始抓取）→ `btn_frame`（**默认不 pack**：暂停/停止/重试失败）→ `adv_frame`（可折叠面板：抓取参数 / 功能入口 / 智能过滤 / AI / 转换+性能 / 浏览器模式）。
 标签条高度约 36px 由 `TNotebook.Tab` 的 `padding=(14,6)` 决定，改 `tabmargins` 或 `TNotebook.padding` 对标签条高度无效。
 
@@ -184,6 +232,8 @@
 - 列表页/帖子（v3.1.12）：`url_shape` / `_extract_card_links` / `_extract_post_links` / `_expand_post_pages` / `_crawl_whole_site` / `crawl_single_post` 内的调用
 - 「范围」解析（v3.1.13）：`parse_range_pair` / `split_legacy_range` / `_post_range_values`（`_crawl_worker` 与 `_crawl_whole_site` 共用）
 - 「页码」解析（v3.1.14）：`parse_page_range` / `split_legacy_page_range` / `_page_range_values`（`_crawl_whole_site` 的翻页收集用它；终止 0 = 不限）
+- 站内翻页上限（v3.1.15）：`station_page_cap`（页码终止与「最多页」取小），CDP 侧在 `_fetch_page` 的 `page_follow` 分支、直连侧在 `_expand_post_pages`
+- 视频 / HLS（v3.1.15）：`is_stream_url` / `parse_m3u8` / `hls_iv` / `aes128cbc_decrypt` / `strip_pkcs7` / `_bcrypt_aes` / `_download_hls` / `_download_hls_list` / `_find_ffmpeg`；页面临时结果 `_page_stream_urls` 与 `_cdp_direct_urls` 都是**线程本地**（`_cdp_tls`）
 - 调试浏览器：`_launch_debug_browser` / `_open_independent_browser` / `_embed_browser` / `_debug_browser_visible_pid` / `_embedded_browser_alive` / `_prepare_debug_profile` / `_find_browser_exe` / `_wait_debug_port_free`
 - 游戏修改：`_open_game_mod_window` / `_ai_ec_scan` / `_ai_ec_edit` / `_ai_ec_lock` / `_wasm_boot` / `_ec_assign_expr`
 - 目录历史：`_dir_remember` / `_dir_refresh_combo` / `_on_dir_pick` / `cfg['save_dirs']`
