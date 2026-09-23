@@ -129,6 +129,42 @@ def looks_like_media(data):
     return False
 
 
+# ===== 「范围」输入框解析（v3.1.13：原来一个框填 "20" / "15-60"，现拆成起始/终止两个框）=====
+def parse_range_pair(start_text, end_text, default_end=20):
+    """把「范围」的两个框解析成 (起始序号, 终止序号)，都是 1-based、闭区间。
+
+    留空 / 非法 / 小于 1 一律回退到默认值（起始 1、终止 default_end）；
+    填反了（起始 > 终止）自动对调，免得用户手误导致一个帖子都抓不到。
+    """
+    def _num(text, default):
+        try:
+            v = int(str(text).strip())
+        except Exception:
+            return default
+        return v if v > 0 else default
+
+    s_text = str(start_text).strip()
+    e_text = str(end_text).strip()
+    # 兼容：有人会把老的 "15-60" 整段粘进起始框，那就当成区间读
+    if '-' in s_text and not e_text:
+        a, _, b = s_text.partition('-')
+        s_text, e_text = a, b
+    s = _num(s_text, 1)
+    e = _num(e_text, default_end)
+    if s > e:
+        s, e = e, s
+    return s, e
+
+
+def split_legacy_range(text, default_end=20):
+    """把旧配置里的单框值转成 (起始, 终止)：'20' → (1, 20)，'15-60' → (15, 60)。"""
+    t = str(text or '').strip()
+    if '-' in t:
+        a, _, b = t.partition('-')
+        return parse_range_pair(a, b, default_end)
+    return parse_range_pair('1', t, default_end)
+
+
 class HttpSessions:
     """会话池：直连 / 系统代理 两条通道，自动择优并记住上次成功的那条。
 
@@ -202,7 +238,7 @@ def http_get(url, headers=None, timeout=30, referer=None, allow_proxy_fallback=T
 # 图片扩展名
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.avif')
 
-APP_VERSION = 'v3.1.12'
+APP_VERSION = 'v3.1.13'
 APP_NAME = '全能网页助手'
 
 # ===== 界面主题（深色科技蓝 / 浅色简约，可一键切换）=====
@@ -930,7 +966,10 @@ class ScraplingGrabberGUI:
         self.download_video_var.set(self.cfg.get('download_video', False))
         self.render_mode_var.set(self.cfg.get('render_mode', '直连模式'))
         self.grab_mode_var.set(self.cfg.get('grab_mode', '单页'))
-        self.post_range_var.set(self.cfg.get('post_range', '20'))
+        # 范围（v3.1.13 起拆成起始/终止两个框；旧配置里的 '20' / '15-60' 自动拆开）
+        _rng_s, _rng_e = split_legacy_range(self.cfg.get('post_range', '20'))
+        self.post_range_start_var.set(self.cfg.get('post_range_start', _rng_s))
+        self.post_range_end_var.set(self.cfg.get('post_range_end', _rng_e))
         self.min_size_var.set(self.cfg.get('min_size', 0))
         if hasattr(self, 'convert_webp_var'):
             self.convert_webp_var.set(self.cfg.get('convert_webp', False))
@@ -976,6 +1015,7 @@ class ScraplingGrabberGUI:
         """保存当前设置到配置文件"""
         # 先把当前服务商的 Key/模型配置归档
         self._save_provider_state()
+        self.cfg.pop('post_range', None)   # 旧键（单框 "20"/"15-60"）已拆成下面两个
         self.cfg.update({
             'url': self.url_var.get().strip(),
             'save_dir': os.path.normpath(self.dir_var.get().strip()),
@@ -986,7 +1026,8 @@ class ScraplingGrabberGUI:
             'download_video': self.download_video_var.get(),
             'render_mode': self.render_mode_var.get(),
             'grab_mode': self.grab_mode_var.get(),
-            'post_range': self.post_range_var.get(),
+            'post_range_start': self.post_range_start_var.get(),
+            'post_range_end': self.post_range_end_var.get(),
             'min_size': self.min_size_var.get(),
             'convert_webp': self.convert_webp_var.get(),
             'convert_avif': self.convert_avif_var.get(),
@@ -3357,9 +3398,14 @@ class ScraplingGrabberGUI:
         mode_combo['values'] = ('单页', '全站')
         mode_combo.pack(side='left', padx=(2, 10))
         ttk.Label(opt_frame, text='范围:').pack(side='left')
-        self.post_range_var = tk.StringVar(value='20')
-        ttk.Entry(opt_frame, textvariable=self.post_range_var, width=4,
-                  style='Row.TEntry').pack(side='left', padx=(2, 10))
+        # 起始 / 终止 两个框（v3.1.13 起，原来是单个框填 "20" 或 "15-60"）
+        self.post_range_start_var = tk.StringVar(value='1')
+        ttk.Entry(opt_frame, textvariable=self.post_range_start_var, width=3,
+                  style='Row.TEntry').pack(side='left', padx=(2, 1))
+        ttk.Label(opt_frame, text='-', style='Muted.TLabel').pack(side='left')
+        self.post_range_end_var = tk.StringVar(value='20')
+        ttk.Entry(opt_frame, textvariable=self.post_range_end_var, width=4,
+                  style='Row.TEntry').pack(side='left', padx=(1, 10))
         ttk.Label(opt_frame, text='页码:').pack(side='left')
         self.page_num_var = tk.StringVar(value='0')
         ttk.Entry(opt_frame, textvariable=self.page_num_var, width=3,
@@ -7357,6 +7403,15 @@ class ScraplingGrabberGUI:
             except Exception:
                 pass
 
+    def _post_range_values(self):
+        """读取「范围」两个框 → (range_start, range_end)
+
+        range_start 是 0-based 索引（直接给列表切片用），range_end 是 1-based 的终止序号。
+        留空/非法值都走 parse_range_pair 的默认（起始 1、终止 20），填反自动对调。
+        """
+        s, e = parse_range_pair(self.post_range_start_var.get(), self.post_range_end_var.get())
+        return s - 1, e
+
     def _crawl_worker(self, url, save_dir):
         """抓取工作线程"""
         try:
@@ -7371,24 +7426,10 @@ class ScraplingGrabberGUI:
         max_threads = self.threads_var.get()
         timeout = self.timeout_var.get()
         grab_mode = self.grab_mode_var.get()
-        # 解析范围，支持"20"或"15-60"两种格式
-        range_str = self.post_range_var.get().strip() or '20'
-        range_start = 0
-        range_end = 20
-        if '-' in range_str:
-            try:
-                parts = range_str.split('-')
-                range_start = max(0, int(parts[0].strip()) - 1)  # 转换为0-based索引
-                range_end = int(parts[1].strip())
-                self._log('范围: 第%d到第%d个帖子' % (range_start + 1, range_end))
-            except Exception:
-                range_start = 0
-                range_end = 20
-        else:
-            try:
-                range_end = int(range_str)
-            except Exception:
-                range_end = 20
+        # 范围：两个框（起始 / 终止 帖子序号，1-based 闭区间；留空按默认 1 / 20）
+        range_start, range_end = self._post_range_values()
+        if range_start > 0:
+            self._log('范围: 第%d到第%d个帖子' % (range_start + 1, range_end))
         post_range = range_end  # 最大帖子数用range_end
         min_size = self.min_size_var.get()
 
@@ -7613,18 +7654,8 @@ class ScraplingGrabberGUI:
         from urllib.parse import urlparse
         domain = urlparse(url).netloc.replace('www.', '')
 
-        # 解析范围，支持"20"或"15-60"两种格式
-        range_str = self.post_range_var.get().strip() or '20'
-        range_start = 0
-        range_end = post_range
-        if '-' in range_str:
-            try:
-                parts = range_str.split('-')
-                range_start = max(0, int(parts[0].strip()) - 1)  # 转换为0-based索引
-                range_end = int(parts[1].strip())
-            except Exception:
-                range_start = 0
-                range_end = post_range
+        # 范围：与 _crawl_worker 同一口径（两个框 → 起始/终止 帖子序号）
+        range_start, range_end = self._post_range_values()
 
         # 分页翻页，收集所有帖子链接
         all_post_links = []

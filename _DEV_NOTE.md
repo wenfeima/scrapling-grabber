@@ -1,4 +1,35 @@
-# Scrapling 图片爬虫 - 开发交接笔记（截至 v3.1.12）
+# Scrapling 图片爬虫 - 开发交接笔记（截至 v3.1.13）
+
+## v3.1.13 新增（「范围」拆成起始/终止两个输入框）
+
+**需求**：用户贴了高级面板第 1 排的截图（`范围: [10-50]`），要求「分成 2 个，前面一个填开始、后面一个填终止」。
+
+**改法**
+- UI（`opt_frame` 第 1 排）：单个 `Entry(width=4)` 换成 起始框 `width=3` + 一个 `Muted.TLabel('-')` + 终止框 `width=4`；
+  变量 `post_range_var` → `post_range_start_var` / `post_range_end_var`（默认 `'1'` / `'20'`）。
+  实测这排最右端 650px（可用 964），面板 reqwidth 仍 882，不影响 980 默认窗口。
+- 解析集中在模块级两个纯函数（好单测）：
+  - `parse_range_pair(start_text, end_text, default_end=20)` → `(起始, 终止)`，1-based 闭区间。
+    留空/非数字/≤0 都回退默认（起始 1、终止 20）；起始 > 终止时**自动对调**；
+    另外兼容「把旧格式 `15-60` 整段粘进起始框」。
+  - `split_legacy_range(text, default_end=20)`：旧配置单值 → 两值（`'20'`→`(1,20)`、`'15-60'`→`(15,60)`）。
+- 类内 `_post_range_values()` 返回 `(起始-1, 终止)`（直接给列表切片用），
+  `_crawl_worker` 与 `_crawl_whole_site` **两处共用**（原来这段解析逻辑在两处各写了一遍，随手统一了）。
+- 配置：存 `post_range_start` / `post_range_end`；加载时优先读新键、缺失就用 `split_legacy_range(cfg['post_range'])` 拆。
+  保存时 `self.cfg.pop('post_range', None)` 清掉旧键（`cfg.update()` 是合并语义，不清就永远留在配置文件里）。
+- 日志口径不变：`范围: 第N到第M个帖子`（只在起始 > 1 时打，跟旧行为一致），`_crawl_whole_site` 里的
+  「开始范围选择（共 X 个帖子，范围: N-M）」照旧。
+
+**验证**
+- `_v3113_unit.py`：`parse_range_pair` 14 例（空/非数字/0/负数/小数/填反/空格/大数字/None/旧格式粘入）、
+  `split_legacy_range` 7 例、真 GUI 配置往返（旧 `post_range='15-60'` 载入 → 两框 15/60；改 5/80 存盘 → 重载 5/80；
+  旧键已清理）→ **29/29 通过**
+- `_v3113_layout.py`：980 与 1936 两档、暗/浅色共 4 张截图；第 1 排最右端 650 ≤ 964、`adv_frame.reqwidth=882` 不变
+- `_codecheck_v3113.py`：exe 内嵌代码 **45 项全过**；`_v3113_exe_smoke.py`：真实点击展开面板截图确认两个框可见
+  - ⚠ 冒烟第一次点击**没展开**（窗口未被前台激活时首击只激活窗口）→ 加「点完按卡片底色采样判断是否展开、
+    最多重试 3 次」的循环后稳定通过。
+  - ⚠ 核对脚本里「旧版本号已清除」这项**必须用精确匹配**（`'v3.1.12' in ss`）：v3.1.12 起
+    `_extract_card_links` 的 docstring 里写着「（v3.1.12 新增…）」，用子串匹配会误报 ❌。
 
 ## v3.1.12 新增（列表页自动进帖子抓内容图）
 
@@ -83,7 +114,7 @@
 （桩网络 18 项：命中原图/回 200+HTML 回退/404 回退/关开关/异常换候选/过小跳过/普通地址不变），
 `_origreal.py` 真机下 8 张：**8/8 全部 1800×2400、合计 2802KB（对照组预览图 228KB，12.3 倍）**。
 
-## v3.x 交接补充（v3.0.0 → v3.1.12）
+## v3.x 交接补充（v3.0.0 → v3.1.13）
 
 > 仓库 git 历史里 v3.1.x 的逐版细节没留（只有 v3.0.0 两条提交 + 最后一次 v3.1.10），这里按「发布版本 → 实际改动」补齐；
 > 依据是各版 exe 的内嵌代码解包核对（逐版探测标志性方法/常量存在性）+ 改造过程记录，不是回忆推测。
@@ -102,8 +133,9 @@
 - **v3.1.10**：面板排版放宽（行距/分隔条/AI 开关拆两排）+ 新样式 `Feature.TButton` + 功能入口按钮右对齐
 - **v3.1.11**：抓取原图（`orig_url_candidates` / `looks_like_media` / `_cdp_fallback` + 「抓取原图」勾选框），详见上节
 - **v3.1.12**：列表页自动进帖子抓内容图（`url_shape` / `_extract_card_links` / `_expand_post_pages` + 卡片判据替换形态规则 + 增量短路 bug 修复），详见上节
+- **v3.1.13**：「范围」拆成起始/终止两个输入框（`parse_range_pair` / `split_legacy_range` / `_post_range_values` + 配置键拆成 `post_range_start`/`post_range_end`），详见上节
 
-### 当前顶部结构（v3.1.12）
+### 当前顶部结构（v3.1.13）
 `url_frame`（行1：网址 + 收藏 / 设置 / 高级选项 ▾ / 开始抓取）→ `btn_frame`（**默认不 pack**：暂停/停止/重试失败）→ `adv_frame`（可折叠面板：抓取参数 / 功能入口 / 智能过滤 / AI / 转换+性能 / 浏览器模式）。
 标签条高度约 36px 由 `TNotebook.Tab` 的 `padding=(14,6)` 决定，改 `tabmargins` 或 `TNotebook.padding` 对标签条高度无效。
 
@@ -113,6 +145,7 @@
 - 下载：`IMAGE_HEADERS` / `HttpSessions` / `http_get` / `_download_image_list` / `_cdp_download_image`
 - 原图推导（v3.1.11）：`_ORIG_SUFFIX_RE` / `orig_url_candidates` / `looks_like_media` / `_download_image_list._cdp_fallback`
 - 列表页/帖子（v3.1.12）：`url_shape` / `_extract_card_links` / `_extract_post_links` / `_expand_post_pages` / `_crawl_whole_site` / `crawl_single_post` 内的调用
+- 「范围」解析（v3.1.13）：`parse_range_pair` / `split_legacy_range` / `_post_range_values`（`_crawl_worker` 与 `_crawl_whole_site` 共用）
 - 调试浏览器：`_launch_debug_browser` / `_open_independent_browser` / `_embed_browser` / `_debug_browser_visible_pid` / `_embedded_browser_alive` / `_prepare_debug_profile` / `_find_browser_exe` / `_wait_debug_port_free`
 - 游戏修改：`_open_game_mod_window` / `_ai_ec_scan` / `_ai_ec_edit` / `_ai_ec_lock` / `_wasm_boot` / `_ec_assign_expr`
 - 目录历史：`_dir_remember` / `_dir_refresh_combo` / `_on_dir_pick` / `cfg['save_dirs']`
